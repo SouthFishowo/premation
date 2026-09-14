@@ -3,6 +3,32 @@
 Newest first. Each entry is what a person opening the app after an update
 would want to know; the engine-level detail is in `ROADMAP.md`.
 
+## 0.8.3 — 2026-09-14
+
+Text that reads like After Effects set it, and a batch of shape and render
+fixes.
+
+- **Real multilingual text**: full right-to-left and bidirectional layout
+  (Arabic, Hebrew — mixed with Latin in one line), **vertical writing** with
+  tate-chū-yoko and kinsoku line-breaking for CJK, and **true optical
+  kerning**. Source-text expressions can now drive what a text layer says.
+- **Time Stretch on any layer**, not just footage.
+- **Rounded rectangles stay rounded** everywhere geometry is rebuilt: under
+  any path operator (Trim, Zig-Zag, Repeater…), through Merge Paths booleans
+  and the path cloner, and under the Knife — all of which used to square the
+  corners off. Scaled layers keep circular corners, and animated radii are
+  honoured throughout.
+- **Projected shadows no longer paint over the layer casting them**, and the
+  lamp's wash survives alongside its shadow.
+- **Properties panel no longer loops**: since 0.8.1 the panel re-rendered
+  itself endlessly while it was open ("Maximum update depth exceeded" in the
+  console, hundreds of times), wasting CPU the whole time. Its rows in the
+  inspector's ⋯ menu (keyframe lanes, Open Effect Controls) now also stay put
+  instead of only appearing because of that loop.
+- **Object Matte installs reliably**: the custom model install pairs the
+  encoder/decoder downloads through the app itself (no more copy-pasting two
+  URLs into the right folders), with resumable, verified downloads.
+
 ## 0.8.2 — 2026-09-12
 
 Sound, brought up to the level of the rest of the app. The audio engine was
