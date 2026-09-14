@@ -27,12 +27,23 @@ export const SAM_MODEL_KEY = 'sam-object-matte';
 
 export interface CachedModel {
   id: string;
-  /** The ONNX bytes. */
+  /** The encoder's ONNX bytes (or the whole model, in a legacy record). */
   data: Blob;
   /** Where it came from, verbatim. */
   sourceUrl: string;
+  /**
+   * The decoder half of a SAM encoder/decoder pair, with its own provenance.
+   *
+   * Absent on records written before the install flow spoke the real SAM
+   * protocol (`samPipeline.ts`) — those held a single file the legacy wrapper
+   * could load but no published SAM export could answer, so a record without
+   * this field is treated as stale rather than restored.
+   */
+  decoderData?: Blob;
+  decoderUrl?: string;
   /** Epoch millis. Shown so "when did I install this" is answerable. */
   installedAt: number;
+  /** Total size across both files. */
   bytes: number;
 }
 
