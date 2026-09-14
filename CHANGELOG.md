@@ -3,6 +3,14 @@
 Newest first. Each entry is what a person opening the app after an update
 would want to know; the engine-level detail is in `ROADMAP.md`.
 
+## Unreleased
+
+- **Properties panel no longer loops**: since 0.8.1 the panel re-rendered
+  itself endlessly while it was open ("Maximum update depth exceeded" in the
+  console, hundreds of times), wasting CPU the whole time. Its rows in the
+  inspector's ⋯ menu (keyframe lanes, Open Effect Controls) now also stay put
+  instead of only appearing because of that loop.
+
 ## 0.8.1 — 2026-09-10
 
 Everything in 0.8.0, plus a refreshed interface:
