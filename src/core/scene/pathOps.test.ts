@@ -125,6 +125,63 @@ describe('shapeOutline with corner radii', () => {
   });
 });
 
+/** Signed distance to a uniform-radius rounded rect centred at 0,0. */
+function roundedRectSdf(p: Pt, w: number, h: number, r: number): number {
+  const qx = Math.abs(p.x) - (w / 2 - r);
+  const qy = Math.abs(p.y) - (h / 2 - r);
+  const outside = Math.hypot(Math.max(qx, 0), Math.max(qy, 0));
+  return outside + Math.min(Math.max(qx, qy), 0) - r;
+}
+
+const minDistTo = (pts: readonly Pt[], c: Pt): number =>
+  Math.min(...pts.map((p) => Math.hypot(p.x - c.x, p.y - c.y)));
+
+describe('shapeOutline with corner radii', () => {
+  it('every emitted point sits ON the rounded boundary', () => {
+    const pts = shapeOutline('rect', 100, 60, 48, 0, 10);
+    for (const p of pts) expect(Math.abs(roundedRectSdf(p, 100, 60, 10))).toBeLessThan(1e-9);
+  });
+
+  it('the corner is cut back by r(√2−1) — the arc\'s closest approach to the sharp vertex', () => {
+    const pts = shapeOutline('rect', 100, 60, 48, 0, 10);
+    for (const c of [{ x: -50, y: -30 }, { x: 50, y: -30 }, { x: 50, y: 30 }, { x: -50, y: 30 }]) {
+      expect(minDistTo(pts, c)).toBeCloseTo(10 * (Math.SQRT2 - 1), 1);
+    }
+  });
+
+  it('per-corner radii round only the corners that asked', () => {
+    const pts = shapeOutline('rect', 100, 60, 48, 0, [10, 0, 0, 0] as const);
+    expect(minDistTo(pts, { x: -50, y: -30 })).toBeCloseTo(10 * (Math.SQRT2 - 1), 1);
+    // The other three stay the exact sharp vertices.
+    expect(pts).toContainEqual({ x: 50, y: -30 });
+    expect(pts).toContainEqual({ x: 50, y: 30 });
+    expect(pts).toContainEqual({ x: -50, y: 30 });
+  });
+
+  it('cornerAxisScale makes the corner an ellipse HERE that scales to a circle THERE', () => {
+    // Drawn at |scale| [2, 1], a 20px comp-space corner spans 10px locally in
+    // x and the full 20 in y — the same compensation roundRect applies.
+    const pts = shapeOutline('rect', 100, 60, 48, 0, 20, [2, 1]);
+    expect(minDistTo(pts, { x: -50, y: -10 })).toBeLessThan(1e-6); // arc start, left edge
+    expect(minDistTo(pts, { x: -40, y: -30 })).toBeLessThan(1e-6); // arc end, top edge
+  });
+
+  it('subdivide still densifies the straight edges between the arcs', () => {
+    const pts = shapeOutline('rect', 100, 60, 48, 8, 10);
+    const longest = Math.max(
+      ...pts.map((p, i) => {
+        const q = pts[(i + 1) % pts.length]!;
+        return Math.hypot(q.x - p.x, q.y - p.y);
+      }),
+    );
+    expect(longest).toBeLessThanOrEqual(100 / 9 + 1e-9);
+  });
+
+  it('a zero radius is the plain sharp rect, byte for byte', () => {
+    expect(shapeOutline('rect', 100, 60, 48, 0, 0)).toEqual(shapeOutline('rect', 100, 60));
+  });
+});
+
 describe('zigzag', () => {
   it('offsets interior points perpendicular, alternating sign', () => {
     // one horizontal edge (0,0)→(4,0), 2 segments, amplitude 1
