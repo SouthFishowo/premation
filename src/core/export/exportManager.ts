@@ -19,6 +19,7 @@ import { buildSnapshot, COMP_WIDTH, COMP_HEIGHT, type SnapshotComp } from '@core
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { defaultAnimation, pointsToLottieBezier } from '@motion/animation';
 import { shapeOutline } from '@core/scene/pathOps';
+import { readNodePolystar } from '@core/scene/polystar';
 import { captureDocument } from '@core/api/cloudDocument';
 import { getTimelineController } from '@core/timeline/TimelineController';
 import { flattenScene, readNodeKind } from '@core/scene/sceneDerive';
@@ -910,7 +911,28 @@ function lottieShapesFor(node: SceneNode): unknown[] {
   const geomComp = node.components.find((c) => c.type === 'Geometry');
   let geometry: unknown;
 
-  if (geomComp && Array.isArray(geomComp.props.points) && (geomComp.props.points as Array<{ x: number; y: number }>).length > 0) {
+  const polystar = readNodePolystar(node);
+  if (polystar) {
+    // A PARAMETRIC polystar exports as Lottie's native 'sr' shape rather than
+    // a re-derived outline — players then render the same roundness math this
+    // renderer uses (both follow AE's segment-proportional tangents). Static
+    // values only, matching every other shape here (rect w/h export static
+    // too); keyframed polystar params flatten to their base values.
+    geometry = {
+      ty: 'sr',
+      sy: polystar.starType === 'polygon' ? 2 : 1,
+      d: 1,
+      pt: { a: 0, k: polystar.points },
+      p: { a: 0, k: [0, 0] },
+      r: { a: 0, k: polystar.rotation },
+      or: { a: 0, k: polystar.outerRadius },
+      os: { a: 0, k: polystar.outerRoundness },
+      ...(polystar.starType === 'star'
+        ? { ir: { a: 0, k: polystar.innerRadius }, is: { a: 0, k: polystar.innerRoundness } }
+        : {}),
+      nm: polystar.starType === 'polygon' ? 'Polygon' : 'Star',
+    };
+  } else if (geomComp && Array.isArray(geomComp.props.points) && (geomComp.props.points as Array<{ x: number; y: number }>).length > 0) {
     const pts = geomComp.props.points as Array<{ x: number; y: number; inX?: number; inY?: number; outX?: number; outY?: number }>;
     const closed = geomComp.props.open !== true;
     const lottieBez = pointsToLottieBezier(pts, closed);

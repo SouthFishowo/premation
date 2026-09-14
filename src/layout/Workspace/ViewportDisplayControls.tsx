@@ -363,6 +363,10 @@ export function useViewportDisplayModel(): ViewportDisplayModel {
   const guidesVisible = useGuidesStore((s) => s.guidesVisible);
   const motionPathDots = useGuidesStore((s) => s.motionPathDots);
   const setMotionPathDots = useGuidesStore((s) => s.setMotionPathDots);
+  const motionPathShow = useGuidesStore((s) => s.motionPathShow);
+  const motionPathWindowSeconds = useGuidesStore((s) => s.motionPathWindowSeconds);
+  const setMotionPathShow = useGuidesStore((s) => s.setMotionPathShow);
+  const setMotionPathWindowSeconds = useGuidesStore((s) => s.setMotionPathWindowSeconds);
   const overlayOpacity = useGuidesStore((s) => s.overlayOpacity);
   const setOverlayOpacity = useGuidesStore((s) => s.setOverlayOpacity);
   const hud = useViewportDisplayStore((s) => s.hud);
@@ -398,6 +402,27 @@ export function useViewportDisplayModel(): ViewportDisplayModel {
         dotChoice('small', 'Small'),
         dotChoice('medium', 'Medium'),
         dotChoice('large', 'Large'),
+      ],
+    },
+    {
+      // AE Preferences ▸ Display ▸ Motion Path: how much of the path to draw.
+      type: 'item',
+      id: 'vd-motion-path-show',
+      label: 'Motion Path Keyframes',
+      submenu: [
+        { type: 'checkbox', id: 'vd-mp-show-all', label: 'All Keyframes', checked: motionPathShow === 'all', onChange: () => setMotionPathShow('all') },
+        { type: 'checkbox', id: 'vd-mp-show-none', label: 'No Keyframes', checked: motionPathShow === 'none', onChange: () => setMotionPathShow('none') },
+        { type: 'separator' },
+        ...[1, 2, 5, 10].map<DropdownItem>((sec) => ({
+          type: 'checkbox',
+          id: `vd-mp-show-${sec}s`,
+          label: `${sec} Second${sec === 1 ? '' : 's'} Around Playhead`,
+          checked: motionPathShow === 'window' && motionPathWindowSeconds === sec,
+          onChange: () => {
+            setMotionPathWindowSeconds(sec);
+            setMotionPathShow('window');
+          },
+        })),
       ],
     },
     { type: 'separator' },

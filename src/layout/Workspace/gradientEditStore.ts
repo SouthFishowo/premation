@@ -23,6 +23,9 @@
 
 import { create } from 'zustand';
 
+/** Which paint the gizmo edits: the fill, or a text layer's stroke gradient. */
+export type GradientEditTarget = 'fill' | 'stroke';
+
 interface GradientEditStore {
   /** The layer whose gradient axis is showing, or null when disarmed. */
   nodeId: string | null;
@@ -34,11 +37,18 @@ interface GradientEditStore {
    * a specific one.
    */
   fillIndex: number;
+  /**
+   * The fill, or the STROKE gradient of a text layer (`strokePaint` on its Text
+   * component) — chosen with the overlay's Fill/Stroke chip or the stroke
+   * rows' "Edit on canvas" toggle.
+   */
+  target: GradientEditTarget;
   /** The stop the next Delete would remove, or null. */
   selectedStopId: string | null;
-  arm: (nodeId: string, fillIndex?: number) => void;
+  arm: (nodeId: string, fillIndex?: number, target?: GradientEditTarget) => void;
   disarm: () => void;
   setFillIndex: (fillIndex: number) => void;
+  setTarget: (target: GradientEditTarget) => void;
   selectStop: (stopId: string | null) => void;
   /** True when this exact layer owns the visible gradient gizmo. */
   isArmed: (nodeId: string) => boolean;
@@ -47,13 +57,15 @@ interface GradientEditStore {
 export const useGradientEditStore = create<GradientEditStore>((set, get) => ({
   nodeId: null,
   fillIndex: 0,
+  target: 'fill',
   selectedStopId: null,
   // Arming a DIFFERENT layer (or a different fill) drops the stop selection:
   // stop ids are only meaningful inside one fill's list, and a stale one would
   // arm Delete against a stop that is no longer on screen.
-  arm: (nodeId, fillIndex = 0) => set({ nodeId, fillIndex, selectedStopId: null }),
-  disarm: () => set({ nodeId: null, fillIndex: 0, selectedStopId: null }),
-  setFillIndex: (fillIndex) => set({ fillIndex, selectedStopId: null }),
+  arm: (nodeId, fillIndex = 0, target = 'fill') => set({ nodeId, fillIndex, target, selectedStopId: null }),
+  disarm: () => set({ nodeId: null, fillIndex: 0, target: 'fill', selectedStopId: null }),
+  setFillIndex: (fillIndex) => set({ fillIndex, target: 'fill', selectedStopId: null }),
+  setTarget: (target) => set({ target, selectedStopId: null }),
   selectStop: (stopId) => set({ selectedStopId: stopId }),
   isArmed: (nodeId) => get().nodeId === nodeId,
 }));

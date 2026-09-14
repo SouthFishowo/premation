@@ -17,6 +17,12 @@
  */
 
 import { parseExpression, evaluateExpression, type ExprNode } from './exprLang';
+import {
+  makeSourceTextValue,
+  coerceSourceTextResult,
+  type SourceTextSample,
+  type SourceTextExpressionResult,
+} from './sourceText';
 
 /**
  * Ceiling on `wiggle`'s octave count.
@@ -113,6 +119,21 @@ export interface ExprContext {
    * Order is not required of the host; see {@link ExprMarker}.
    */
   markersAt?: (scope: 'comp' | 'layer') => readonly ExprMarkerData[];
+  /**
+   * Source Text of a text layer at time `t` — backs `text.sourceText`,
+   * `thisLayer.text.sourceText` and `thisComp.layer("Title").text.sourceText`.
+   *
+   * `name` is null for the current layer. Undefined for a layer that is not
+   * text (or does not exist), which the evaluator turns into a STATED error:
+   * an empty string would silently blank whatever the expression builds.
+   */
+  sourceTextAt?: (name: string | null, t: number) => SourceTextSample | undefined;
+  /**
+   * Present only when the expression is ON the Source Text property. Then
+   * `value` / `thisProperty.value` are the pre-expression text (a String
+   * object with `.style`), as in AE, instead of a number.
+   */
+  textValue?: SourceTextSample;
 }
 
 /**
@@ -205,6 +226,12 @@ export interface CompiledExpression {
   src: string;
   compileError: string | null;
   run: (ctx: ExprContext) => ExprResult;
+  /**
+   * Evaluate as a SOURCE TEXT expression: the result is text plus style
+   * overrides (see `sourceText.ts`), not a number. `ctx.textValue` should
+   * carry the pre-expression text so `value` means what it does in AE.
+   */
+  runText: (ctx: ExprContext) => { result: SourceTextExpressionResult | null; error: string | null };
 }
 
 /** Deterministic hash → 0..1 (no Math.random, so playback is reproducible). */
@@ -276,7 +303,12 @@ export function boundScopeNames(): readonly string[] {
 export function compileExpression(src: string): CompiledExpression {
   const trimmed = src.trim();
   if (trimmed === '') {
-    return { src, compileError: null, run: () => ({ value: null, error: null }) };
+    return {
+      src,
+      compileError: null,
+      run: () => ({ value: null, error: null }),
+      runText: () => ({ result: null, error: null }),
+    };
   }
 
   // Parsed, not eval'd. `new Function` is refused by the app's CSP
@@ -290,11 +322,13 @@ export function compileExpression(src: string): CompiledExpression {
     compileError = humanize(e);
   }
 
-  return {
-    src,
-    compileError,
-    run: (ctx) => {
-      if (compileError || !ast) return { value: null, error: compileError };
+  /**
+   * Evaluate to whatever the expression produced. `run` (numbers) and
+   * `runText` (Source Text) differ only in how they judge that value, so the
+   * scope — and its §2·0 reflection — is built in exactly one place.
+   */
+  const evaluateRaw = (ctx: ExprContext): { out: unknown; error: string | null } => {
+      if (compileError || !ast) return { out: null, error: compileError };
       const { time, value } = ctx;
       const audio = ctx.audio ?? 0;
       const ctrl = ctx.ctrl ?? ((): number => 0);
@@ -707,6 +741,37 @@ export function compileExpression(src: string): CompiledExpression {
         return selfAt(start + (((rel % dur) + dur) % dur));
       };
 
+      // ── Source Text ────────────────────────────────────────────────
+      /**
+       * `text.sourceText` for one layer (null = this one), or a STATED error.
+       *
+       * LAZY and memoised per evaluation, like `marker`: reading a text layer
+       * means sampling its hold track and style, and charging every numeric
+       * expression in the project for that would be the wrong trade.
+       */
+      const sourceTextOf = (name: string | null, t: number): object => {
+        const sample = ctx.sourceTextAt?.(name, t);
+        if (!sample) {
+          throw new Error(name === null
+            ? 'text.sourceText: this layer has no Source Text.'
+            : `text.sourceText: no text layer named “${name}”.`);
+        }
+        return makeSourceTextValue(sample, { foreign: name !== null });
+      };
+      const textGroup = (name: string | null): { readonly sourceText: object } => {
+        let memo: object | null = null;
+        return {
+          get sourceText() { return (memo ??= sourceTextOf(name, time)); },
+        };
+      };
+      const ownText = textGroup(null);
+      // On the Source Text property itself `value` IS the text, as in AE.
+      const textValue = ctx.textValue ? makeSourceTextValue(ctx.textValue) : null;
+      const propertyValue: unknown = textValue ?? value;
+      const propertyValueAtTime = textValue
+        ? (t: number): object => sourceTextOf(null, t)
+        : valueAtTime;
+
       const thisComp = {
         width: compInfo.width,
         height: compInfo.height,
@@ -723,6 +788,7 @@ export function compileExpression(src: string): CompiledExpression {
           height: compInfo.height,
           name,
           ...spaceFns(name),
+          text: textGroup(name),
         },
         marker: markerComp,
       };
@@ -737,10 +803,11 @@ export function compileExpression(src: string): CompiledExpression {
         // same way `sourceRectAtTime` is — one shorter to type, identical.
         ...ownSpace,
         marker: markerLayer,
+        text: ownText,
       };
       const thisProperty = {
-        value,
-        valueAtTime,
+        value: propertyValue,
+        valueAtTime: propertyValueAtTime,
         velocity,
         speed,
         velocityAtTime,
@@ -759,12 +826,12 @@ export function compileExpression(src: string): CompiledExpression {
       // `EXPRESSION_API` below, and `expressionApi.test.ts` asserts this Map and
       // that table hold the same names, which closes the loop.
       const scope = new Map<string, unknown>([
-        ['time', time], ['value', value], ['audio', audio], ['ctrl', ctrl],
+        ['time', time], ['value', propertyValue], ['audio', audio], ['ctrl', ctrl],
         ['wiggle', wiggle], ['clamp', clamp], ['linear', linear],
         ['ease', ease], ['easeIn', easeIn], ['easeOut', easeOut],
         ['timeToFrames', timeToFrames], ['framesToTime', framesToTime],
         ['random', random], ['Math', Math],
-        ['valueAtTime', valueAtTime], ['velocity', velocity], ['speed', speed],
+        ['valueAtTime', propertyValueAtTime], ['velocity', velocity], ['speed', speed],
         ['velocityAtTime', velocityAtTime],
         ['layer', layer], ['layerAt', layerAt],
         ['loopOut', loopOut], ['loopIn', loopIn],
@@ -779,6 +846,8 @@ export function compileExpression(src: string): CompiledExpression {
         ['posterizeTime', posterizeTime],
         ['add', add], ['sub', sub], ['mul', mul], ['div', div],
         ['dot', dot], ['cross', cross], ['length', length], ['normalize', normalize],
+        // ── Text ──
+        ['text', ownText],
       ]);
       // Reflect the REAL Map for the discoverability guard. Captured once
       // (first evaluation) rather than per run, because `run` is called per
@@ -787,21 +856,36 @@ export function compileExpression(src: string): CompiledExpression {
       if (boundNames.length === 0) boundNames = [...scope.keys()];
 
       try {
-        const out = evaluateExpression(ast, scope);
-        if (typeof out === 'number' && Number.isFinite(out)) return { value: out, error: null };
-        // AE-style vector returns: `[x, y]` (or [x,y,z]/[x,y,z,w]). The engine
-        // selects the component matching the decomposed track (x→0, y→1, z→2),
-        // so one expression drives Position instead of erroring out.
-        if (
-          Array.isArray(out) && out.length >= 1 && out.length <= 4 &&
-          out.every((v) => typeof v === 'number' && Number.isFinite(v))
-        ) {
-          return { value: out as number[], error: null };
-        }
-        return { value: null, error: 'Expression must return a number (or a [x, y] array).' };
+        return { out: evaluateExpression(ast, scope), error: null };
       } catch (e) {
-        return { value: null, error: humanize(e) };
+        return { out: null, error: humanize(e) };
       }
+  };
+
+  return {
+    src,
+    compileError,
+    run: (ctx) => {
+      if (compileError || !ast) return { value: null, error: compileError };
+      const { out, error } = evaluateRaw(ctx);
+      if (error) return { value: null, error };
+      if (typeof out === 'number' && Number.isFinite(out)) return { value: out, error: null };
+      // AE-style vector returns: `[x, y]` (or [x,y,z]/[x,y,z,w]). The engine
+      // selects the component matching the decomposed track (x→0, y→1, z→2),
+      // so one expression drives Position instead of erroring out.
+      if (
+        Array.isArray(out) && out.length >= 1 && out.length <= 4 &&
+        out.every((v) => typeof v === 'number' && Number.isFinite(v))
+      ) {
+        return { value: out as number[], error: null };
+      }
+      return { value: null, error: 'Expression must return a number (or a [x, y] array).' };
+    },
+    runText: (ctx) => {
+      if (compileError || !ast) return { result: null, error: compileError };
+      const { out, error } = evaluateRaw(ctx);
+      if (error) return { result: null, error };
+      return coerceSourceTextResult(out, ctx.textValue?.text ?? '');
     },
   };
 }
@@ -990,4 +1074,7 @@ export const EXPRESSION_API: { insert: string; label: string; hint: string }[] =
   { insert: 'cross([1, 0], [0, 1])', label: 'cross()', hint: '3D cross product (2-vectors take z=0)' },
   { insert: 'length(value)', label: 'length()', hint: 'magnitude, or distance between two points' },
   { insert: 'normalize(value)', label: 'normalize()', hint: 'unit vector' },
+  // ── Text ──
+  { insert: 'text.sourceText', label: 'text.sourceText', hint: 'this layer’s Source Text — a string: .length .split(" ") .style .getStyleAt(i)' },
+  { insert: 'text.sourceText.style.setFontSize(80)', label: 'text.sourceText.style', hint: 'text style: .fontSize .font .fillColor… and chainable setFontSize(v[, start, count]) setFillColor([r,g,b]) setText("…")' },
 ];

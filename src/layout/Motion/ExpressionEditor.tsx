@@ -30,8 +30,13 @@ import {
   tokenizeExpression,
   matchBracket,
   EXPRESSION_API,
+  SOURCE_TEXT_PROP,
   type TokenKind,
+  type ExprResult,
+  type SourceTextExpressionResult,
 } from '@motion/animation';
+import { installSourceTextProvider } from '@core/textExpr/sourceTextProvider';
+import { unsupportedRangeKeys } from '@core/textExpr/applySourceTextResult';
 import { runAnimEdit } from '@core/animation/animationCommands';
 import { PickWhip } from '@components/PickWhip';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
@@ -43,6 +48,23 @@ import styles from './ExpressionEditor.module.css';
 /** Chars that, once typed, mean the caret is inside a name worth completing. */
 const OPENS_COMPLETION = /[A-Za-z0-9_$.]/;
 const COMPLETION_LIST_ID = 'expression-completions';
+
+/** How a Source Text preview reads in the status line: the text, then what the style changed. */
+function describeTextResult(r: SourceTextExpressionResult | null): string {
+  if (!r) return '—';
+  const shown = r.text.length > 60 ? `${r.text.slice(0, 57)}…` : r.text;
+  const styled = Object.keys(r.style).length;
+  const extras = [
+    styled > 0 ? `${styled} style override${styled === 1 ? '' : 's'}` : '',
+    r.ranges.length > 0 ? `${r.ranges.length} character range${r.ranges.length === 1 ? '' : 's'}` : '',
+  ].filter(Boolean).join(', ');
+  return `“${shown}”${extras ? ` · ${extras}` : ''}`;
+}
+
+function describeNumber(p: ExprResult): string {
+  if (p.error || p.value === null) return '—';
+  return Array.isArray(p.value) ? `[${p.value.map((v) => v.toFixed(2)).join(', ')}]` : p.value.toFixed(2);
+}
 
 const TOKEN_CLASS: Record<TokenKind, string | undefined> = {
   num: styles.tNum,
@@ -92,12 +114,29 @@ export function ExpressionEditor({ nodeId, prop }: { nodeId: string; prop: strin
   const attached = defaultAnimation.hasExpression(nodeId, prop);
   const enabled = defaultAnimation.isExpressionEnabled(nodeId, prop);
 
+  // Source Text is a STRING property: its expression evaluates to text plus
+  // style overrides, previewed through its own engine entry point.
+  const isSourceText = prop === SOURCE_TEXT_PROP;
+
   // Live evaluation of the current draft at the playhead — through the engine
   // so valueAtTime / layer / loopOut preview exactly as playback resolves.
-  const preview = useMemo(
-    () => defaultAnimation.previewExpression(nodeId, prop, draft, time),
-    [draft, nodeId, prop, time],
-  );
+  const preview = useMemo(() => {
+    if (!isSourceText) {
+      const p = defaultAnimation.previewExpression(nodeId, prop, draft, time);
+      return { error: p.error, shown: describeNumber(p), note: null as string | null };
+    }
+    // Idempotent; the render hook installs it too, whichever runs first.
+    installSourceTextProvider();
+    const p = defaultAnimation.previewSourceTextExpression(nodeId, draft, time);
+    const unsupported = unsupportedRangeKeys(p.result);
+    return {
+      error: p.error,
+      shown: describeTextResult(p.result),
+      note: unsupported.length > 0
+        ? `Per-character ${unsupported.join(', ')} can’t be drawn per character and are ignored.`
+        : null,
+    };
+  }, [draft, nodeId, prop, time, isSourceText]);
 
   const commit = (src: string): void => {
     setDraft(src);
@@ -209,7 +248,12 @@ export function ExpressionEditor({ nodeId, prop }: { nodeId: string; prop: strin
     if (!name) return;
     const el = taRef.current;
     const at = el?.selectionStart ?? draft.length;
-    const next = insertAtCaret(draft, at, whipExpression(name, target.prop ?? prop));
+    // On Source Text, a whip onto a layer (or its Source Text) reads that
+    // layer's text — the numeric `layer(name, prop)` form cannot carry a string.
+    const reference = isSourceText && (target.prop === undefined || target.prop === SOURCE_TEXT_PROP)
+      ? `thisComp.layer(${JSON.stringify(name)}).text.sourceText`
+      : whipExpression(name, target.prop ?? prop);
+    const next = insertAtCaret(draft, at, reference);
     commit(next.text);
     setCaret(next.caret);
     // Focus and caret restored on the next tick, after the controlled value
@@ -294,7 +338,9 @@ export function ExpressionEditor({ nodeId, prop }: { nodeId: string; prop: strin
           className={styles.editor}
           value={draft}
           spellCheck={false}
-          placeholder="e.g. wiggle(2, 30)  ·  time * 90  ·  value + Math.sin(time*3)*40"
+          placeholder={isSourceText
+            ? 'e.g. value + "!"  ·  Math.round(time)  ·  value.style.setFontSize(80)'
+            : 'e.g. wiggle(2, 30)  ·  time * 90  ·  value + Math.sin(time*3)*40'}
           rows={2}
           // Combobox rather than plain textbox while the list can appear, so a
           // screen reader announces the highlighted row as it changes. The list
@@ -358,19 +404,16 @@ export function ExpressionEditor({ nodeId, prop }: { nodeId: string; prop: strin
         {attached && !enabled ? (
           <span className={styles.muted}>
             Disabled — the property uses its keyframes. Would be{' '}
-            {preview.error
-              ? '—'
-              : preview.value === null
-                ? '—'
-                : Array.isArray(preview.value)
-                  ? `[${preview.value.map((v) => v.toFixed(2)).join(', ')}]`
-                  : preview.value.toFixed(2)}{' '}
+            {preview.error ? '—' : preview.shown}{' '}
             <span className={styles.at}>@ {time.toFixed(2)}s</span>
           </span>
         ) : preview.error ? (
           <span className={styles.error}><Icon name="warning" size="sm" /> {preview.error}</span>
         ) : draft.trim() ? (
-          <span className={styles.value}>= {preview.value === null ? '—' : Array.isArray(preview.value) ? `[${preview.value.map((v) => v.toFixed(2)).join(', ')}]` : preview.value.toFixed(2)} <span className={styles.at}>@ {time.toFixed(2)}s</span></span>
+          <span className={styles.value}>
+            = {preview.shown} <span className={styles.at}>@ {time.toFixed(2)}s</span>
+            {preview.note ? <span className={styles.muted}> {preview.note}</span> : null}
+          </span>
         ) : (
           <span className={styles.muted}>No expression — the property uses its keyframes.</span>
         )}

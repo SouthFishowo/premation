@@ -12,6 +12,7 @@ import {
   type CustomViewParams,
 } from '@core/workspace/customViews';
 import { isCameraViewMode, type CameraViewMode } from '@core/scene/cameraViewMode';
+import { sanitizeStoredGuides, type StoredGuide } from '@core/workspace/guideGeometry';
 
 /** Which channel the viewport shows. Non-'rgb' values isolate that channel as
  *  greyscale (alpha = matte/coverage; red/green/blue = that colour component). */
@@ -157,6 +158,20 @@ export interface GuidesSettings {
   /** Motion-path frame-dot size: subtle / normal / bold ('off' hides dots but
    *  keeps the curve). Pro users tune this to taste. */
   motionPathDots: 'off' | 'small' | 'medium' | 'large';
+  /**
+   * How much of the motion path is drawn (AE Preferences ▸ Display ▸ Motion
+   * Path): every keyframe, none, or `motionPathWindowSeconds` of path centred
+   * on the playhead. Absent on older documents = 'all'.
+   */
+  motionPathShow?: 'all' | 'none' | 'window';
+  /** Span, in seconds, drawn when `motionPathShow === 'window'`. */
+  motionPathWindowSeconds?: number;
+  /**
+   * User ruler guides (AE 26.5: value + unit + pin edge + colour). The engine
+   * holds the live guides; this is the document copy `useGuideSync` keeps in
+   * step. Absent on older documents = none.
+   */
+  userGuides?: StoredGuide[];
   /** Camera bookmarks, comp id → slots. Absent on older documents. */
   cameraBookmarks?: Record<string, CameraBookmark[]>;
   /**
@@ -171,10 +186,20 @@ export type Gizmo3dState = 'universal' | 'position' | 'scale' | 'rotation';
 export type Gizmo3dAxisMode = 'local' | 'world' | 'view';
 
 /**
- * The active left-drag camera tool (C key cycles orbit → pan → dolly; Esc or
- * any tool pick returns to 'none' = normal selection). Session view state.
+ * The active drag camera tool (C key cycles unified → orbit → pan → dolly;
+ * Esc or any tool pick returns to 'none' = normal selection). Session view
+ * state. 'unified' is AE's Unified Camera: the mouse BUTTON picks the gesture
+ * (left = orbit, middle = track XY, right = track Z / dolly).
  */
-export type CameraTool = 'none' | 'orbit' | 'pan' | 'dolly';
+export type CameraTool = 'none' | 'unified' | 'orbit' | 'pan' | 'dolly';
+
+/**
+ * What the orbit gesture pivots on (AE's Orbit Around Cursor / Scene / Camera
+ * POI). Applies to the orbit tool AND the unified tool's left-drag; ortho and
+ * custom views keep their own promote-to-custom-view behaviour regardless.
+ * Session view state, like the camera tool itself.
+ */
+export type CameraOrbitPivot = 'cursor' | 'scene' | 'poi';
 
 interface GuidesStore extends GuidesSettings {
   camera3dMode: Camera3dMode;
@@ -232,6 +257,8 @@ interface GuidesStore extends GuidesSettings {
   smartGuides: boolean;
   /** Active left-drag camera tool (C-key cycling), 'none' = selection. */
   cameraTool: CameraTool;
+  /** What the orbit gesture pivots on — see {@link CameraOrbitPivot}. */
+  cameraOrbitPivot: CameraOrbitPivot;
   /**
    * Whether user guides are DRAWN (and grabbable). Locking is per guide in the
    * engine (`Guides.setLocked`); this is the View ▸ Show Guides switch, which
@@ -283,8 +310,9 @@ interface GuidesStore extends GuidesSettings {
   toggleSmartGuides: () => void;
   setSmartGuides: (on: boolean) => void;
   setCameraTool: (tool: CameraTool) => void;
-  /** C key: none → orbit → pan → dolly → orbit … */
+  /** C key: none → unified → orbit → pan → dolly → unified … */
   cycleCameraTool: () => void;
+  setCameraOrbitPivot: (pivot: CameraOrbitPivot) => void;
   /** Set (or clear, with null) the region of interest, in comp px. */
   setRoi: (roi: RegionOfInterest | null) => void;
   toggleChannel: () => void;
@@ -292,6 +320,13 @@ interface GuidesStore extends GuidesSettings {
   setChannel: (channel: ViewChannel) => void;
   toggleMotionPath: () => void;
   setMotionPathDots: (size: GuidesSettings['motionPathDots']) => void;
+  motionPathShow: 'all' | 'none' | 'window';
+  motionPathWindowSeconds: number;
+  setMotionPathShow: (show: 'all' | 'none' | 'window') => void;
+  setMotionPathWindowSeconds: (seconds: number) => void;
+  userGuides: StoredGuide[];
+  /** Replace the document's user guides (the engine sync calls this). */
+  setUserGuides: (guides: StoredGuide[]) => void;
   toggleGuidesVisible: () => void;
   setGuidesVisible: (on: boolean) => void;
   setOverlayOpacity: (opacity: number) => void;
@@ -385,10 +420,18 @@ export const useGuidesStore = create<GuidesStore>((set, get) => ({
   draft3d: false,
   smartGuides: true,
   cameraTool: 'none',
+  cameraOrbitPivot: 'poi',
   guidesVisible: true,
   cameraBookmarks: {},
   overlayOpacity: 1,
+  motionPathShow: 'all',
+  motionPathWindowSeconds: 2,
+  userGuides: [],
 
+  setMotionPathShow: (show) => set({ motionPathShow: show }),
+  setMotionPathWindowSeconds: (seconds) =>
+    set({ motionPathWindowSeconds: Number.isFinite(seconds) ? Math.max(0.1, Math.min(600, seconds)) : 2 }),
+  setUserGuides: (guides) => set({ userGuides: guides }),
   toggleGuidesVisible: () => set((s) => ({ guidesVisible: !s.guidesVisible })),
   setGuidesVisible: (on) => set({ guidesVisible: on }),
   setOverlayOpacity: (opacity) => set({ overlayOpacity: clampOverlayOpacity(opacity) }),
@@ -453,14 +496,17 @@ export const useGuidesStore = create<GuidesStore>((set, get) => ({
   toggleSmartGuides: () => set((s) => ({ smartGuides: !s.smartGuides })),
   setSmartGuides: (on) => set({ smartGuides: on }),
   setCameraTool: (tool) => set({ cameraTool: tool }),
+  // AE's C-key order: Unified first, then the three single-gesture tools.
   cycleCameraTool: () =>
     set((s) => ({
       cameraTool:
-        s.cameraTool === 'none' ? 'orbit'
+        s.cameraTool === 'none' ? 'unified'
+        : s.cameraTool === 'unified' ? 'orbit'
         : s.cameraTool === 'orbit' ? 'pan'
         : s.cameraTool === 'pan' ? 'dolly'
-        : 'orbit',
+        : 'unified',
     })),
+  setCameraOrbitPivot: (pivot) => set({ cameraOrbitPivot: pivot }),
   setRoi: (roi) => set({ roi }),
   toggleChannel: () => set((s) => ({ channel: s.channel === 'rgb' ? 'alpha' : 'rgb' })),
   setChannel: (channel) => set({ channel }),
@@ -470,7 +516,7 @@ export const useGuidesStore = create<GuidesStore>((set, get) => ({
     const {
       rulers, grid, gridSpacing, gridSubdivisions, snapToGrid, gridColor, gridStyle,
       proportionalGrid, proportionalColumns, proportionalRows, safeArea, motionPathVisible, motionPathDots,
-      cameraBookmarks, overlayOpacity,
+      cameraBookmarks, overlayOpacity, motionPathShow, motionPathWindowSeconds, userGuides,
     } = get();
     return {
       rulers, grid, gridSpacing, gridSubdivisions, snapToGrid, gridColor, gridStyle,
@@ -479,6 +525,8 @@ export const useGuidesStore = create<GuidesStore>((set, get) => ({
       // back byte-identical to one written before they existed.
       ...(Object.keys(cameraBookmarks).length ? { cameraBookmarks } : {}),
       ...(overlayOpacity !== 1 ? { overlayOpacity } : {}),
+      ...(motionPathShow !== 'all' ? { motionPathShow, motionPathWindowSeconds } : {}),
+      ...(userGuides.length ? { userGuides: userGuides.map((g) => ({ ...g })) } : {}),
     };
   },
   restore: (s) => {
@@ -504,6 +552,12 @@ export const useGuidesStore = create<GuidesStore>((set, get) => ({
     // Bookmarks are replaced wholesale: a document carries its own set, and a
     // blank document carries none.
     set({ cameraBookmarks: sanitizeBookmarks(s.cameraBookmarks) });
+    // User guides likewise: a document's guides, or none.
+    set({ userGuides: sanitizeStoredGuides(s.userGuides) });
+    set({
+      motionPathShow: s.motionPathShow === 'none' || s.motionPathShow === 'window' ? s.motionPathShow : 'all',
+    });
+    if (typeof s.motionPathWindowSeconds === 'number') get().setMotionPathWindowSeconds(s.motionPathWindowSeconds);
     // Legacy projects stored one `gridDivisions` (cells per axis) with no
     // absolute/proportional split. That value only ever described a
     // comp-relative division, so it restores onto the PROPORTIONAL grid — the
@@ -525,7 +579,7 @@ export const useGuidesStore = create<GuidesStore>((set, get) => ({
           return `${v.yaw},${v.pitch},${v.distance ?? '-'},${v.poi ? `${v.poi.x},${v.poi.y},${v.poi.z}` : '-'}`;
         })()
       : '-';
-    return `${s.rulers ? 1 : 0}${s.grid ? 1 : 0}:${s.gridSpacing}/${s.gridSubdivisions}/${s.gridStyle}:${s.proportionalGrid ? 1 : 0}${s.proportionalColumns}x${s.proportionalRows}:${s.gridColor}:${s.safeArea ? 1 : 0}:${s.camera3dMode}:${cv}:${s.viewLayout}:${s.secondaryViewMode}:${s.quadViewModes.join(',')}:${s.channel}:${s.motionPathVisible ? 1 : 0}:${s.motionPathDots}:${s.gizmo3dState}:${s.gizmo3dAxisMode}:${s.groundGridVisible ? 1 : 0}:${s.draft3d ? 1 : 0}:${roi}`;
+    return `${s.rulers ? 1 : 0}${s.grid ? 1 : 0}:${s.gridSpacing}/${s.gridSubdivisions}/${s.gridStyle}:${s.proportionalGrid ? 1 : 0}${s.proportionalColumns}x${s.proportionalRows}:${s.gridColor}:${s.safeArea ? 1 : 0}:${s.camera3dMode}:${cv}:${s.viewLayout}:${s.secondaryViewMode}:${s.quadViewModes.join(',')}:${s.channel}:${s.motionPathVisible ? 1 : 0}:${s.motionPathDots}:${s.motionPathShow}/${s.motionPathWindowSeconds}:${s.gizmo3dState}:${s.gizmo3dAxisMode}:${s.groundGridVisible ? 1 : 0}:${s.draft3d ? 1 : 0}:${roi}`;
   },
 }));
 

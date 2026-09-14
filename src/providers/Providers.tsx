@@ -83,6 +83,10 @@ import { buildChoreographyCommands } from '@core/animation/choreographyCommands'
 import { buildBeatCommands } from '@core/audio/beatCommands';
 import { buildSpeedRampCommands } from '@core/animation/speedRampCommands';
 import { buildLayerTimeCommands } from '@core/animation/layerTimeCommands';
+import { buildExpressionCommands } from '@core/animation/expressionCommands';
+import { buildLayerTransformCommands } from '@core/scene/layerTransformCommands';
+import { openTimeStretchDialog } from '@layout/Composition/TimeStretchDialog';
+import { openAutoOrientDialog } from '@layout/Composition/AutoOrientDialog';
 import { buildCameraCommands } from '@core/scene/cameraCommands';
 import {
   buildSmartAnimateCommands,
@@ -136,8 +140,9 @@ import { PresentationMode } from '@layout/Presentation/PresentationMode';
 import { openPalette } from '@stores/commandPaletteStore';
 import { focusNavigationClaimedNow } from '@core/commands/focusContext';
 import { isNativeMenuActionId } from '@layout/Menu/nativeMenuTemplate';
-import { insertAdjustmentLayer, insertPrimitive, insertSolid, deleteSelectedLayers, duplicateSelectedLayers, insert3DPrimitive } from '@core/scene/sceneInsert';
+import { insertAdjustmentLayer, insertPrimitive, deleteSelectedLayers, duplicateSelectedLayers, insert3DPrimitive } from '@core/scene/sceneInsert';
 import { openPrecomposeDialog } from '@layout/Composition/PrecomposeDialog';
+import { openSolidSettings } from '@layout/Composition/LayerSettingsDialog';
 import { openCameraDialog, openLightDialog } from '@layout/Workspace/SceneInsertDialogs';
 import { runSceneEditDetection, type SceneEditMode } from '@core/tracking/sceneEditCommand';
 import { getWorkspaceManager } from '@core/layout/workspaceManager';
@@ -337,6 +342,9 @@ function buildToolCommands(): ReadonlyArray<Command> {
     { tool: 'knife', label: 'Knife Tool', chord: { key: 'k' } },
     { tool: 'brush', label: 'Brush Tool' },
     { tool: 'text', label: 'Text Tool', chord: { key: 't', meta: true } },
+    // No chord of its own: AE reaches it by pressing Ctrl+T again, which the
+    // Text Tool command below does (it cycles horizontal ⇄ vertical).
+    { tool: 'vertical-text', label: 'Vertical Type Tool' },
     { tool: 'shape', label: 'Rectangle Tool', chord: { key: 'q' } },
     { tool: 'ellipse', label: 'Ellipse Tool', chord: { key: 'q', shift: true } },
     { tool: 'puppet-pin', label: 'Puppet Position Pin Tool', chord: { key: 'p', meta: true } },
@@ -376,6 +384,7 @@ function buildToolCommands(): ReadonlyArray<Command> {
     pen: 'pen',
     brush: 'brush',
     text: 'type',
+    'vertical-text': 'type-vertical',
     shape: 'square',
     ellipse: 'circle',
     'puppet-pin': 'puppet-pin',
@@ -396,7 +405,15 @@ function buildToolCommands(): ReadonlyArray<Command> {
     icon: TOOL_ICONS[tool] ?? ('crosshair' as const),
     ...(chord ? { shortcut: chord } : {}),
     enabled: () => true,
-    execute: () => useUIStore.getState().setActiveTool(tool),
+    execute: () => {
+      const ui = useUIStore.getState();
+      // AE: with a Type tool already active, Ctrl+T switches to the other one.
+      if (tool === 'text' && (ui.activeTool === 'text' || ui.activeTool === 'vertical-text')) {
+        ui.setActiveTool(ui.activeTool === 'text' ? 'vertical-text' : 'text');
+        return;
+      }
+      ui.setActiveTool(tool);
+    },
   }));
 }
 
@@ -410,14 +427,35 @@ function buildCameraToolCommands(): ReadonlyArray<Command> {
   return [
     {
       id: asCommandId('tool.cameraCycle'),
-      label: 'Camera Tool (Orbit / Pan / Dolly)',
+      label: 'Camera Tool (Unified / Orbit / Pan / Dolly)',
       icon: 'camera',
       shortcut: { key: 'c' },
       enabled: () => findNavTarget() !== null,
       execute: () => {
         useGuidesStore.getState().cycleCameraTool();
         const mode = useGuidesStore.getState().cameraTool;
-        notify(`Camera tool: ${mode === 'pan' ? 'Pan (Track XY)' : mode === 'dolly' ? 'Dolly' : 'Orbit'} — Esc to exit`, 'info');
+        notify(
+          `Camera tool: ${
+            mode === 'unified' ? 'Unified (left orbit · middle pan · right dolly)'
+            : mode === 'pan' ? 'Pan (Track XY)'
+            : mode === 'dolly' ? 'Dolly'
+            : 'Orbit'
+          } — Esc to exit`,
+          'info',
+        );
+      },
+    },
+    {
+      // The Unified Camera directly (AE's first camera tool), bindable in
+      // Customize… like every other tool. No default chord: C already cycles
+      // into it first, and every sensible bare key is taken.
+      id: asCommandId('tool.cameraUnified'),
+      label: 'Unified Camera Tool',
+      icon: 'camera',
+      enabled: () => findNavTarget() !== null,
+      execute: () => {
+        useGuidesStore.getState().setCameraTool('unified');
+        notify('Unified Camera: left-drag orbits, middle-drag pans, right-drag dollies — Esc to exit', 'info');
       },
     },
     {
@@ -921,11 +959,14 @@ function buildBuiltinCommands(): ReadonlyArray<Command> {
       },
     },
     {
-      /** AE Animation ▸ Keyframe Assistant ▸ Time-Reverse Keyframes (Ctrl/Cmd+Alt+R). */
+      /**
+       * AE Animation ▸ Keyframe Assistant ▸ Time-Reverse Keyframes. No default
+       * chord, as in AE: Ctrl/Cmd+Alt+R is AE's Time-Reverse LAYER, and now
+       * sits on `time.reverseLayer` (layerTimeCommands.ts).
+       */
       id: asCommandId('animation.timeReverseKeyframes'),
       label: 'Time-Reverse Keyframes',
       icon: 'skip-back',
-      shortcut: { key: 'r', meta: true, alt: true },
       enabled: () => {
         const id = useSelectionStore.getState().ids[0];
         return !!id && defaultAnimation.animatedProps(id).length > 0;
@@ -1324,7 +1365,9 @@ export function buildStaticCommands(): ReadonlyArray<Command> {
     ...buildChoreographyCommands(),
     ...buildBeatCommands(),
     ...buildSpeedRampCommands(),
-    ...buildLayerTimeCommands(),
+    ...buildLayerTimeCommands({ openTimeStretch: openTimeStretchDialog }),
+    ...buildExpressionCommands(),
+    ...buildLayerTransformCommands({ openAutoOrient: openAutoOrientDialog }),
     ...buildCameraCommands(),
     ...buildSmartAnimateCommands(),
     ...buildReframeCommands(),
@@ -1527,7 +1570,8 @@ function buildProjectCommands(): ReadonlyArray<Command> {
       label: 'Solid…',
       shortcut: { key: 'y', meta: true },
       enabled: () => true,
-      execute: () => insertSolid(),
+      // AE: Layer ▸ New ▸ Solid opens Solid Settings before inserting.
+      execute: () => openSolidSettings({ mode: 'new' }),
     },
     {
       // The AE-style options dialog, not a bare insert. This called
@@ -1685,8 +1729,9 @@ function buildProjectCommands(): ReadonlyArray<Command> {
     // through `sourceOf`, so a placed composition fits exactly like footage.
     ...([
       ['layer.fitToComp', 'Fit to Comp', 'contain' as const, { key: 'f', meta: true, alt: true }],
-      ['layer.fitToCompWidth', 'Fit to Comp Width', 'width' as const, undefined],
-      ['layer.fitToCompHeight', 'Fit to Comp Height', 'height' as const, undefined],
+      // AE's chords: Ctrl+Alt+Shift+H / G.
+      ['layer.fitToCompWidth', 'Fit to Comp Width', 'width' as const, { key: 'h', meta: true, alt: true, shift: true }],
+      ['layer.fitToCompHeight', 'Fit to Comp Height', 'height' as const, { key: 'g', meta: true, alt: true, shift: true }],
       ['layer.fillComp', 'Fill Comp (crop to frame)', 'cover' as const, undefined],
       ['layer.nativeSize', 'Set to Native Size', 'native' as const, undefined],
     ] as const).map(([id, label, mode, shortcut]) => ({
@@ -1702,6 +1747,8 @@ function buildProjectCommands(): ReadonlyArray<Command> {
     {
       id: asCommandId('layer.centreAnchor'),
       label: 'Centre Anchor Point in Layer Content',
+      // AE: Ctrl/Cmd+Alt+Home.
+      shortcut: { key: 'Home', meta: true, alt: true },
       enabled: () => useSelectionStore.getState().count() > 0,
       execute: () => {
         for (const nodeId of useSelectionStore.getState().ids) centreAnchorInContent(nodeId);
@@ -1726,6 +1773,9 @@ function buildProjectCommands(): ReadonlyArray<Command> {
       */
       id: asCommandId('layer.centreInComp'),
       label: 'Centre Layer in Comp',
+      // AE's Center In View: Ctrl/Cmd+Home. Plain Home stays "go to start" —
+      // useTimelineKeys ignores Home while Ctrl/Cmd is held.
+      shortcut: { key: 'Home', meta: true },
       enabled: () => useSelectionStore.getState().count() > 0,
       execute: () => {
         const frame = activeCompSize();

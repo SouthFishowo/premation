@@ -173,6 +173,9 @@ export const APP_MENU: MenuGroupModel[] = [
       { separator: true },
       { commandId: BuiltinCommands.DuplicateSelected, label: 'Duplicate' },
       { separator: true },
+      { commandId: 'text.findReplace', label: 'Find and Replace Text…' },
+      { commandId: 'text.replaceFonts', label: 'Find and Replace Fonts…' },
+      { separator: true },
       {
         // Text-based editing. Both act on the transcript panel's selection
         // rather than on layers — delete the selected words' time range from
@@ -322,6 +325,51 @@ export const APP_MENU: MenuGroupModel[] = [
       },
       { separator: true },
       {
+        /**
+         * AE's Layer ▸ Transform, in AE's order. Fit, Fill, Native Size and both
+         * Centre commands were registered with no menu line at all — reachable
+         * only by a chord (Ctrl+Alt+F) or by typing their names into the
+         * palette. Reset, the two Flips and Auto-Orient are new.
+         */
+        label: 'Transform',
+        children: [
+          { commandId: 'layer.resetTransform', label: 'Reset' },
+          {
+            label: 'Anchor Point',
+            children: [
+              { commandId: 'layer.centreAnchor', label: 'Center Anchor Point in Layer Content' },
+            ],
+          },
+          { commandId: 'layer.flipHorizontal', label: 'Flip Horizontal' },
+          { commandId: 'layer.flipVertical', label: 'Flip Vertical' },
+          { commandId: 'layer.centreInComp', label: 'Center In View' },
+          { separator: true },
+          { commandId: 'layer.fitToComp', label: 'Fit to Comp' },
+          { commandId: 'layer.fitToCompWidth', label: 'Fit to Comp Width' },
+          { commandId: 'layer.fitToCompHeight', label: 'Fit to Comp Height' },
+          { commandId: 'layer.fillComp', label: 'Fill Comp' },
+          { commandId: 'layer.nativeSize', label: 'Set to Native Size' },
+          { separator: true },
+          { commandId: 'layer.autoOrient', label: 'Auto-Orient…' },
+        ],
+      },
+      { commandId: 'layer.settings', label: 'Layer Settings…' },
+      {
+        // Text-layer verbs AE keeps on the layer: point ↔ paragraph conversion
+        // (no visual jump) and the Character panel's fill/stroke swap (Shift+X).
+        label: 'Text',
+        children: [
+          { commandId: 'text.convertToParagraphText', label: 'Convert to Paragraph Text' },
+          { commandId: 'text.convertToPointText', label: 'Convert to Point Text' },
+          { commandId: 'text.toggleOrientation', label: 'Convert to Vertical/Horizontal Text' },
+          { separator: true },
+          { commandId: 'text.swapFillStroke', label: 'Swap Fill and Stroke' },
+          { commandId: 'text.sourceTextExpression', label: 'Source Text Expression…' },
+        ],
+      },
+      // AE's Layer ▸ Guide Layer. Registered, with no menu line until now.
+      { commandId: 'layer.toggleGuide', label: 'Guide Layer' },
+      {
         label: 'Arrange',
         children: [
           { commandId: 'layer.bringToFront', label: 'Bring to Front' },
@@ -340,6 +388,7 @@ export const APP_MENU: MenuGroupModel[] = [
           { commandId: 'layer.nullsFromPath', label: 'Nulls From Path Points' },
           { commandId: 'layer.nullsFromPathLive', label: 'Nulls From Path Points (Points Follow Nulls)' },
           { commandId: 'layer.shapesFromText', label: 'Shapes From Text' },
+          { commandId: 'layer.masksFromText', label: 'Masks From Text' },
           { commandId: 'layer.autoTrace', label: 'Auto-trace…' },
         ],
       },
@@ -489,6 +538,7 @@ export const APP_MENU: MenuGroupModel[] = [
           { commandId: 'time.reverseLayer', label: 'Time-Reverse Layer' },
           { commandId: 'time.timeStretch', label: 'Time Stretch…' },
           { commandId: 'time.freezeFrame', label: 'Freeze Frame' },
+          { commandId: 'time.freezeOnLastFrame', label: 'Freeze On Last Frame' },
           { separator: true },
           { commandId: 'time.speedRamp.quarter', label: 'Speed Ramp to 25%' },
           { commandId: 'time.speedRamp.normal', label: 'Speed Ramp back to 100%' },

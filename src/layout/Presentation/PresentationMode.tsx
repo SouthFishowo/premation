@@ -12,7 +12,8 @@
  * Esc (or the close button) exits.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { getWorkspaceController } from '@core/workspace/WorkspaceController';
 import { createPortal } from 'react-dom';
 import { Icon } from '@components/Icon';
 import { usePresentationStore } from '@stores/presentationStore';
@@ -67,7 +68,16 @@ export function PresentationMode(): JSX.Element | null {
   // canvas was blank with no feedback while the GPU backend initialised).
   const [backendReady, setBackendReady] = useState(false);
 
-  const { initError } = useViewportRenderer(canvasRef, stageRef, sceneRev, time);
+  // Quality = Wireframe layers render hidden here (as in every viewer); their
+  // boxes come from the main viewport's scene, which follows the same view mode.
+  const wireframeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const wireframeOverlay = useMemo(
+    () => ({ canvasRef: wireframeCanvasRef, nodes: () => getWorkspaceController().sceneNodes() }),
+    [],
+  );
+  const { initError } = useViewportRenderer(
+    canvasRef, stageRef, sceneRev, time, undefined, undefined, undefined, undefined, wireframeOverlay,
+  );
   // NOTE: no usePlaybackClock here — App.tsx runs the single shared clock; a
   // second instance would double-tick the controller (2× playback speed).
 
@@ -280,6 +290,9 @@ export function PresentationMode(): JSX.Element | null {
 
       <div className={styles.stage} ref={stageRef}>
         <canvas ref={canvasRef} className={styles.canvas} />
+        {/* Quality = Wireframe boxes, laid exactly over the content canvas by
+            `paintWireframeOverlay` (position and size are set per frame). */}
+        <canvas ref={wireframeCanvasRef} aria-hidden style={{ position: 'absolute', pointerEvents: 'none' }} />
         {/* Loading spinner — shown until the first rAF fires (backend mounting).
             Prevents the user from seeing a blank stage and assuming it's broken. */}
         {!backendReady && !initError && (

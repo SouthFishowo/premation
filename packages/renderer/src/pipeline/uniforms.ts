@@ -160,13 +160,33 @@ export const SHADOW3D_FLOATS = MAT4_STD140_FLOATS + 4 + 4 + 4;
  */
 export const AO3D_FLOATS = MAT4_STD140_FLOATS + 4;
 
+/**
+ * Floats the Advanced-3D MATERIAL block occupies, between `envParams` and the
+ * AO block: vec4 reflParams (Reflection Intensity / Sharpness / Rolloff +
+ * the IOR-derived Schlick F0) + vec4 alphaParams (Transparency / Transparency
+ * Rolloff, zw spare).
+ *
+ * BEFORE the AO and shadow blocks, not after, for the reason `AO3D_FLOATS`
+ * documents: shadowMaps.test.ts reads the shadow blocks as "the last floats
+ * of the tail", and anything appended past them would silently become what
+ * that test reads. Beside `envParams` because that is what reflParams
+ * modulates.
+ *
+ * An absent shade packs zeros here like everywhere else; a PRESENT shade packs
+ * the identity (intensity 1, sharpness 0, rolloff 0, F0 of 1.52, transparency
+ * 0) so the shader's extra multiplies are ×1.0 / mix(…, 0.0) — byte-exact for
+ * every scene that has not touched the new axes.
+ */
+export const REFL3D_FLOATS = 4 + 4;
+
 /** Floats occupied by the shade tail appended to every 3d material uniform:
  *  mat4 model (16) + vec4 eye (4) + vec4 shadeParams (4) + lights (8×4 vec4)
- *  + vec4 envParams (4) + the AO block (20) + the shadow-map block (28). */
+ *  + vec4 envParams (4) + the reflection/transparency block (8) + the AO
+ *  block (20) + the shadow-map block (28). */
 /** Both shadow blocks together — the tail's last floats since plan B2 added a second mapped light. */
 export const SHADOW3D_TAIL_FLOATS = SHADOW3D_FLOATS * 2;
 export const SHADE3D_FLOATS =
-  MAT4_STD140_FLOATS + 4 + 4 + MAX_LIGHTS3D * LIGHT3D_VEC4S * 4 + 4 + AO3D_FLOATS + SHADOW3D_TAIL_FLOATS;
+  MAT4_STD140_FLOATS + 4 + 4 + MAX_LIGHTS3D * LIGHT3D_VEC4S * 4 + 4 + REFL3D_FLOATS + AO3D_FLOATS + SHADOW3D_TAIL_FLOATS;
 
 /** One scene light in the shader's terms. Structurally compatible with the
  *  FrameScene `SceneLight3D` DTO (kept independent so the pipeline layer does
@@ -210,6 +230,14 @@ export interface Shade3DLight {
 }
 
 const LIGHT3D_TYPE_ID: Record<Shade3DLight['type'], number> = { ambient: 0, point: 1, spot: 2, parallel: 3 };
+
+/** Schlick F0 from an index of refraction: ((n−1)/(n+1))². Twin of
+ *  `schlickF0FromIor` in src/core/scene/lightShading.ts — the CPU reference
+ *  the parity test compares against; keep them character-for-character. */
+function f0FromIor(ior: number): number {
+  const r = (ior - 1) / (ior + 1);
+  return r * r;
+}
 
 /** Per-draw lighting data for a 3D material. Absent → the shade tail packs as
  *  zeros with the lit flag off, so the shader is a byte-exact no-op. */
@@ -280,6 +308,35 @@ export interface Shade3D {
     /** HDR decode multiplier for the atlas — see `EnvSpecularMap.scale`. */
     scale: number;
   };
+  /**
+   * AE Advanced-3D Reflection Intensity, 0..1 per MATERIAL (the env block
+   * above is per SCENE). Absent packs 1 — the exact identity: the shader
+   * multiplies the env-specular term by it, and ×1.0 is a no-op in IEEE.
+   */
+  reflectionIntensity?: number;
+  /** Reflection Sharpness 0..1: the env atlas is sampled at
+   *  roughness × (1 − sharpness). Absent packs 0 (identity). */
+  reflectionSharpness?: number;
+  /** Reflection Rolloff 0..1: mix(1, Schlick F(N·V), rolloff) weights the env
+   *  term toward grazing angles. Absent packs 0 — mix(…, 0.0) is exactly 1. */
+  reflectionRolloff?: number;
+  /**
+   * Advanced-3D Transparency 0..1: `shadeAlpha3d` multiplies the fragment's
+   * alpha by 1 − t·mix(1, 1 − F(N·V), rolloff). Absent packs 0, and the
+   * shader early-outs to a literal 1.0 there — every entry point's
+   * `a * 1.0` is `a`, so untouched scenes render byte-identically.
+   */
+  transparency?: number;
+  /** Transparency Rolloff 0..1 — the Fresnel weight above. Absent packs 0. */
+  transparencyRolloff?: number;
+  /**
+   * Index of refraction feeding the Schlick F0 both rolloffs share. Absent
+   * packs F0(1.52) ≈ 0.0426 — inert while both rolloffs are 0, because each
+   * multiplies it by an exact 0 weight. Derived HERE (one producer) so the
+   * two shader dialects cannot disagree about the formula; the CPU twin is
+   * `schlickF0FromIor` in src/core/scene/lightShading.ts.
+   */
+  ior?: number;
   /**
    * GEOMETRY-AWARE shadows: the run's casters, rendered to a depth map from
    * one light, sampled per fragment to darken that light's contribution.
@@ -423,18 +480,31 @@ export function packShade3D(out: Float32Array, floatOffset: number, shade?: Shad
   // left (shadeParams.w became Metal). Zeros mean "no environment map", which
   // is what an absent `env` leaves behind and what every pre-existing scene
   // packs; the shader's reflection block is gated on x alone.
-  const envAt = end - SHADOW3D_TAIL_FLOATS - AO3D_FLOATS - 4;
+  const envAt = end - SHADOW3D_TAIL_FLOATS - AO3D_FLOATS - REFL3D_FLOATS - 4;
   if (shade.env) {
     out[envAt + 0] = 1;
     out[envAt + 1] = shade.env.intensity;
     out[envAt + 2] = shade.env.rotationRad;
     out[envAt + 3] = shade.env.scale;
   }
-  // The AO block, between envParams and the shadow block. Zeros unless the
-  // comp turned SSAO on AND the run actually produced a buffer — `strength` is
-  // both the gate and the amount, so a zero here leaves the shader's ambient
+  // reflParams + alphaParams — the Advanced-3D material axes (REFL3D_FLOATS).
+  // Written UNCONDITIONALLY for a present shade, because unlike every other
+  // block their identity is not all-zeros: Reflection Intensity's no-op is 1,
+  // and the F0 slot must hold a real Fresnel base for whichever rolloff wakes
+  // first. Each default below is an exact IEEE identity in the shader.
+  const reflAt = envAt + 4;
+  const clamp01 = (v: number): number => Math.max(0, Math.min(1, v));
+  out[reflAt + 0] = clamp01(shade.reflectionIntensity ?? 1);
+  out[reflAt + 1] = clamp01(shade.reflectionSharpness ?? 0);
+  out[reflAt + 2] = clamp01(shade.reflectionRolloff ?? 0);
+  out[reflAt + 3] = f0FromIor(shade.ior ?? 1.52);
+  out[reflAt + 4] = clamp01(shade.transparency ?? 0);
+  out[reflAt + 5] = clamp01(shade.transparencyRolloff ?? 0);
+  // The AO block, between the material axes and the shadow block. Zeros unless
+  // the comp turned SSAO on AND the run actually produced a buffer — `strength`
+  // is both the gate and the amount, so a zero here leaves the shader's ambient
   // term exactly the product it was before AO existed.
-  const aoAt = envAt + 4;
+  const aoAt = reflAt + REFL3D_FLOATS;
   if (shade.ao && shade.ao.strength > 0) {
     for (let i = 0; i < 16; i++) out[aoAt + i] = shade.ao.matrix[i] ?? 0;
     const a = aoAt + MAT4_STD140_FLOATS;
@@ -790,7 +860,11 @@ export function packSsaoBlur(
 
 /**
  * Polygonal bokeh gather: mat3 + uvRect + params(texelX, texelY, radius, blades)
- * + params2(roundness, highlightGain, 0, 0).
+ * + params2(roundness, highlightGain, irisRotation RADIANS, irisAspect)
+ * + params3(highlightThreshold 0..1, highlightSaturation, fringe 0..1, 0).
+ *
+ * Neutral extras (rotation 0, aspect 1, threshold/saturation/fringe 0) reduce
+ * to the pre-extras maths exactly — the shader multiplies by 1 / adds 0.
  */
 export function packBokeh(
   mvp: Mat3,
@@ -801,8 +875,13 @@ export function packBokeh(
   blades: number,
   roundness: number,
   highlightGain: number,
+  irisRotationRad = 0,
+  irisAspect = 1,
+  highlightThreshold = 0,
+  highlightSaturation = 0,
+  fringe = 0,
 ): Float32Array {
-  const out = new Float32Array(MAT3_STD140_FLOATS + 4 + 4 + 4);
+  const out = new Float32Array(MAT3_STD140_FLOATS + 4 + 4 + 4 + 4);
   let o = packMat3(mvp, out, 0);
   o = packRect(uvRect, out, o);
   out[o + 0] = texelX;
@@ -811,14 +890,23 @@ export function packBokeh(
   out[o + 3] = blades;
   out[o + 4] = roundness;
   out[o + 5] = highlightGain;
-  out[o + 6] = 0;
-  out[o + 7] = 0;
+  out[o + 6] = irisRotationRad;
+  out[o + 7] = irisAspect;
+  out[o + 8] = highlightThreshold;
+  out[o + 9] = highlightSaturation;
+  out[o + 10] = fringe;
+  out[o + 11] = 0;
   return out;
 }
 
 /**
  * Planar per-pixel CoC: bilinear corner radii (already in texels) + optional iris.
  * `fxBox` is the layer's extent in the effect buffer (same as gradient ramp).
+ *
+ * params  = (texelX, texelY, blades, irisRotation RADIANS)
+ * params2 = (roundness, highlightGain, irisAspect, highlightThreshold 0..1)
+ * irisP   = (highlightSaturation, fringe 0..1, 0, 0)
+ * Neutral extras reduce to the pre-extras maths exactly.
  */
 export function packCocBlur(
   mvp: Mat3,
@@ -830,26 +918,35 @@ export function packCocBlur(
   blades: number,
   roundness: number,
   highlightGain: number,
+  irisRotationRad = 0,
+  irisAspect = 1,
+  highlightThreshold = 0,
+  highlightSaturation = 0,
+  fringe = 0,
 ): Float32Array {
-  const out = new Float32Array(MAT3_STD140_FLOATS + 4 + 4 + 4 + 4 + 4);
+  const out = new Float32Array(MAT3_STD140_FLOATS + 4 + 4 + 4 + 4 + 4 + 4);
   let o = packMat3(mvp, out, 0);
   o = packRect(uvRect, out, o);
   out[o + 0] = texelX;
   out[o + 1] = texelY;
   out[o + 2] = blades;
-  out[o + 3] = 0;
+  out[o + 3] = irisRotationRad;
   o += 4;
   out[o + 0] = roundness;
   out[o + 1] = highlightGain;
-  out[o + 2] = 0;
-  out[o + 3] = 0;
+  out[o + 2] = irisAspect;
+  out[o + 3] = highlightThreshold;
   o += 4;
   out[o + 0] = cornersTexels[0];
   out[o + 1] = cornersTexels[1];
   out[o + 2] = cornersTexels[2];
   out[o + 3] = cornersTexels[3];
   o += 4;
-  packRect(fxBox, out, o);
+  o = packRect(fxBox, out, o);
+  out[o + 0] = highlightSaturation;
+  out[o + 1] = fringe;
+  out[o + 2] = 0;
+  out[o + 3] = 0;
   return out;
 }
 
@@ -859,10 +956,13 @@ export function packCocBlur(
  * + params(texelX, texelY, blades, roundness)
  * + params2(highlightGain, maxRadiusPx, depthA, depthB)
  * + dofP(focus, aperture, strength, focalLength)
- * + dofP2(fStop or 0 = legacy ramp, 0, 0, 0).
+ * + dofP2(fStop or 0 = legacy ramp, irisRotation RADIANS, irisAspect, highlightThreshold 0..1)
+ * + dofP3(highlightSaturation, fringe 0..1, 0, 0).
  *
  * depthA/depthB are the 3D projection's z-row entries (proj[10], proj[14]);
  * the shader inverts the stored depth back to camera-space z with them.
+ * Neutral iris extras (rotation 0, aspect 1, threshold/saturation/fringe 0)
+ * reduce to the pre-extras maths exactly.
  */
 export function packDofGather(
   mvp: Mat3,
@@ -880,8 +980,13 @@ export function packDofGather(
   strength: number,
   focalLength: number,
   fStop: number,
+  irisRotationRad = 0,
+  irisAspect = 1,
+  highlightThreshold = 0,
+  highlightSaturation = 0,
+  fringe = 0,
 ): Float32Array {
-  const out = new Float32Array(MAT3_STD140_FLOATS + 4 + 4 + 4 + 4 + 4);
+  const out = new Float32Array(MAT3_STD140_FLOATS + 4 + 4 + 4 + 4 + 4 + 4);
   let o = packMat3(mvp, out, 0);
   o = packRect(uvRect, out, o);
   out[o + 0] = texelX;
@@ -900,7 +1005,12 @@ export function packDofGather(
   out[o + 3] = focalLength;
   o += 4;
   out[o + 0] = fStop;
-  out[o + 1] = 0;
+  out[o + 1] = irisRotationRad;
+  out[o + 2] = irisAspect;
+  out[o + 3] = highlightThreshold;
+  o += 4;
+  out[o + 0] = highlightSaturation;
+  out[o + 1] = fringe;
   out[o + 2] = 0;
   out[o + 3] = 0;
   return out;

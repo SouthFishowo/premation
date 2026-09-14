@@ -101,7 +101,14 @@ describe('TextSpec → raster cache signature parity', () => {
     expect(fields).toContain('glyphs');
     // 24, then +8 (2026-09-05): the Character panel's case / small caps /
     // super-sub / scale / baseline shift and the layer's own text stroke.
-    expect(fields.length).toBe(32);
+    // +1 (2026-09-13): `textExtras` — AE indents, justification, faux styles,
+    // stroke join/order, none swatches and kerning mode, bundled in one field.
+    // +2 (2026-09-13): `fontAxes` (variable-font axes beyond wght/wdth/slnt)
+    // and `fillPaint` (a gradient across the text block).
+    // +1 (2026-09-13): `strokePaint` — a gradient on the text stroke.
+    // (RTL direction, vertical orientation and the auto-height box offset ride
+    // inside `textExtras`, which is keyed whole.)
+    expect(fields.length).toBe(36);
   });
 
   it.each(

@@ -297,4 +297,11 @@ export function restoreDocument(doc: EditorDocument): void {
   // asset store runs the same rebind when hydration lands, so whichever
   // finishes second completes the repair.
   rebindAssetSrcs(useAssetStore.getState().assets);
+
+  // A cloud open never emits ProjectLoaded, so the missing-font watcher would
+  // not run; ask directly, deferred like the watcher so web fonts can register.
+  // Dynamic import keeps core/api free of a static dependency on the UI layer.
+  setTimeout(() => {
+    void import('@layout/Text/missingFontsWatcher').then((m) => m.checkMissingFonts()).catch(() => {});
+  }, 400);
 }

@@ -22,7 +22,21 @@ export interface Guide {
   locked: boolean;
   /** Distinguishes user guides from derived (center/safe-area) guides. */
   kind: 'user' | 'center' | 'safe-area' | 'margin';
+  /**
+   * AE 26.5 guide metadata (all optional; absent = px / start / theme colour).
+   * `position` stays the live world coordinate the engine snaps and draws with;
+   * these say how the host re-resolves it when the composition is resized —
+   * see the app's `guideGeometry`.
+   */
+  unit?: 'px' | '%';
+  /** `end` pins the guide to the right (x) / bottom (y) edge of the comp. */
+  edge?: 'start' | 'end';
+  /** Per-guide stroke colour (CSS colour string). */
+  color?: string;
 }
+
+/** The editable fields of a guide. */
+export type GuidePatch = Partial<Pick<Guide, 'position' | 'unit' | 'edge' | 'color' | 'locked'>>;
 
 interface GuideEvents {
   added: { guide: Guide };
@@ -78,6 +92,45 @@ export class Guides {
     this.events.emit('moved', { guide: g });
     this.events.emit('changed', {});
     return true;
+  }
+
+  /**
+   * Edit a guide's position and/or metadata in one change. Unlike `move`, a
+   * locked guide still takes a metadata edit (colour, unit, pin) — the lock is
+   * about dragging it by accident, and the editor is a deliberate act. A
+   * `color`/`unit`/`edge` of `undefined` in the patch clears that field.
+   */
+  update(id: string, patch: GuidePatch): boolean {
+    const g = this.guides.get(id);
+    if (!g) return false;
+    if (patch.position !== undefined && Number.isFinite(patch.position)) g.position = patch.position;
+    if ('unit' in patch) { if (patch.unit === undefined || patch.unit === 'px') delete g.unit; else g.unit = patch.unit; }
+    if ('edge' in patch) { if (patch.edge === undefined || patch.edge === 'start') delete g.edge; else g.edge = patch.edge; }
+    if ('color' in patch) { if (!patch.color) delete g.color; else g.color = patch.color; }
+    if (patch.locked !== undefined) g.locked = patch.locked;
+    this.events.emit('moved', { guide: g });
+    this.events.emit('changed', {});
+    return true;
+  }
+
+  /**
+   * Replace every USER guide wholesale (document restore). Derived guides are
+   * untouched; one `changed` event is emitted for the lot.
+   */
+  replaceUserGuides(
+    list: ReadonlyArray<{ axis: GuideAxis; position: number; locked?: boolean; unit?: 'px' | '%'; edge?: 'start' | 'end'; color?: string }>,
+  ): void {
+    for (const [id, g] of [...this.guides]) {
+      if (g.kind === 'user') this.guides.delete(id);
+    }
+    for (const item of list) {
+      const guide: Guide = { id: nextGuideId(), axis: item.axis, position: item.position, locked: item.locked === true, kind: 'user' };
+      if (item.unit === '%') guide.unit = '%';
+      if (item.edge === 'end') guide.edge = 'end';
+      if (item.color) guide.color = item.color;
+      this.guides.set(guide.id, guide);
+    }
+    this.events.emit('changed', {});
   }
 
   setLocked(id: string, locked: boolean): boolean {

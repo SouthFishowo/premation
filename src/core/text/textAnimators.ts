@@ -39,6 +39,9 @@ import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { bumpScene } from '@stores/sceneStore';
 import { parseExpression, evaluateExpression } from '@motion/animation';
 import { clamp01 } from '@utils/lang';
+import { splitGraphemes } from './graphemes';
+import { mixCssColors } from './cssColor';
+import { isAxisTag, MAX_ANIMATED_AXES } from './fontAxes';
 import {
   defaultRangeSelector,
   defaultSelector,
@@ -115,10 +118,65 @@ export const ANIMATOR_PARAMS = [
   // Per-character 3D" — each glyph becomes its own plane, so an animator can
   // push glyphs in Z and tumble them about X/Y. Flat text ignores them.
   'z', 'rotationX', 'rotationY',
-  // Paint / typography.
-  'fillOpacity', 'strokeWidth', 'lineSpacing', 'characterOffset', 'blur',
+  // Paint / typography. `blur` is AE's 2-D animator Blur: the X radius, with
+  // `blurY` diverging the Y radius once unlinked (absent = linked/uniform).
+  'fillOpacity', 'strokeWidth', 'lineSpacing', 'characterOffset', 'blur', 'blurY',
+  // OPTIONAL properties (AE's "Add ▸ Property" menu). Absent from an animator
+  // until added, so an animator written before them evaluates — and hashes —
+  // exactly as it did. See OPTIONAL_ANIMATOR_PROPERTIES.
+  'anchorX', 'anchorY', 'anchorZ', 'skewAxis', 'lineAnchor', 'characterValue',
+  'fillHue', 'fillSaturation', 'fillBrightness',
+  'strokeOpacity', 'strokeHue', 'strokeSaturation', 'strokeBrightness',
 ] as const;
 export type AnimatorParam = (typeof ANIMATOR_PARAMS)[number];
+
+/** How Character Offset walks: AE's "Character Range". */
+export type CharacterRange = 'preserve' | 'full';
+/** Where animator tracking is added around each character: AE's "Tracking Type". */
+export type TrackingType = 'beforeAfter' | 'before' | 'after';
+
+/**
+ * The properties an animator carries only once ADDED — AE's Animate / Add ▸
+ * Property menu. `defaultValue` is what a freshly added one holds (its no-op).
+ */
+export const OPTIONAL_ANIMATOR_PROPERTIES: ReadonlyArray<{
+  param: AnimatorParam;
+  label: string;
+  unit: string;
+  defaultValue: number;
+  min?: number;
+  max?: number;
+  step?: number;
+  group: 'transform' | 'typography' | 'fill' | 'stroke';
+}> = [
+  { param: 'anchorX', label: 'Anchor Point X', unit: 'px', defaultValue: 0, group: 'transform' },
+  { param: 'anchorY', label: 'Anchor Point Y', unit: 'px', defaultValue: 0, group: 'transform' },
+  { param: 'anchorZ', label: 'Anchor Point Z', unit: 'px', defaultValue: 0, group: 'transform' },
+  { param: 'skewAxis', label: 'Skew Axis', unit: '°', defaultValue: 0, group: 'transform' },
+  { param: 'lineAnchor', label: 'Line Anchor', unit: '%', defaultValue: 0, min: 0, max: 100, group: 'typography' },
+  { param: 'characterValue', label: 'Character Value', unit: '', defaultValue: 65, min: 0, max: 0x10ffff, step: 1, group: 'typography' },
+  { param: 'fillHue', label: 'Fill Hue', unit: '°', defaultValue: 0, group: 'fill' },
+  { param: 'fillSaturation', label: 'Fill Saturation', unit: '%', defaultValue: 0, min: -100, max: 100, group: 'fill' },
+  { param: 'fillBrightness', label: 'Fill Brightness', unit: '%', defaultValue: 0, min: -100, max: 100, group: 'fill' },
+  { param: 'strokeOpacity', label: 'Stroke Opacity', unit: '%', defaultValue: 100, min: 0, max: 100, group: 'stroke' },
+  { param: 'strokeHue', label: 'Stroke Hue', unit: '°', defaultValue: 0, group: 'stroke' },
+  { param: 'strokeSaturation', label: 'Stroke Saturation', unit: '%', defaultValue: 0, min: -100, max: 100, group: 'stroke' },
+  { param: 'strokeBrightness', label: 'Stroke Brightness', unit: '%', defaultValue: 0, min: -100, max: 100, group: 'stroke' },
+];
+
+/** AE's "All Transform Properties": the optional transform properties it adds
+ *  (position / scale / skew / rotation / opacity are always present here). */
+export const ALL_TRANSFORM_OPTIONAL: ReadonlyArray<AnimatorParam> = ['anchorX', 'anchorY', 'skewAxis'];
+
+/** Prop-path of a Font Axis property: `ta.<i>.axis<TAG>`. */
+export function animatorAxisPropPath(index: number, tag: string): string {
+  return `ta.${index}.axis${tag}`;
+}
+
+/** The tag an animator param names when it is a Font Axis (`axisGRAD`), else null. */
+export function axisTagOfParam(param: string): string | null {
+  return /^axis[A-Za-z0-9]{4}$/.test(param) ? param.slice(4) : null;
+}
 
 /** Keyframeable numeric parameters of a SELECTOR. */
 export const SELECTOR_PARAMS = [
@@ -193,8 +251,12 @@ export interface TextAnimatorData {
    * scrambling / decode reveal, and it cannot be faked with transforms.
    */
   characterOffset?: number;
-  /** Per-glyph blur, px. */
+  /** Per-glyph blur, px. AE's animator Blur is 2-D: this is the X radius. */
   blur?: number;
+  /** Per-glyph vertical blur, px. ABSENT means linked to `blur` (uniform) —
+   *  the pre-2-D scalar shape every older document carries. Present only once
+   *  the axes are unlinked, so an untouched animator round-trips byte-identical. */
+  blurY?: number;
   /** Skew, degrees (italic-style shear per glyph). */
   skew?: number;
   /** Fill colour the covered glyphs blend toward. */
@@ -202,6 +264,34 @@ export interface TextAnimatorData {
   /** Stroke colour and width for the covered glyphs. */
   strokeColor?: string;
   strokeWidth?: number;
+
+  // ── Optional properties (present once added; see OPTIONAL_ANIMATOR_PROPERTIES) ──
+  /** Per-character anchor offset, px: the glyph is drawn at −anchor about its
+   *  transform origin, as a layer's content sits about its anchor point. */
+  anchorX?: number;
+  anchorY?: number;
+  anchorZ?: number;
+  /** Angle of the axis Skew shears along, degrees (0 = horizontal shear). */
+  skewAxis?: number;
+  /** Where animator tracking pivots within each line, 0–100 %. */
+  lineAnchor?: number;
+  /** Replace affected characters with this Unicode code point. */
+  characterValue?: number;
+  /** Character Offset's walk: letters/digits within their own set, or all of Unicode. */
+  characterRange?: CharacterRange;
+  /** Where Tracking is added. Absent = after (this build's original behaviour). */
+  trackingType?: TrackingType;
+  /** HSB offsets applied to the base fill / stroke colour. */
+  fillHue?: number;
+  fillSaturation?: number;
+  fillBrightness?: number;
+  /** Stroke-only opacity, percent. */
+  strokeOpacity?: number;
+  strokeHue?: number;
+  strokeSaturation?: number;
+  strokeBrightness?: number;
+  /** Font Axis offsets by tag (AE 26), at most MAX_ANIMATED_AXES per layer. */
+  axes?: Record<string, number>;
 
   // ── Legacy flat selector fields (read for migration, never written) ──
   /** @deprecated moved to `selectors[0].basedOn`. */
@@ -238,10 +328,29 @@ export interface ResolvedAnimator {
   lineSpacing: number;
   characterOffset: number;
   blur: number;
+  /** Y blur radius, px. Undefined = linked to `blur` (uniform). */
+  blurY?: number;
   skew: number;
   strokeWidth: number;
   color?: string;
   strokeColor?: string;
+  // Optional properties — undefined when the animator has not added them.
+  anchorX?: number;
+  anchorY?: number;
+  anchorZ?: number;
+  skewAxis?: number;
+  lineAnchor?: number;
+  characterValue?: number;
+  characterRange?: CharacterRange;
+  trackingType?: TrackingType;
+  fillHue?: number;
+  fillSaturation?: number;
+  fillBrightness?: number;
+  strokeOpacity?: number;
+  strokeHue?: number;
+  strokeSaturation?: number;
+  strokeBrightness?: number;
+  axes?: Record<string, number>;
 }
 
 /** Per-glyph transform the rasterizer applies when laying out animated text. */
@@ -268,19 +377,50 @@ export interface GlyphTransform {
   tracking: number;
   /** Extra leading for the line this glyph sits on, px. */
   lineSpacing: number;
-  /** Blur radius, px. */
+  /** Blur radius, px — the X radius of AE's 2-D animator Blur. */
   blur: number;
+  /** Y blur radius, px. Set ONLY when it diverges from `blur`, so a uniform
+   *  blur's glyph list — and every cache key hashed from it — is unchanged. */
+  blurY?: number;
   /** Shear, degrees (applied as a horizontal skew per glyph). */
   skew: number;
   /** Colour to blend toward, with `colorMix` as the blend amount. */
   color?: string;
   colorMix?: number;
-  /** Stroke to paint under/over the glyph. */
+  /** Stroke to paint under/over the glyph. Applies to the layer's own stroke
+   *  too, whenever the layer has one — not only when the animator adds width. */
   strokeColor?: string;
+  /** How far toward `strokeColor` the stroke is blended (selector amount). */
+  strokeColorMix?: number;
   strokeWidth: number;
   /** The character actually drawn, after Character Offset walked it through
    *  its alphabet. Equals `char` when no animator offsets it. */
   displayChar: string;
+
+  // ── Optional (set only when an animator adds the property, so an existing
+  //    document's glyph list — and the cache key built from it — is unchanged) ──
+  /** Anchor offset, px: drawn at −anchor in the glyph's transformed frame. */
+  anchorX?: number;
+  anchorY?: number;
+  /** Depth anchor, px — per-character 3D only (perChar3D.ts pivots about it). */
+  anchorZ?: number;
+  /** Skew axis, degrees. */
+  skewAxis?: number;
+  /** Line Anchor, 0..1 — where this line's animator tracking pivots. */
+  lineAnchor?: number;
+  /** Px of this glyph's animator tracking that sits BEFORE it (Tracking Type). */
+  trackingBefore?: number;
+  /** HSB offsets on the fill (degrees, %, %). */
+  fillHue?: number;
+  fillSaturation?: number;
+  fillBrightness?: number;
+  /** Stroke-only opacity multiplier, 0..1. */
+  strokeOpacity?: number;
+  strokeHue?: number;
+  strokeSaturation?: number;
+  strokeBrightness?: number;
+  /** Font Axis offsets by tag. */
+  axes?: Record<string, number>;
 }
 
 /** An identity glyph transform — every field at its no-op value. Callers that
@@ -418,6 +558,10 @@ const ALPHABETS: ReadonlyArray<readonly [number, number]> = [
  *  no alphabet (punctuation, spaces, CJK) are left alone. */
 export function offsetCharacter(ch: string, n: number): string {
   if (!n) return ch;
+  // A grapheme cluster ('é' as e + U+0301, an emoji sequence) is not a letter
+  // in any alphabet we walk — rebuilding it from its first code point would
+  // silently drop the rest of the cluster.
+  if ([...ch].length !== 1) return ch;
   const code = ch.codePointAt(0);
   if (code === undefined) return ch;
   for (const [lo, hi] of ALPHABETS) {
@@ -428,6 +572,30 @@ export function offsetCharacter(ch: string, n: number): string {
     }
   }
   return ch;
+}
+
+/**
+ * Character Range "Full Unicode": shift the code point itself by `n`, stepping
+ * over the surrogate block (not characters) and staying within printable
+ * space (U+0020..U+10FFFF). Multi-code-point clusters are left alone, as in
+ * {@link offsetCharacter}.
+ */
+export function offsetCharacterFull(ch: string, n: number): string {
+  const k = Math.round(n);
+  if (!k || [...ch].length !== 1) return ch;
+  const code = ch.codePointAt(0);
+  if (code === undefined) return ch;
+  let c = code + k;
+  if (c >= 0xd800 && c <= 0xdfff) c += k > 0 ? 0x800 : -0x800;
+  c = Math.max(0x20, Math.min(0x10ffff, c));
+  return String.fromCodePoint(c);
+}
+
+/** Character Value: the code point as a drawable character (clamped, surrogates refused). */
+export function characterFromValue(value: number): string | null {
+  const c = Math.round(value);
+  if (!Number.isFinite(c) || c < 0x20 || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff)) return null;
+  return String.fromCodePoint(c);
 }
 
 /**
@@ -443,7 +611,8 @@ export function evaluateTextAnimators(
   animators: readonly ResolvedAnimator[],
   time = 0,
 ): GlyphTransform[] {
-  const chars = [...text];
+  // Grapheme clusters — the index space runs, selectors and layout share.
+  const chars = splitGraphemes(text);
   const glyphs: GlyphTransform[] = chars.map((ch) => identityGlyphTransform(ch));
 
   // One unit map per basedOn per string, shared across every selector that
@@ -461,13 +630,23 @@ export function evaluateTextAnimators(
   // Character Offset accumulates as a number and is applied ONCE at the end —
   // walking the alphabet twice for two animators would compound the wrap.
   const charShift = new Array<number>(chars.length).fill(0);
+  // Character Value replaces (last affecting animator wins); Character Range
+  // decides how the accumulated offset then walks.
+  const charValue = new Array<number | undefined>(chars.length);
+  const charRange = new Array<CharacterRange | undefined>(chars.length);
 
   for (const a of animators) {
     if (!a.enabled) continue;
     for (let i = 0; i < chars.length; i++) {
+      // Line Anchor is a property of the LINE, not a per-character amount: it
+      // says where tracking pivots, so it applies whatever the selector says.
+      if (a.lineAnchor !== undefined) glyphs[i]!.lineAnchor = clamp01(a.lineAnchor / 100);
       const w = evaluateSelectors(a.selectors, i, unitsFor, time);
       if (w.x <= 0 && w.y <= 0) continue;
       const g = glyphs[i]!;
+      applyOptionalProperties(g, a, w.x, w.y);
+      if (a.characterValue !== undefined && w.x >= 0.5) charValue[i] = a.characterValue;
+      if (a.characterRange && a.characterOffset) charRange[i] = a.characterRange;
       g.dx += a.x * w.x;
       g.dy += a.y * w.y;
       if (a.z) g.dz = (g.dz ?? 0) + a.z * w.x;
@@ -477,6 +656,17 @@ export function evaluateTextAnimators(
       g.tracking += a.tracking * w.x;
       g.lineSpacing += a.lineSpacing * w.y;
       g.skew += a.skew * w.x;
+      // 2-D blur. The Y radius exists only once an animator unlinks it
+      // (a.blurY defined and different) — a scalar-blur stack keeps the
+      // single field, so an existing document's glyph list is field-for-field
+      // what it always was. Once diverged, every animator feeds Y through the
+      // selector's Y weight, the axis rule position and scale follow.
+      {
+        const aBlurY = a.blurY ?? a.blur;
+        if (aBlurY !== a.blur || g.blurY !== undefined) {
+          g.blurY = (g.blurY ?? g.blur) + aBlurY * w.y;
+        }
+      }
       g.blur += a.blur * w.x;
       g.strokeWidth += a.strokeWidth * w.x;
       charShift[i] = (charShift[i] ?? 0) + a.characterOffset * w.x;
@@ -488,15 +678,61 @@ export function evaluateTextAnimators(
         g.color = a.color;
         g.colorMix = Math.max(g.colorMix ?? 0, clamp01(w.x));
       }
-      if (a.strokeColor) g.strokeColor = a.strokeColor;
+      if (a.strokeColor) {
+        g.strokeColor = a.strokeColor;
+        g.strokeColorMix = Math.max(g.strokeColorMix ?? 0, clamp01(w.x));
+      }
     }
   }
 
   for (let i = 0; i < glyphs.length; i++) {
+    const g = glyphs[i]!;
+    // Value first, then the offset walks from the replaced character — AE's
+    // order, so a Character Value + Character Offset pair counts up from it.
+    const replaced = charValue[i] !== undefined ? characterFromValue(charValue[i]!) : null;
+    const from = replaced ?? g.char;
     const shift = Math.round(charShift[i] ?? 0);
-    if (shift) glyphs[i]!.displayChar = offsetCharacter(glyphs[i]!.char, shift);
+    const walked = shift ? (charRange[i] === 'full' ? offsetCharacterFull(from, shift) : offsetCharacter(from, shift)) : from;
+    if (walked !== g.char) g.displayChar = walked;
   }
   return glyphs;
+}
+
+/**
+ * The optional properties' per-glyph maths. Every field is touched only when
+ * the animator carries the property, so a glyph list from an animator that
+ * predates them is identical — field for field — to what it always was.
+ */
+function applyOptionalProperties(g: GlyphTransform, a: ResolvedAnimator, wx: number, wy: number): void {
+  const add = (key: 'anchorX' | 'anchorY' | 'anchorZ' | 'skewAxis' | 'fillHue' | 'fillSaturation' | 'fillBrightness' | 'strokeHue' | 'strokeSaturation' | 'strokeBrightness', v: number | undefined, w: number): void => {
+    if (v === undefined || !v) return;
+    g[key] = (g[key] ?? 0) + v * w;
+  };
+  add('anchorX', a.anchorX, wx);
+  add('anchorY', a.anchorY, wy);
+  add('anchorZ', a.anchorZ, wx);
+  add('skewAxis', a.skewAxis, wx);
+  add('fillHue', a.fillHue, wx);
+  add('fillSaturation', a.fillSaturation, wx);
+  add('fillBrightness', a.fillBrightness, wx);
+  add('strokeHue', a.strokeHue, wx);
+  add('strokeSaturation', a.strokeSaturation, wx);
+  add('strokeBrightness', a.strokeBrightness, wx);
+  if (a.strokeOpacity !== undefined && a.strokeOpacity !== 100) {
+    g.strokeOpacity = (g.strokeOpacity ?? 1) * (1 + (a.strokeOpacity / 100 - 1) * wx);
+  }
+  // Tracking Type: the advance always grows by the full amount (tracking is
+  // accumulated by the caller); what changes is how much of it sits in FRONT.
+  if (a.tracking && (a.trackingType === 'before' || a.trackingType === 'beforeAfter')) {
+    const t = a.tracking * wx;
+    g.trackingBefore = (g.trackingBefore ?? 0) + (a.trackingType === 'before' ? t : t / 2);
+  }
+  if (a.axes) {
+    for (const [tag, v] of Object.entries(a.axes)) {
+      if (!isAxisTag(tag) || !Number.isFinite(v) || !v) continue;
+      g.axes = { ...(g.axes ?? {}), [tag]: (g.axes?.[tag] ?? 0) + v * wx };
+    }
+  }
 }
 
 // ── Scene integration ───────────────────────────────────────────────
@@ -536,7 +772,34 @@ export function resolveAnimators(
   return data.map((d, i) => {
     const val = (param: AnimatorParam, fallback: number): number =>
       av?.get(animatorPropPath(i, param)) ?? fallback;
+    // An optional property resolves only when the animator carries it — a
+    // leftover track for a removed property must not resurrect it.
+    const opt = (param: AnimatorParam, v: number | undefined): Partial<ResolvedAnimator> =>
+      v === undefined ? {} : { [param]: val(param, v) };
+    const axes = d.axes
+      ? Object.fromEntries(
+          Object.entries(d.axes)
+            .filter(([tag, v]) => isAxisTag(tag) && typeof v === 'number')
+            .map(([tag, v]) => [tag, av?.get(animatorAxisPropPath(i, tag)) ?? v]),
+        )
+      : undefined;
     return {
+      ...opt('anchorX', d.anchorX),
+      ...opt('anchorY', d.anchorY),
+      ...opt('anchorZ', d.anchorZ),
+      ...opt('skewAxis', d.skewAxis),
+      ...opt('lineAnchor', d.lineAnchor),
+      ...opt('characterValue', d.characterValue),
+      ...opt('fillHue', d.fillHue),
+      ...opt('fillSaturation', d.fillSaturation),
+      ...opt('fillBrightness', d.fillBrightness),
+      ...opt('strokeOpacity', d.strokeOpacity),
+      ...opt('strokeHue', d.strokeHue),
+      ...opt('strokeSaturation', d.strokeSaturation),
+      ...opt('strokeBrightness', d.strokeBrightness),
+      ...(d.characterRange ? { characterRange: d.characterRange } : {}),
+      ...(d.trackingType ? { trackingType: d.trackingType } : {}),
+      ...(axes && Object.keys(axes).length > 0 ? { axes } : {}),
       enabled: d.enabled !== false,
       selectors: (d.selectors ?? []).map((s, j) => resolveSelector(s, i, j, av)),
       x: val('x', d.x),
@@ -553,6 +816,11 @@ export function resolveAnimators(
       lineSpacing: val('lineSpacing', d.lineSpacing ?? 0),
       characterOffset: val('characterOffset', d.characterOffset ?? 0),
       blur: val('blur', d.blur ?? 0),
+      // Resolved only when the animator stores its own Y radius or a track
+      // drives one — otherwise it stays linked (undefined), the legacy shape.
+      ...(d.blurY !== undefined || av?.get(animatorPropPath(i, 'blurY')) !== undefined
+        ? { blurY: val('blurY', d.blurY ?? d.blur ?? 0) }
+        : {}),
       skew: val('skew', d.skew ?? 0),
       strokeWidth: val('strokeWidth', d.strokeWidth ?? 0),
       color: d.color,
@@ -625,6 +893,56 @@ export function updateAnimator(
   writeAnimators(nodeId, next);
 }
 
+/** Add optional properties (at their no-op defaults) to the animator at `index`.
+ *  Already-present ones keep their value. */
+export function addAnimatorProperties(nodeId: string, index: number, params: ReadonlyArray<AnimatorParam>): void {
+  const node = defaultSceneGraph.getNode(nodeId);
+  const cur = node ? readAnimatorData(node)[index] : undefined;
+  if (!cur) return;
+  const patch: Record<string, number> = {};
+  for (const p of params) {
+    const spec = OPTIONAL_ANIMATOR_PROPERTIES.find((o) => o.param === p);
+    if (spec && (cur as unknown as Record<string, unknown>)[p] === undefined) patch[p] = spec.defaultValue;
+  }
+  if (Object.keys(patch).length > 0) updateAnimator(nodeId, index, patch as Partial<TextAnimatorData>);
+}
+
+/** Remove an optional property (or a Font Axis, by `axis<TAG>`) from an animator. */
+export function removeAnimatorProperty(nodeId: string, index: number, param: string): void {
+  const node = defaultSceneGraph.getNode(nodeId);
+  if (!node) return;
+  const data = readAnimatorData(node);
+  const cur = data[index];
+  if (!cur) return;
+  const next = { ...cur } as unknown as Record<string, unknown>;
+  const tag = axisTagOfParam(param);
+  if (tag) {
+    const axes = { ...(cur.axes ?? {}) };
+    delete axes[tag];
+    next.axes = Object.keys(axes).length > 0 ? axes : undefined;
+  } else {
+    delete next[param];
+  }
+  const all = data.slice();
+  all[index] = normalizeAnimator(next as unknown as TextAnimatorData);
+  writeAnimators(nodeId, all);
+}
+
+/** Add a Font Axis property. Refused past MAX_ANIMATED_AXES distinct tags on
+ *  the LAYER (AE's limit is per layer, across all of its animators). */
+export function addAnimatorAxis(nodeId: string, index: number, tag: string): boolean {
+  const node = defaultSceneGraph.getNode(nodeId);
+  if (!node || !isAxisTag(tag)) return false;
+  const data = readAnimatorData(node);
+  const cur = data[index];
+  if (!cur) return false;
+  const used = new Set(data.flatMap((a) => Object.keys(a.axes ?? {})));
+  if (!used.has(tag) && used.size >= MAX_ANIMATED_AXES) return false;
+  if (cur.axes && tag in cur.axes) return true;
+  updateAnimator(nodeId, index, { axes: { ...(cur.axes ?? {}), [tag]: 0 } });
+  return true;
+}
+
 /** Append a selector of `kind` to the animator at `index`. */
 export function addSelector(
   nodeId: string,
@@ -688,21 +1006,16 @@ export function updateSelector(
   updateAnimator(nodeId, index, { selectors });
 }
 
-/** Blend two `#rrggbb` colours by `mix` (0 = a, 1 = b). Falls back to `b`. */
+/**
+ * Blend two colours by `mix` (0 = a, 1 = b).
+ *
+ * Accepts any CSS colour `cssColor.ts` understands (hex of every length,
+ * rgb()/rgba(), `var(--token)`, named colours) and NEVER returns a string the
+ * canvas cannot parse: this used to hand `'var(--color-primary)'` straight to
+ * `fillStyle`, which Canvas2D silently ignores — the glyph then painted in
+ * whatever colour the previous glyph left behind. An unreadable target keeps
+ * the base colour; an unreadable base takes the target.
+ */
 export function mixHex(a: string | undefined, b: string, mix: number): string {
-  const pa = parseHex(a);
-  const pb = parseHex(b);
-  if (!pa || !pb) return b;
-  const m = clamp01(mix);
-  const ch = (x: number, y: number): number => Math.round(x + (y - x) * m);
-  const hex = (n: number): string => n.toString(16).padStart(2, '0');
-  return `#${hex(ch(pa[0], pb[0]))}${hex(ch(pa[1], pb[1]))}${hex(ch(pa[2], pb[2]))}`;
-}
-
-function parseHex(c: string | undefined): [number, number, number] | null {
-  if (!c) return null;
-  const m = /^#?([0-9a-f]{6})$/i.exec(c.trim());
-  if (!m) return null;
-  const n = parseInt(m[1]!, 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  return mixCssColors(a, b, mix);
 }

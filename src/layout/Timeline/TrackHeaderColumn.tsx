@@ -21,6 +21,45 @@ import styles from './Timeline.module.css';
 import { ColorPicker } from '@components/ColorPicker';
 import { MATTE_OPTIONS, MATTE_SHORT_LABEL, matteOptionId, applyMatteOption } from '@components/MatteControl/matteMenu';
 import { areRowPropsEqual } from './rowMemo';
+import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
+import { readNodeQuality } from '@core/effects/layerQuality';
+import { openContextMenu, type ContextMenuItem } from '@stores/contextMenuStore';
+import {
+  collapseSwitchKind,
+  readCollapseSwitch,
+  toggleCollapseSwitch,
+  qualitySwitchAvailable,
+  toggleQualitySwitch,
+  frameBlendSwitchAvailable,
+  readFrameBlendSwitch,
+  toggleFrameBlendSwitch,
+  selectLabelGroup,
+} from './layerSwitches';
+
+/** The Quality switch's three positions, as AE draws them (/, \, and a box). */
+const QUALITY_SWITCH = {
+  best: { label: 'Quality: Best', title: 'Quality: Best — click for Draft', glyph: '/' },
+  draft: { label: 'Quality: Draft', title: 'Quality: Draft — click for Wireframe', glyph: '\\' },
+  wireframe: {
+    label: 'Quality: Wireframe',
+    title: 'Quality: Wireframe (viewport only — exports as Best) — click for Best',
+    glyph: '□',
+  },
+} as const;
+
+/**
+ * Where a row's context menu opens. A keyboard ContextMenu / Shift+F10 press
+ * reports (0, 0), so it opens under the row instead of in the window corner.
+ */
+function contextMenuPoint(e: React.MouseEvent<HTMLElement>): { x: number; y: number } {
+  if (e.clientX !== 0 || e.clientY !== 0) return { x: e.clientX, y: e.clientY };
+  const r = e.currentTarget.getBoundingClientRect();
+  return { x: r.left + 24, y: r.bottom };
+}
+
+/** Parent pick-whip tooltip — the AE modifiers, stated where they are used. */
+export const PARENT_WHIP_LABEL =
+  'Parent pick-whip — drag onto a layer (Shift: jump to the parent · Alt: keep values)';
 
 // Label colours come from the ONE palette in `core/scene/labelColor`. This file
 // used to carry its own 12 hexes, so the same layer showed a different red in the
@@ -88,8 +127,8 @@ export const TrackHeader = memo(function TrackHeader({
   onToggleAudio?: () => void;
   onBlendModeChange?: (mode: LayerBlendMode) => void;
   onMatteChange?: (matte: any) => void;
-  /** `options.preserveWorld: false` is the Alt variant — link without compensating. */
-  onParentChange?: (parentId: string | null, options?: { preserveWorld?: boolean }) => void;
+  /** `jump` is Shift (AE Parent & Link: snap onto the parent); `preserveWorld: false` is Alt. */
+  onParentChange?: (parentId: string | null, options?: { preserveWorld?: boolean; jump?: boolean }) => void;
   onToggleFlag?: (flag: 'shy' | 'collapse' | 'fxEnabled' | 'motionBlur' | 'adjustment' | 'threeD' | 'guide' | 'preserveTransparency') => void;
   onRename?: (newName: string) => void;
   onTrackColorChange?: (trackId: string, color: string) => void;
@@ -142,6 +181,17 @@ export const TrackHeader = memo(function TrackHeader({
     const trimmed = draft.trim();
     if (trimmed && trimmed !== track.name) onRename?.(trimmed);
   };
+
+  // The three switches below read the scene directly: the row re-renders on
+  // every scene revision (the derived `track` is a fresh object), and these
+  // props have no field on the timeline model.
+  const node = defaultSceneGraph.getNode(track.id);
+  const collapseKind = collapseSwitchKind(node);
+  const collapseOn = node && collapseKind ? readCollapseSwitch(node) : false;
+  const hasQuality = qualitySwitchAvailable(node);
+  const quality = node ? readNodeQuality(node) : 'best';
+  const hasFrameBlend = frameBlendSwitchAvailable(node);
+  const frameBlendOn = hasFrameBlend ? readFrameBlendSwitch(track.id) : false;
 
   const currentParent = parentOfNode(track.id);
   const parentOptions = eligibleParents(track.id);
@@ -266,7 +316,20 @@ export const TrackHeader = memo(function TrackHeader({
         </div>
         <span className={styles.trackIndex}>{index}</span>
         {typeof track.nodeColor === 'string' && (
-          <div onClick={(e) => e.stopPropagation()} style={{ display: 'inline-flex', alignItems: 'center' }}>
+          <div
+            onClick={(e) => e.stopPropagation()}
+            // AE's label menu carries "Select Label Group"; the swatch's own
+            // picker is a colour field, so the verb lives on its right-click.
+            onContextMenu={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              openContextMenu(e.clientX, e.clientY, [
+                { id: 'select-label-group', label: 'Select Label Group', onSelect: () => { selectLabelGroup(track.id); } },
+              ]);
+            }}
+            title="Right-click: Select Label Group"
+            style={{ display: 'inline-flex', alignItems: 'center' }}
+          >
             <ColorPicker
               value={track.nodeColor || '#5282b8'}
               onChange={(hex) => onTrackColorChange?.(track.id, hex)}
@@ -345,6 +408,44 @@ export const TrackHeader = memo(function TrackHeader({
             <Icon name="shy" size="sm" />
           </button>
 
+          {/* AE's sunburst: Collapse Transformations on a placed comp,
+              Continuous Rasterize on a vector layer, nothing elsewhere (a
+              spacer keeps the column aligned). */}
+          {collapseKind ? (
+            <button
+              type="button"
+              className={styles.trackAction}
+              data-kind="collapse"
+              data-on={collapseOn || undefined}
+              aria-pressed={collapseOn}
+              aria-label={collapseKind === 'collapse' ? 'Collapse Transformations' : 'Continuous Rasterize'}
+              title={collapseKind === 'collapse' ? 'Collapse Transformations' : 'Continuous Rasterize'}
+              onClick={(e) => { e.stopPropagation(); toggleCollapseSwitch(track.id); }}
+            >
+              <Icon name="star" size="sm" />
+            </button>
+          ) : (
+            <span className={styles.trackAction} data-kind="collapse" data-spacer="" aria-hidden="true" />
+          )}
+
+          {hasQuality ? (
+            <button
+              type="button"
+              className={styles.trackAction}
+              data-kind="quality"
+              data-on={quality !== 'best' || undefined}
+              data-quality={quality}
+              aria-pressed={quality !== 'best'}
+              aria-label={QUALITY_SWITCH[quality].label}
+              title={QUALITY_SWITCH[quality].title}
+              onClick={(e) => { e.stopPropagation(); toggleQualitySwitch(track.id); }}
+            >
+              <span className={styles.fxText}>{QUALITY_SWITCH[quality].glyph}</span>
+            </button>
+          ) : (
+            <span className={styles.trackAction} data-kind="quality" data-spacer="" aria-hidden="true" />
+          )}
+
           <button
             type="button"
             className={styles.trackAction}
@@ -355,6 +456,23 @@ export const TrackHeader = memo(function TrackHeader({
           >
             <span className={styles.fxText}>fx</span>
           </button>
+
+          {hasFrameBlend ? (
+            <button
+              type="button"
+              className={styles.trackAction}
+              data-kind="frameBlend"
+              data-on={frameBlendOn || undefined}
+              aria-pressed={frameBlendOn}
+              aria-label="Frame Blending"
+              title={frameBlendOn ? 'Frame Blending on — click to turn off' : 'Frame Blending'}
+              onClick={(e) => { e.stopPropagation(); toggleFrameBlendSwitch(track.id); }}
+            >
+              <Icon name="video" size="sm" />
+            </button>
+          ) : (
+            <span className={styles.trackAction} data-kind="frameBlend" data-spacer="" aria-hidden="true" />
+          )}
 
           <button
             type="button"
@@ -484,7 +602,7 @@ export const TrackHeader = memo(function TrackHeader({
         */}
         <div className={styles.parentCol} onClick={(e) => e.stopPropagation()}>
           <PickWhip
-            label="Parent pick-whip — drag onto a layer (Alt: keep values, layer jumps)"
+            label={PARENT_WHIP_LABEL}
             accept={(target) => parentOptions.some((o) => o.id === target.nodeId)}
             onPick={(target, m) => onParentChange?.(target.nodeId, parentOptionsFor(m))}
           />
@@ -558,6 +676,7 @@ export function PropertyHeader({
   onSeek,
   whipNodeId,
   whipProp,
+  contextMenuItems,
 }: {
   label: string;
   style: CSSProperties;
@@ -582,8 +701,21 @@ export function PropertyHeader({
   /** The layer and property this row edits, so a pick-whip can land on it. */
   whipNodeId?: string;
   whipProp?: string;
+  /**
+   * The row's right-click menu (AE: Reset, …), built on demand so a scrolling
+   * timeline never pays for menus nobody opens. Absent = no menu.
+   */
+  contextMenuItems?: () => ContextMenuItem[];
 }): JSX.Element {
   const sorted = useMemo(() => [...keyframes].sort((a, b) => a.time - b.time), [keyframes]);
+  const onContextMenu = contextMenuItems
+    ? (e: React.MouseEvent<HTMLDivElement>): void => {
+        e.preventDefault();
+        e.stopPropagation();
+        const { x, y } = contextMenuPoint(e);
+        openContextMenu(x, y, contextMenuItems());
+      }
+    : undefined;
   const at = sorted.find((k) => Math.abs(k.time - currentTime) < KEYFRAME_EPSILON);
   const prev = [...sorted].reverse().find((k) => k.time < currentTime - KEYFRAME_EPSILON);
   const next = sorted.find((k) => k.time > currentTime + KEYFRAME_EPSILON);
@@ -663,6 +795,7 @@ export function PropertyHeader({
         style={style}
         data-whip-layer={whipNodeId}
         data-whip-prop={whipProp}
+        onContextMenu={onContextMenu}
       >
         {stopwatch}
         {name}
@@ -677,6 +810,7 @@ export function PropertyHeader({
       style={style}
       data-whip-layer={whipNodeId}
       data-whip-prop={whipProp}
+      onContextMenu={onContextMenu}
     >
       {stopwatch}
       {name}
@@ -704,6 +838,7 @@ export function TrackCategoryHeader({
   style,
   sticky,
   onToggle,
+  onReset,
 }: {
   label: string;
   icon: IconName;
@@ -713,12 +848,27 @@ export function TrackCategoryHeader({
   /** The PINNED copy: opaque, and shadowed so it reads as sitting above. */
   sticky?: boolean;
   onToggle: () => void;
+  /**
+   * AE's "Reset" link on the Transform group: an inline text button, and the
+   * same verb on the heading's right-click. Absent = neither.
+   */
+  onReset?: () => void;
 }): JSX.Element {
   return (
     <div
       className={cn(styles.categoryHeader, sticky && styles.categoryHeaderSticky)}
       style={style}
       onClick={onToggle}
+      onContextMenu={
+        onReset
+          ? (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              const { x, y } = contextMenuPoint(e);
+              openContextMenu(x, y, [{ id: 'reset', label: 'Reset', onSelect: onReset }]);
+            }
+          : undefined
+      }
     >
       <span className={styles.disclosure}>
         <Icon name={expanded ? 'chevron-down' : 'chevron-right'} size="sm" />
@@ -727,6 +877,20 @@ export function TrackCategoryHeader({
         <Icon name={icon} size="sm" />
       </span>
       <span className={styles.categoryName}>{label}</span>
+      {onReset ? (
+        <button
+          type="button"
+          className={styles.categoryReset}
+          aria-label={`Reset ${label}`}
+          title={`Reset ${label} — remove its keyframes and restore the defaults`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onReset();
+          }}
+        >
+          Reset
+        </button>
+      ) : null}
       <span className={styles.categoryBadge}>{count}</span>
     </div>
   );

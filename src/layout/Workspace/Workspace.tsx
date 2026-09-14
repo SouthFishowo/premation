@@ -90,6 +90,9 @@ import { CompareOverlay } from './CompareOverlay';
 import { RotoBrushOverlay } from './RotoBrushOverlay';
 import { InlineAiPrompt } from './InlineAiPrompt';
 import { installViewportCommands } from './viewportCommands';
+import { installLayerSettingsCommands } from '@layout/Composition/layerSettingsCommands';
+import { useGuideSync } from './useGuideSync';
+import { replaceLayerSourceWithAsset, resolveReplaceTarget } from '@core/scene/replaceSourceDrop';
 import styles from './Workspace.module.css';
 
 export interface WorkspaceViewportProps {
@@ -244,7 +247,12 @@ export function WorkspaceViewport({
   // remount or a second viewport instance re-registers nothing.
   useEffect(() => {
     installViewportCommands();
+    // Layer ▸ Layer Settings… (Ctrl/Cmd+Shift+Y) — same self-install pattern.
+    installLayerSettingsCommands();
   }, []);
+
+  // Ruler guides ⇄ document (value, unit, pin edge, colour) + comp-resize re-pinning.
+  useGuideSync();
 
   // Keep the engine camera's lock in sync with the persisted workspace mode.
   // The composition framing itself rides on the engine's normal first-fit, so
@@ -435,6 +443,13 @@ export function WorkspaceViewport({
         placeSelection();
         break;
       case 'asset': {
+        // AE Alt-drag: REPLACE the source of the layer under the pointer (or
+        // the selected one), keeping its transform, keyframes and effects.
+        if (e.altKey) {
+          const hit = controller.ws.hitTestScreen(local);
+          replaceLayerSourceWithAsset(resolveReplaceTarget(hit?.id), payload.assetId);
+          break;
+        }
         const asset = useAssetStore.getState().assets.find((a) => a.id === payload.assetId);
         if (asset) {
           await insertMedia(asset);

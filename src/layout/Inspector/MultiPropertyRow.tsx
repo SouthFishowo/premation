@@ -22,7 +22,7 @@
  * the model beneath never learns about percent signs.
  */
 
-import { memo, useCallback, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ValueField } from '@components/ValueField';
 import { PropertyRow, KeyframeLane } from '@components/PropertyRow';
 import { PickWhip } from '@components/PickWhip';
@@ -57,6 +57,12 @@ import { useProjectStore } from '@stores/projectStore';
 import { useCompositionStore } from '@stores/compositionStore';
 import { usePreferenceStore } from '@stores/preferenceStore';
 import { ExpressionEditor } from '@layout/Motion/ExpressionEditor';
+import {
+  addExpression,
+  consumeExpressionEditorRequest,
+  onExpressionEditorRequest,
+  setFocusedExpressionRow,
+} from '@core/animation/expressionCommands';
 import { useInspectorSelection } from './inspectorSelection';
 import { ModifierChips } from './ModifierChips';
 import styles from './MultiPropertyRow.module.css';
@@ -125,6 +131,17 @@ function MultiPropertyRowInner({
   const showLane = usePreferenceStore((s) => s.inspectorShowLane);
   const [exprOpen, setExprOpen] = useState(false);
   const starts = useRef<Map<string, number>>(new Map());
+
+  // Add Expression from the timeline's row menu (or Alt+Shift+=) asks THIS row
+  // to open its editor — including when the row mounts just after the request.
+  useEffect(() => {
+    if (consumeExpressionEditorRequest(nodeId, prop)) setExprOpen(true);
+    return onExpressionEditorRequest((ref) => {
+      if (ref.nodeId === nodeId && ref.prop === prop && consumeExpressionEditorRequest(nodeId, prop)) {
+        setExprOpen(true);
+      }
+    });
+  }, [nodeId, prop]);
 
   const node = defaultSceneGraph.getNode(nodeId);
   const meta = resolvePropertyMeta(prop, nodeId);
@@ -251,7 +268,17 @@ function MultiPropertyRowInner({
         aria-pressed={exprOpen}
         aria-label={`${exprOpen ? 'Hide' : 'Show'} ${label} expression`}
         title={exprError ?? (hasExpr ? (exprEnabled ? 'Expression on — click to edit' : 'Expression off — click to edit') : 'Add an expression')}
-        onClick={(e) => { e.stopPropagation(); setExprOpen((v) => !v); }}
+        onClick={(e) => {
+          e.stopPropagation();
+          // No expression yet: ADD one — AE's default `value`, one undo step, the
+          // same helper the timeline row menu and Alt+Shift+= use — and open it.
+          if (!hasExpr) {
+            addExpression(nodeIds.map((id) => ({ nodeId: id, prop })), { openEditor: false });
+            setExprOpen(true);
+            return;
+          }
+          setExprOpen((v) => !v);
+        }}
       >
         =
       </button>
@@ -308,6 +335,11 @@ function MultiPropertyRowInner({
         onToggleKeyframe: () => toggleKeyframeAll(nodeIds, prop, time, access),
       }}
       onReset={resetVal !== undefined ? () => writeAll(resetVal * scale) : undefined}
+      // "The focused property" for Alt+Shift+= (Add Expression).
+      onFocusCapture={() => setFocusedExpressionRow({ nodeId, prop })}
+      onBlurCapture={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocusedExpressionRow(null);
+      }}
       onContextMenu={(e) => {
         e.preventDefault();
         openContextMenu(

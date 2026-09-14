@@ -108,7 +108,7 @@ export class OverlayPass extends RenderPass {
         g.axis === 'x'
           ? { x: g.position, y: view.y, width: t, height: view.height }
           : { x: view.x, y: g.position, width: view.width, height: t };
-      emitSolid(cmds, mvpFor(viewport, modelFromRect(line)), this.guideColor, 1, 'normal');
+      emitSolid(cmds, mvpFor(viewport, modelFromRect(line)), g.color ?? this.guideColor, 1, 'normal');
     }
     if (cmds.length === 0) return;
 

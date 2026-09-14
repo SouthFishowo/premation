@@ -294,6 +294,11 @@ export function Modal({
       className={cn(styles.dialog, styles[size], floating && styles.floating, className)}
       style={floatingStyle}
       data-variant={variant}
+      // A dialog owns Escape (close) and Enter (primary action). Without the
+      // claim the global ShortcutManager — window, capture phase — ran Deselect
+      // on Escape whenever focus sat on a dialog BUTTON rather than a field, so
+      // the dialog stayed open and the layer it was acting on was deselected.
+      data-shortcut-claim="escape enter"
       onKeyDown={onKeyDown}
       onEscapeKeyDown={(e) => persistent && e.preventDefault()}
       // A floating dialog is non-blocking by definition: a click on the app
@@ -323,7 +328,11 @@ export function Modal({
           </div>
           {!hideCloseButton ? (
             <Dialog.Close asChild>
-              <IconButton aria-label="Close" size="sm">
+              {/* No tooltip on the X: a dialog without a text field autofocuses
+                  this button, focus opens its tooltip, and Radix gives the
+                  first Escape to that tooltip layer instead of the dialog. The
+                  aria-label still names it. */}
+              <IconButton aria-label="Close" tooltip="" size="sm">
                 <Icon name="close" size="sm" />
               </IconButton>
             </Dialog.Close>

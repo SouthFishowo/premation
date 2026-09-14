@@ -672,6 +672,16 @@ export class CompositionPass extends RenderPass {
         let wideTex: TextureHandle | null = null;
         const irisBlades = effect.type === 'blur' ? (effect.blades ?? 0) : 0;
         const cocCorners = effect.type === 'blur' ? effect.cocCorners : undefined;
+        // AE iris extras (camera DOF). Defaults are the shaders' exact
+        // identities, so a blur without them packs the same behaviour as
+        // before the extras existed.
+        const irisRotationRad = effect.type === 'blur'
+          ? ((effect.irisRotationDeg ?? 0) * Math.PI) / 180
+          : 0;
+        const irisAspect = effect.type === 'blur' ? (effect.irisAspect ?? 1) : 1;
+        const irisThreshold = effect.type === 'blur' ? (effect.highlightThreshold ?? 0) : 0;
+        const irisSaturation = effect.type === 'blur' ? (effect.highlightSaturation ?? 0) : 0;
+        const irisFringe = effect.type === 'blur' ? (effect.fringe ?? 0) : 0;
 
         // Layer-style Spread: dilate alpha before the soft blur (Photoshop).
         // Prefer the third pool slot so separable blur can keep its f1→f0 dance;
@@ -721,6 +731,11 @@ export class CompositionPass extends RenderPass {
               irisBlades,
               effect.type === 'blur' ? (effect.roundness ?? 0.65) : 0.65,
               effect.type === 'blur' ? (effect.highlightGain ?? 0) : 0,
+              irisRotationRad,
+              irisAspect,
+              irisThreshold,
+              irisSaturation,
+              irisFringe,
             ),
             texture: blurSrc, sampler: clampSampler(),
           });
@@ -744,6 +759,11 @@ export class CompositionPass extends RenderPass {
               irisBlades,
               effect.type === 'blur' ? (effect.roundness ?? 0.65) : 0.65,
               effect.type === 'blur' ? (effect.highlightGain ?? 0) : 0,
+              irisRotationRad,
+              irisAspect,
+              irisThreshold,
+              irisSaturation,
+              irisFringe,
             ),
             texture: blurSrc, sampler: clampSampler(),
           });
@@ -3167,6 +3187,11 @@ export class CompositionPass extends RenderPass {
         dof.strength,
         dof.focalLength ?? dof.focus,
         dof.fStop ?? 0,
+        ((dof.irisRotation ?? 0) * Math.PI) / 180,
+        dof.irisAspect ?? 1,
+        dof.highlightThreshold ?? 0,
+        dof.highlightSaturation ?? 0,
+        dof.diffractionFringe ?? 0,
       ),
       texture: colorTex,
       sampler: smp,
@@ -3344,6 +3369,14 @@ export class CompositionPass extends RenderPass {
         // `oneSided` came to be plumbed end-to-end, asserted at the snapshot,
         // and visible in no pixel.
         ...(s.oneSided ? { oneSided: true } : {}),
+        // The Advanced-3D axes — named here for exactly that reason. Each
+        // absent field packs its own identity in `packShade3D`.
+        ...(s.reflectionIntensity !== undefined ? { reflectionIntensity: s.reflectionIntensity } : {}),
+        ...(s.reflectionSharpness !== undefined ? { reflectionSharpness: s.reflectionSharpness } : {}),
+        ...(s.reflectionRolloff !== undefined ? { reflectionRolloff: s.reflectionRolloff } : {}),
+        ...(s.transparency !== undefined ? { transparency: s.transparency } : {}),
+        ...(s.transparencyRolloff !== undefined ? { transparencyRolloff: s.transparencyRolloff } : {}),
+        ...(s.ior !== undefined ? { ior: s.ior } : {}),
         // Image-based reflections. Attached to the SHADE, not to the draw,
         // because it is the material that decides whether it reflects: toon
         // never does (a mirrored room would undo the cel banding the model

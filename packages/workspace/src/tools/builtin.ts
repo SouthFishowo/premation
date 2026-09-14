@@ -24,6 +24,7 @@ import type { BezierPoint } from '../math/BezierPoint';
 import { corner as bezierCorner } from '../math/BezierPoint';
 import { commands } from '../commands/WorkspaceCommands';
 import * as Mat from '../math/Mat2D';
+import { layerBoxPoints, resolveAnchorSnap } from '../snap/anchorSnap';
 import type { HandleId } from '../selection/handles';
 import {
   resizeBounds,
@@ -1735,7 +1736,11 @@ abstract class CreatePolyTool implements Tool {
     if (!this.rect) return [];
     const cx = this.rect.x + this.rect.width / 2;
     const cy = this.rect.y + this.rect.height / 2;
-    const pts = this.makePoints(cx, cy, Math.max(this.rect.width / 2, 1), Math.max(this.rect.height / 2, 1));
+    // UNIFORM radius — the drag's larger half-dimension. The commit creates a
+    // parametric polystar (one radius, like AE's), so an elliptical preview
+    // would promise a squashed shape the commit does not produce.
+    const r = Math.max(this.rect.width / 2, this.rect.height / 2, 1);
+    const pts = this.makePoints(cx, cy, r, r);
     // Close the preview loop so it reads as a full shape.
     return pts.length ? [...pts, pts[0]!] : pts;
   }
@@ -1758,7 +1763,12 @@ abstract class CreatePolyTool implements Tool {
   private commit(rect: Rect, ctx: ToolContext): void {
     const cx = rect.x + rect.width / 2;
     const cy = rect.y + rect.height / 2;
-    const world = this.makePoints(cx, cy, Math.max(rect.width / 2, 1), Math.max(rect.height / 2, 1));
+    // Same uniform radius as the preview. The host's createNode builds a
+    // PARAMETRIC polystar from the rect (drag sets outer radius; tool options
+    // seed points / inner radius); these baked points remain only as the
+    // payload's outline for hosts without the parametric path.
+    const r = Math.max(rect.width / 2, rect.height / 2, 1);
+    const world = this.makePoints(cx, cy, r, r);
     const local = world.map((p) => ({
       x: p.x - cx, y: p.y - cy,
       inX: p.inX - cx, inY: p.inY - cy,
@@ -1884,12 +1894,64 @@ export class TextTool implements Tool {
   readonly shortcut = 't';
   readonly cursor = 'text' as const;
 
+  /** AE: click = POINT text. */
   onClick(e: ToolPointerEvent, ctx: ToolContext): void {
-    const rect = R.rect(e.world.x, e.world.y, 200, 40);
+    this.placePoint(e.world, ctx);
+  }
+
+  /**
+   * AE: click-drag = PARAGRAPH text whose box is the dragged rectangle. A drag
+   * too small to mean a box (under TEXT_BOX_MIN_DRAG screen px on either axis)
+   * is a click. The host sizes the box and starts editing it.
+   */
+  onDragEnd(e: ToolDragEvent, ctx: ToolContext): void {
+    if (Math.abs(e.totalScreen.x) < TEXT_BOX_MIN_DRAG || Math.abs(e.totalScreen.y) < TEXT_BOX_MIN_DRAG) {
+      this.placePoint(e.startWorld, ctx);
+      return;
+    }
+    ctx.execute(commands.createNode('ParagraphText', R.fromPoints(e.startWorld, e.currentWorld)));
+    ctx.requestRender();
+  }
+
+  private placePoint(world: Vec2, ctx: ToolContext): void {
+    const rect = R.rect(world.x, world.y, 200, 40);
     ctx.execute(commands.createNode('Text', rect));
     ctx.requestRender();
   }
 }
+
+/**
+ * AE's Vertical Type Tool: the Type tool's twin whose layers are created with
+ * `orientation: 'vertical'` — click for point text, click-drag for a box whose
+ * height is the column length. The host's `VerticalText` /
+ * `VerticalParagraphText` kinds set the orientation.
+ */
+export class VerticalTextTool implements Tool {
+  readonly id = 'vertical-text';
+  readonly label = 'Vertical Type';
+  readonly cursor = 'vertical-text' as const;
+
+  onClick(e: ToolPointerEvent, ctx: ToolContext): void {
+    this.placePoint(e.world, ctx);
+  }
+
+  onDragEnd(e: ToolDragEvent, ctx: ToolContext): void {
+    if (Math.abs(e.totalScreen.x) < TEXT_BOX_MIN_DRAG || Math.abs(e.totalScreen.y) < TEXT_BOX_MIN_DRAG) {
+      this.placePoint(e.startWorld, ctx);
+      return;
+    }
+    ctx.execute(commands.createNode('VerticalParagraphText', R.fromPoints(e.startWorld, e.currentWorld)));
+    ctx.requestRender();
+  }
+
+  private placePoint(world: Vec2, ctx: ToolContext): void {
+    ctx.execute(commands.createNode('VerticalText', R.rect(world.x, world.y, 40, 200)));
+    ctx.requestRender();
+  }
+}
+
+/** Screen px a Type-tool drag must cover on BOTH axes to make a paragraph box. */
+const TEXT_BOX_MIN_DRAG = 8;
 
 // ── Rotate (AE: W) ─────────────────────────────────────────────────
 /**
@@ -2002,16 +2064,44 @@ export class PanBehindTool implements Tool {
     if (!this.dragId) return;
     const node = ctx.scene.getNode(this.dragId);
     if (!node) return;
-    const local = Mat.apply(Mat.invert(node.worldMatrix), e.currentWorld);
+    /*
+     * AE snapping for the anchor: the layer's own nine box points first, then
+     * the same features a layer drag snaps to (other layers' edges, anchors,
+     * path vertices, projected 3D points, guides, grid). Ctrl/Cmd TOGGLES it
+     * for the drag — on when the snap switch is off, off when it is on.
+     *
+     * The layer does not move: the host compensates Position for the new
+     * anchor (moveAnchorCompensated, animated-pose aware), which keeps
+     * `worldMatrix` invariant — so the box points read off it stay put too.
+     */
+    const settings = ctx.snap?.getSettings?.();
+    const active = settings ? settings.enabled !== e.modifiers.mod : false;
+    const thresholdPx = Math.max(settings?.thresholdPx ?? 3, ANCHOR_OWN_SNAP_PX);
+    const ownThreshold = ctx.camera.screenDistanceToWorld(thresholdPx);
+    const own = node.localBounds ? layerBoxPoints(node.localBounds, node.worldMatrix) : [];
+    const exclude = new Set([this.dragId]);
+    const snap = resolveAnchorSnap(
+      e.currentWorld,
+      own,
+      ownThreshold,
+      active,
+      ctx.snapPoint ? (p) => ctx.snapPoint?.(p, exclude, { force: true }) : undefined,
+    );
+    const local = Mat.apply(Mat.invert(node.worldMatrix), snap.point);
     ctx.execute(commands.moveAnchor(this.dragId, local));
+    ctx.setSnapLines?.(snap.lines);
     ctx.requestRender();
   }
 
   onDragEnd(_e: ToolDragEvent, ctx: ToolContext): void {
     this.dragId = null;
+    ctx.setSnapLines?.([]);
     ctx.requestRender();
   }
 }
+
+/** Screen-px reach of the anchor's snap to its OWN box points (AE is generous here). */
+const ANCHOR_OWN_SNAP_PX = 8;
 
 /** World position of a node's pivot. worldMatrix already folds the anchor in. */
 function anchorWorld(node: { worldMatrix: Mat.Mat2D; anchor?: Vec2 }): Vec2 {
@@ -2242,6 +2332,7 @@ export function createBuiltinTools(): Tool[] {
     new BrushTool(),
     new CurvatureTool(),
     new TextTool(),
+    new VerticalTextTool(),
     new RotoTool(),
   ];
 }

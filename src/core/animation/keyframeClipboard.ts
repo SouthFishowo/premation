@@ -11,7 +11,7 @@
  * All mutations are wrapped in runAnimEdit so they are fully undoable.
  */
 
-import type { EasingKind, BezierHandles } from '@motion/animation';
+import type { EasingKind, BezierHandles, SpatialInterp } from '@motion/animation';
 import { defaultAnimation, parseKeyframeId, expandKeyframeProp } from '@motion/animation';
 import { runAnimEdit } from '@core/animation/animationCommands';
 import { compToKeyframeTime } from '@core/timeline/TimelineController';
@@ -26,6 +26,8 @@ export interface ClipboardEntry {
   /** Spatial in/out tangents (value-space offsets) — motion-path shape. */
   si?: number;
   so?: number;
+  /** AE spatial interpolation mode of the motion-path vertex. */
+  spatialInterp?: SpatialInterp;
   continuous?: boolean;
   roving?: boolean;
 }
@@ -70,6 +72,7 @@ export function copyKeyframes(ids: ReadonlySet<string>): void {
         bezier: kf.bezier ? [...kf.bezier] as BezierHandles : undefined,
         si: kf.si,
         so: kf.so,
+        spatialInterp: kf.spatialInterp,
         continuous: kf.continuous,
         roving: kf.roving,
       });
@@ -102,6 +105,9 @@ export function pasteKeyframes(targetNodeIds: readonly string[], atCompTime: num
             si: entry.si,
             so: entry.so,
           });
+        }
+        if (entry.spatialInterp !== undefined) {
+          defaultAnimation.setSpatialInterp(nodeId, entry.prop, layerT, entry.spatialInterp);
         }
         if (entry.continuous !== undefined || entry.roving !== undefined) {
           defaultAnimation.updateKeyframe(nodeId, entry.prop, layerT, {

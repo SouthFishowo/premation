@@ -43,7 +43,7 @@
  * tab is `inspectorSections.ts`; how they render is `InspectorContent`.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Panel } from '@components/Panel';
 import { SearchField } from '@components/SearchField';
@@ -174,7 +174,11 @@ export function PropertiesPanel(): JSX.Element {
 
   const searching = query.trim().length > 0;
 
-  const menuItems: DropdownItem[] = [
+  // Memoised, and it has to be: the effect below hands this list to the
+  // DockPanel header, which is a state update THERE and so a re-render HERE. A
+  // fresh array per render re-ran the effect on every pass — the v0.8.1
+  // "Maximum update depth exceeded" loop, hundreds of warnings a second.
+  const menuItems: DropdownItem[] = useMemo(() => [
     {
       type: 'checkbox',
       id: 'lanes',
@@ -190,7 +194,7 @@ export function PropertiesPanel(): JSX.Element {
       icon: 'sparkles',
       onSelect: () => useLayoutStore.getState().openPanel('effectControls'),
     },
-  ];
+  ], [showLane, setPref]);
 
   const dockHeader = useDockPanelHeader();
   const setCustomMenuItems = dockHeader?.setCustomMenuItems;

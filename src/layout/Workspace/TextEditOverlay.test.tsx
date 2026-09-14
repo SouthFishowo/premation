@@ -6,8 +6,9 @@
  * the product ships as. These tests exercise the replacement in a real render.
  */
 
-import { render, act } from '@testing-library/react';
-import { TextEditOverlay } from './TextEditOverlay';
+import { render, act, fireEvent } from '@testing-library/react';
+import { TextEditOverlay, insideKeepZone } from './TextEditOverlay';
+import { ColorPicker } from '@components/ColorPicker';
 import { useTextEditStore } from '@stores/textEditStore';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { getEventBus } from '@core/events/EventBus';
@@ -106,15 +107,62 @@ describe('TextEditOverlay', () => {
     );
   });
 
-  it('discards edits on Escape', () => {
+  it('commits on Escape — After Effects keeps the edits', () => {
+    const { getByRole } = render(<TextEditOverlay />);
+    act(() => useTextEditStore.getState().begin('t1'));
+    const box = getByRole('textbox');
+    box.innerText = 'Kept';
+    act(() => box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
+
+    expect(contentOf('t1')).toBe('Kept');
+    expect(useTextEditStore.getState().nodeId).toBeNull();
+  });
+
+  it('discards edits only on the explicit Shift+Escape', () => {
     const { getByRole } = render(<TextEditOverlay />);
     act(() => useTextEditStore.getState().begin('t1'));
     const box = getByRole('textbox');
     box.innerText = 'Should not stick';
-    act(() => box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
+    act(() => box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', shiftKey: true, bubbles: true })));
 
     expect(contentOf('t1')).toBe('Hello');
     expect(useTextEditStore.getState().nodeId).toBeNull();
+  });
+
+  it('commits on the numeric keypad Enter', () => {
+    const { getByRole } = render(<TextEditOverlay />);
+    act(() => useTextEditStore.getState().begin('t1'));
+    const box = getByRole('textbox');
+    box.innerText = 'Keypad';
+    act(() => box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'NumpadEnter', bubbles: true, cancelable: true })));
+
+    expect(contentOf('t1')).toBe('Keypad');
+    expect(useTextEditStore.getState().nodeId).toBeNull();
+  });
+
+  it('keeps editing when focus moves into the Character panel, and commits on an outside click', () => {
+    const { getByRole } = render(<TextEditOverlay />);
+    act(() => useTextEditStore.getState().begin('t1'));
+    const box = getByRole('textbox');
+
+    // Created AFTER the lookup: the panel's input is a textbox too.
+    const panel = document.createElement('div');
+    panel.setAttribute('data-text-edit-keep', '');
+    const field = document.createElement('input');
+    panel.appendChild(field);
+    document.body.appendChild(panel);
+    try {
+      box.innerText = 'Styled';
+      act(() => box.dispatchEvent(new FocusEvent('blur', { relatedTarget: field })));
+      act(() => box.dispatchEvent(new FocusEvent('focusout', { relatedTarget: field, bubbles: true })));
+      expect(useTextEditStore.getState().nodeId).toBe('t1');
+
+      act(() => document.body.dispatchEvent(new Event('pointerdown', { bubbles: true })));
+      expect(contentOf('t1')).toBe('Styled');
+      expect(useTextEditStore.getState().nodeId).toBeNull();
+    } finally {
+      panel.remove();
+    }
   });
 
   it('Enter does not commit — it is a newline, like After Effects', () => {
@@ -125,6 +173,90 @@ describe('TextEditOverlay', () => {
 
     expect(useTextEditStore.getState().nodeId).toBe('t1');
     expect(contentOf('t1')).toBe('Hello');
+  });
+
+  it('keeps editing through clicks inside a PORTALLED popover opened from the panel (colour picker)', () => {
+    (globalThis as { ResizeObserver?: unknown }).ResizeObserver ??= class {
+      observe(): void {}
+      unobserve(): void {}
+      disconnect(): void {}
+    };
+    render(<TextEditOverlay />);
+    // The Character panel is a keep zone; the picker lives inside it.
+    const panel = render(
+      <div data-text-edit-keep="">
+        <ColorPicker value="#ff0000" onChange={() => {}} />
+      </div>,
+    );
+    act(() => useTextEditStore.getState().begin('t1'));
+    const trigger = panel.getByRole('button', { name: /pick a color/i });
+    act(() => {
+      fireEvent.pointerDown(trigger);
+      fireEvent.click(trigger);
+    });
+    expect(useTextEditStore.getState().nodeId).toBe('t1');
+
+    const content = document.querySelector('[role="dialog"]');
+    expect(content).not.toBeNull();
+    // Really portalled out of the panel — the case the attribute exists for.
+    expect(panel.container.contains(content)).toBe(false);
+    const inner = content!.querySelector('input') ?? content!;
+    act(() => {
+      inner.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    });
+    expect(useTextEditStore.getState().nodeId).toBe('t1');
+
+    // A genuine outside click still commits.
+    act(() => document.body.dispatchEvent(new Event('pointerdown', { bubbles: true })));
+    expect(useTextEditStore.getState().nodeId).toBeNull();
+  });
+
+  it('treats a text node inside a keep zone (font picker list row) as inside', () => {
+    const pop = document.createElement('div');
+    pop.setAttribute('data-text-edit-keep', '');
+    const label = document.createTextNode('Inter');
+    pop.appendChild(label);
+    document.body.appendChild(pop);
+    try {
+      expect(insideKeepZone(label)).toBe(true);
+      expect(insideKeepZone(document.body)).toBe(false);
+    } finally {
+      pop.remove();
+    }
+  });
+
+  it('a fixed paragraph box clips, aligns like the painter, and flags overflow live', () => {
+    const put = (props: Record<string, unknown>) => {
+      try { defaultSceneGraph.removeNode('t1'); } catch { /* ignore */ }
+      const n = textNode('t1', 'Hi');
+      Object.assign(n.components[1]!.props, { fontSize: 20, lineHeight: 1.2, fontFamily: 'Arial', boxWidth: 300, boxAutoSize: 'off', ...props });
+      defaultSceneGraph.addNode(n);
+    };
+    // Centred in a 300px box: the 24px line block starts 138px down, as drawn.
+    put({ boxHeight: 300, boxVerticalAlign: 'center' });
+    const { getByRole, unmount } = render(<TextEditOverlay />);
+    act(() => useTextEditStore.getState().begin('t1'));
+    let box = getByRole('textbox') as HTMLElement;
+    expect(box.style.overflow).toBe('hidden');
+    expect(parseFloat(box.style.paddingTop)).toBeCloseTo(138, 3);
+    expect(box.getAttribute('data-overflow')).toBeNull();
+    act(() => useTextEditStore.getState().end());
+    unmount();
+
+    // Bottom-aligned but overflowing: yields to top, and typing a line that
+    // does not fit raises the overflow flag before anything is committed.
+    put({ boxHeight: 30, boxVerticalAlign: 'bottom' });
+    const again = render(<TextEditOverlay />);
+    act(() => useTextEditStore.getState().begin('t1'));
+    box = again.getByRole('textbox') as HTMLElement;
+    expect(parseFloat(box.style.paddingTop || '0')).toBeCloseTo(6, 3);
+    act(() => {
+      box.innerText = 'Hi\nthere';
+      fireEvent.input(box);
+    });
+    expect(box.getAttribute('data-overflow')).toBe('true');
+    expect(parseFloat(box.style.paddingTop || '0')).toBe(0);
+    expect(contentOf('t1')).toBe('Hi');
   });
 
   it('Shift+Enter does not commit (newline in multi-line text)', () => {

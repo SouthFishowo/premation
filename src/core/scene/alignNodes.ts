@@ -29,6 +29,20 @@
  * So the boxes are measured through `world2DAt` (the transform chain the
  * renderer composes) and the answer is converted BACK through the parent's
  * inverse before it is written, because `x`/`y` are still parent-space values.
+ *
+ * ## Distribute
+ *
+ * AE's eight distribute buttons, as pure maths in `distributeBoxes`:
+ *
+ *   • by EDGE or CENTRE (left / h-centre / right, top / v-centre / bottom):
+ *     that reference line is spaced evenly from the first layer's to the
+ *     last's, sorted along the axis;
+ *   • SPACING (horizontal / vertical): equal GAPS between the bounding boxes,
+ *     which is the one that looks even when the layers differ in size.
+ *
+ * Relative to the selection the two extreme layers stay put and at least three
+ * are needed (AE). Relative to the composition the extremes are the frame's
+ * edges instead, so two layers are enough.
  */
 
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
@@ -40,12 +54,22 @@ import { world2DAt, parentWorld2DAt } from '@core/scene/layerSpace';
 import { useProjectStore } from '@stores/projectStore';
 import { Matrix } from '@motion/scene';
 
+export type DistributeMode =
+  | 'distribute-left' | 'distribute-h' | 'distribute-right'
+  | 'distribute-top'  | 'distribute-v' | 'distribute-bottom'
+  | 'distribute-space-h' | 'distribute-space-v';
+
 export type AlignMode =
   | 'left' | 'center-h' | 'right'
   | 'top'  | 'middle-v' | 'bottom'
-  | 'distribute-h' | 'distribute-v';
+  | DistributeMode;
 
-interface Bounds { x: number; y: number; w: number; h: number; cx: number; cy: number; }
+export interface Bounds { x: number; y: number; w: number; h: number; cx: number; cy: number; }
+
+/** Fewest layers each distribute mode needs (AE: three against the selection). */
+export function distributeMinimum(alignTo: 'selection' | 'composition'): number {
+  return alignTo === 'composition' ? 2 : 3;
+}
 
 /** The playhead in raw comp time — alignment lines up what is on screen NOW. */
 function playheadCompTime(): number {
@@ -103,6 +127,88 @@ function setPos(nodeId: string, x: number, y: number): void {
   writeTransformProps(nodeId, [{ prop: 'x', value: local.x }, { prop: 'y', value: local.y }], 'Align');
 }
 
+type Ref = 'start' | 'centre' | 'end' | 'space';
+
+const DISTRIBUTE: Readonly<Record<DistributeMode, { axis: 'x' | 'y'; ref: Ref }>> = {
+  'distribute-left': { axis: 'x', ref: 'start' },
+  'distribute-h': { axis: 'x', ref: 'centre' },
+  'distribute-right': { axis: 'x', ref: 'end' },
+  'distribute-top': { axis: 'y', ref: 'start' },
+  'distribute-v': { axis: 'y', ref: 'centre' },
+  'distribute-bottom': { axis: 'y', ref: 'end' },
+  'distribute-space-h': { axis: 'x', ref: 'space' },
+  'distribute-space-v': { axis: 'y', ref: 'space' },
+};
+
+export function isDistributeMode(mode: AlignMode): mode is DistributeMode {
+  return mode in DISTRIBUTE;
+}
+
+/**
+ * The new CENTRES for a distribution — pure, so the eight modes are testable
+ * without a scene. Returns one entry per input box (input order), moved on the
+ * distribute axis only; `null` when there are too few boxes.
+ *
+ * `frame` is the composition size when distributing relative to it: the
+ * extremes then sit flush with the frame's edges.
+ */
+export function distributeBoxes(
+  boxes: ReadonlyArray<Bounds>,
+  mode: DistributeMode,
+  frame?: { width: number; height: number },
+): Array<{ cx: number; cy: number }> | null {
+  const min = frame ? 2 : 3;
+  if (boxes.length < min) return null;
+  const { axis, ref } = DISTRIBUTE[mode];
+  const lo = (b: Bounds): number => (axis === 'x' ? b.x : b.y);
+  const size = (b: Bounds): number => (axis === 'x' ? b.w : b.h);
+  const extent = frame ? (axis === 'x' ? frame.width : frame.height) : 0;
+
+  const refOf = (b: Bounds): number =>
+    ref === 'start' ? lo(b) : ref === 'end' ? lo(b) + size(b) : lo(b) + size(b) / 2;
+
+  const order = boxes.map((b, i) => ({ b, i })).sort((p, q) =>
+    ref === 'space' ? lo(p.b) - lo(q.b) : refOf(p.b) - refOf(q.b),
+  );
+  const out = boxes.map((b) => ({ cx: b.cx, cy: b.cy }));
+  const place = (i: number, newLo: number): void => {
+    const b = boxes[i]!;
+    const c = newLo + size(b) / 2;
+    if (axis === 'x') out[i] = { cx: c, cy: b.cy };
+    else out[i] = { cx: b.cx, cy: c };
+  };
+
+  const first = order[0]!.b;
+  const last = order[order.length - 1]!.b;
+  const n = order.length;
+
+  if (ref === 'space') {
+    const start = frame ? 0 : lo(first);
+    const end = frame ? extent : lo(last) + size(last);
+    const total = order.reduce((s, o) => s + size(o.b), 0);
+    const gap = (end - start - total) / (n - 1);
+    let cursor = start;
+    for (const o of order) {
+      place(o.i, cursor);
+      cursor += size(o.b) + gap;
+    }
+    return out;
+  }
+
+  // The reference line's first and last positions. Against the frame, the
+  // first layer sits flush with the frame's start and the last with its end.
+  const refPos = (b: Bounds, newLo: number): number =>
+    ref === 'start' ? newLo : ref === 'end' ? newLo + size(b) : newLo + size(b) / 2;
+  const r0 = frame ? refPos(first, 0) : refOf(first);
+  const r1 = frame ? refPos(last, extent - size(last)) : refOf(last);
+  order.forEach((o, k) => {
+    const r = r0 + ((r1 - r0) * k) / (n - 1);
+    const newLo = ref === 'start' ? r : ref === 'end' ? r - size(o.b) : r - size(o.b) / 2;
+    place(o.i, newLo);
+  });
+  return out;
+}
+
 export function alignNodes(
   ids: string[],
   mode: AlignMode,
@@ -115,6 +221,18 @@ export function alignNodes(
     .map((id) => ({ id, b: getBounds(id) }))
     .filter((v): v is { id: string; b: Bounds } => v.b !== null);
   if (boxes.length === 0) return;
+
+  if (isDistributeMode(mode)) {
+    const frame = alignTo === 'composition' ? { width: compWidth, height: compHeight } : undefined;
+    const centres = distributeBoxes(boxes.map((v) => v.b), mode, frame);
+    if (!centres) return;
+    centres.forEach((c, i) => {
+      const { id, b } = boxes[i]!;
+      if (Math.abs(c.cx - b.cx) > 1e-6 || Math.abs(c.cy - b.cy) > 1e-6) setPos(id, c.cx, c.cy);
+    });
+    bumpScene();
+    return;
+  }
 
   const left   = alignTo === 'composition' ? 0 : Math.min(...boxes.map((v) => v.b.x));
   const top    = alignTo === 'composition' ? 0 : Math.min(...boxes.map((v) => v.b.y));
@@ -132,34 +250,6 @@ export function alignNodes(
       case 'middle-v': setPos(id, b.cx, cy);                        break;
       case 'bottom':   setPos(id, b.cx, bottom - b.h / 2);          break;
       default: break;
-    }
-  }
-
-  if (mode === 'distribute-h' && boxes.length > (alignTo === 'composition' ? 1 : 2)) {
-    const sorted = [...boxes].sort((a, b) => a.b.x - b.b.x);
-    const totalW = sorted.reduce((s, v) => s + v.b.w, 0);
-    const gap = (right - left - totalW) / (sorted.length - (alignTo === 'composition' ? 0 : 1));
-    let cursor = left;
-    if (alignTo === 'composition') {
-      cursor += gap / 2;
-    }
-    for (const { id, b } of sorted) {
-      setPos(id, cursor + b.w / 2, b.cy);
-      cursor += b.w + gap;
-    }
-  }
-
-  if (mode === 'distribute-v' && boxes.length > (alignTo === 'composition' ? 1 : 2)) {
-    const sorted = [...boxes].sort((a, b) => a.b.y - b.b.y);
-    const totalH = sorted.reduce((s, v) => s + v.b.h, 0);
-    const gap = (bottom - top - totalH) / (sorted.length - (alignTo === 'composition' ? 0 : 1));
-    let cursor = top;
-    if (alignTo === 'composition') {
-      cursor += gap / 2;
-    }
-    for (const { id, b } of sorted) {
-      setPos(id, b.cx, cursor + b.h / 2);
-      cursor += b.h + gap;
     }
   }
 

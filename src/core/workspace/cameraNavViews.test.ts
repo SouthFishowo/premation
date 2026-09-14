@@ -14,14 +14,20 @@ import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { SCENE_KIND_PROP } from '@core/scene/seedDefaultScene';
 import { useGuidesStore } from '@stores/guidesStore';
 import type { SceneNode } from '@core/types';
+import { Project3D } from '@motion/scene';
+import { defaultFocalLength } from '@core/scene/camera3d';
 import { customViewCamera, defaultCustomViews, ORTHO_VIEW_ANGLES } from './customViews';
 import {
+  CAMERA_TOOL_CYCLE,
   dollyNavBy,
   findNavTarget,
+  orbitCameraAboutPivot,
   orbitNavBy,
+  resolveOrbitPivot,
   resolveViewCameraInput,
   sceneHasAny3D,
   trackNavBy,
+  unifiedNavModeFor,
 } from './cameraNav';
 
 const ROOT = 'camnav-views-root';
@@ -266,5 +272,149 @@ describe('guidesStore custom-view state', () => {
     useGuidesStore.getState().setCamera3dMode('custom3');
     useGuidesStore.getState().setCamera3dMode('active');
     expect(useGuidesStore.getState().lastCustomView).toBe('custom3');
+  });
+});
+
+// ── Unified Camera tool + orbit pivot modes ─────────────────────────
+
+describe('Unified Camera (button → gesture) and the C cycle', () => {
+  it('maps left → orbit, middle → pan, right → dolly, anything else → null', () => {
+    expect(unifiedNavModeFor(0)).toBe('orbit');
+    expect(unifiedNavModeFor(1)).toBe('pan');
+    expect(unifiedNavModeFor(2)).toBe('dolly');
+    expect(unifiedNavModeFor(3)).toBeNull();
+    expect(unifiedNavModeFor(4)).toBeNull();
+  });
+
+  it('C cycles unified → orbit → pan → dolly → unified (AE order), and the constant matches', () => {
+    useGuidesStore.setState({ cameraTool: 'none' });
+    const seen: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      useGuidesStore.getState().cycleCameraTool();
+      seen.push(useGuidesStore.getState().cameraTool);
+    }
+    expect(seen).toEqual(['unified', 'orbit', 'pan', 'dolly', 'unified']);
+    expect(CAMERA_TOOL_CYCLE).toEqual(['unified', 'orbit', 'pan', 'dolly']);
+  });
+});
+
+describe('orbit pivot modes', () => {
+  const W = 1920;
+  const H = 1080;
+
+  beforeEach(() => {
+    useGuidesStore.setState({ cameraOrbitPivot: 'poi' });
+  });
+
+  it("'poi' resolves to null — the classic POI orbit stays the default", () => {
+    expect(resolveOrbitPivot({ x: 100, y: 100 }, W, H, 'poi')).toBeNull();
+  });
+
+  it("'scene' resolves to the world origin", () => {
+    expect(resolveOrbitPivot({ x: 123, y: 456 }, W, H, 'scene')).toEqual({ x: 0, y: 0, z: 0 });
+  });
+
+  it("'cursor' over empty space falls back to the POI-distance plane facing the camera", () => {
+    addCamera();
+    // Straight through the principal point: the ray is the view axis, so the
+    // pivot lands on the comp plane at the comp centre (the default camera
+    // sits pulled back by its focal length, aimed at the centre).
+    const p = resolveOrbitPivot({ x: W / 2, y: H / 2 }, W, H, 'cursor');
+    expect(p).not.toBeNull();
+    expect(p!.x).toBeCloseTo(W / 2, 4);
+    expect(p!.y).toBeCloseTo(H / 2, 4);
+    expect(p!.z).toBeCloseTo(0, 4);
+  });
+
+  it("'cursor' below the horizon hits the ground plane (y = compHeight), not the top edge", () => {
+    addCamera();
+    const p = resolveOrbitPivot({ x: W / 2, y: H - 10 }, W, H, 'cursor');
+    expect(p).not.toBeNull();
+    // The 3D ground grid draws at y = compHeight (+ groundLevel, 0 here).
+    expect(p!.y).toBeCloseTo(H, 3);
+  });
+});
+
+describe('orbitCameraAboutPivot — a rigid orbit about an arbitrary world point', () => {
+  const W = 1920;
+  const H = 1080;
+  const dist = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) =>
+    Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+
+  function nav() {
+    return { nodeId: CAMERA, transId: `${CAMERA}_t` };
+  }
+
+  /** The eye the renderer would resolve from the written props (one-node). */
+  function resolvedEyeOneNode(): { x: number; y: number; z: number } {
+    const p = camProps() as Record<string, number | undefined>;
+    const focal = p.focalLength ?? defaultFocalLength(W);
+    const base = { x: p.x ?? W / 2, y: p.y ?? H / 2, z: p.z ?? -focal };
+    return Project3D.orbitCamera(
+      base, { x: W / 2, y: H / 2, z: 0 }, p.orbitYaw ?? 0, p.orbitPitch ?? 0,
+    ).position;
+  }
+
+  it('one-node: the eye keeps its distance to the pivot, and the aim angles advance additively', () => {
+    add3DShape();
+    addCamera();
+    const pivot = { x: 0, y: 0, z: 0 };
+    const before = resolvedEyeOneNode();
+    const r0 = dist(before, pivot);
+
+    orbitCameraAboutPivot(nav(), 25, 10, pivot, W, H); // Δyaw 10°, Δpitch 4°
+
+    const p = camProps() as Record<string, number | undefined>;
+    expect(p.orbitYaw).toBeCloseTo(10, 9);
+    expect(p.orbitPitch).toBeCloseTo(4, 9);
+    const after = resolvedEyeOneNode();
+    expect(dist(after, pivot)).toBeCloseTo(r0, 6);
+    // And it actually moved — a pivot orbit is not the in-place POI orbit.
+    expect(dist(after, before)).toBeGreaterThan(1);
+  });
+
+  it('two-node: eye AND POI rotate rigidly about the pivot; orbitYaw/orbitPitch stay untouched', () => {
+    add3DShape();
+    addCamera();
+    // Make it a two-node camera aimed at the comp centre.
+    defaultSceneGraph.writeProp(CAMERA, `${CAMERA}_t`, 'poiX', W / 2);
+    defaultSceneGraph.writeProp(CAMERA, `${CAMERA}_t`, 'poiY', H / 2);
+    defaultSceneGraph.writeProp(CAMERA, `${CAMERA}_t`, 'poiZ', 0);
+
+    const pivot = { x: 300, y: 200, z: -100 };
+    const p0 = camProps() as Record<string, number | undefined>;
+    const focal = p0.focalLength ?? defaultFocalLength(W);
+    const poiBefore = { x: W / 2, y: H / 2, z: 0 };
+    const eyeBefore = { x: p0.x ?? W / 2, y: p0.y ?? H / 2, z: p0.z ?? -focal };
+    const eyeToPoi = dist(eyeBefore, poiBefore);
+    const poiToPivot = dist(poiBefore, pivot);
+
+    orbitCameraAboutPivot(nav(), 25, 10, pivot, W, H);
+
+    const p = camProps() as Record<string, number | undefined>;
+    // The pivot is never written INTO the POI — the POI rotates, it is not re-targeted.
+    const poiAfter = { x: p.poiX!, y: p.poiY!, z: p.poiZ! };
+    expect(poiAfter).not.toEqual(pivot);
+    expect(dist(poiAfter, pivot)).toBeCloseTo(poiToPivot, 6);
+    // Rigid: the shot keeps framing its subject (eye→POI distance preserved;
+    // orbit props untouched, so the resolved eye is base orbited by 0/0 = base).
+    expect(p.orbitYaw ?? 0).toBe(0);
+    expect(p.orbitPitch ?? 0).toBe(0);
+    const eyeAfter = { x: p.x!, y: p.y!, z: p.z! };
+    expect(dist(eyeAfter, poiAfter)).toBeCloseTo(eyeToPoi, 6);
+    expect(dist(eyeAfter, pivot)).toBeCloseTo(dist(eyeBefore, pivot), 6);
+  });
+
+  it('orbitNavBy without a pivot keeps the classic POI orbit (no position writes)', () => {
+    add3DShape();
+    addCamera();
+    orbitNavBy({ kind: 'scene', nodeId: CAMERA, transId: `${CAMERA}_t` }, 10, 5, null);
+    const p = camProps() as Record<string, number | undefined>;
+    expect(p.orbitYaw).toBeCloseTo(4, 9);
+    expect(p.orbitPitch).toBeCloseTo(2, 9);
+    // x/y untouched (the fixture's 960/540), z never written.
+    expect(p.x).toBe(960);
+    expect(p.y).toBe(540);
+    expect(p.z).toBeUndefined();
   });
 });

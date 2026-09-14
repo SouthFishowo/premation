@@ -38,7 +38,8 @@ import { beginViewportGesture, endViewportGesture } from '@core/workspace/viewpo
 import { useSceneRefGeometry } from './useSceneRefGeometry';
 import type { RenderView } from '@core/rendering/RenderBackend';
 import { Project3D, type Vec3 } from '@motion/scene';
-import { Gizmo3D, type GizmoHandleType, type RenderedGizmo3D } from '@motion/workspace';
+import { Gizmo3D, pointLines, type GizmoHandleType, type RenderedGizmo3D, type SnapLine, type SnapPointTarget } from '@motion/workspace';
+import { snapActive, snapGizmoTranslate } from './gizmo3dSnap';
 import type { SceneNode } from '@core/types';
 
 export interface DragState3D {
@@ -111,6 +112,10 @@ export function useGizmo3d(stageRef: React.RefObject<HTMLElement | null>, option
   readViewRef.current = getViewOpt
     ? (): RenderView => getViewOpt() ?? IDENTITY_VIEW
     : (): RenderView => getWorkspaceController().getView();
+  // Snapping reads the MAIN workspace's features, projected through the main
+  // view — a secondary pane (own camera, own framing) must not snap to them.
+  const mainViewRef = useRef(true);
+  mainViewRef.current = !getViewOpt;
 
   const compWidth = useCompositionStore((s) => s.width);
   const compHeight = useCompositionStore((s) => s.height);
@@ -134,6 +139,12 @@ export function useGizmo3d(stageRef: React.RefObject<HTMLElement | null>, option
   // and re-attaching the stage/window listeners.
   const dragRef = useRef<DragState3D | null>(null);
   const dragHudRaf = useRef<number | null>(null);
+  /**
+   * Snap features for the current TRANSLATE drag, collected once at grab time
+   * (nothing else moves during the drag). `shown` tracks whether the indicator
+   * is up, so a move that snaps nothing clears it exactly once.
+   */
+  const snapRef = useRef<{ points: SnapPointTarget[]; thresholdWorld: number; enabled: boolean; shown: boolean } | null>(null);
 
   // Filter selected nodes to those with 3D enabled (AE multi-layer 3D selection).
   //
@@ -272,6 +283,44 @@ export function useGizmo3d(stageRef: React.RefObject<HTMLElement | null>, option
       return 12 / s;
     };
 
+    const showSnapIndicator = (lines: readonly SnapLine[]): void => {
+      try {
+        getWorkspaceController().ws.setSnapIndicator(lines);
+      } catch {
+        /* no workspace (tests) */
+      }
+    };
+    const endSnap = (): void => {
+      if (snapRef.current?.shown) showSnapIndicator([]);
+      snapRef.current = null;
+    };
+
+    /**
+     * Snap a translate move's result onto a feature, constrained to the axis
+     * (`dir` = axis) or plane (`dir` = normal) being dragged. Ctrl/Cmd toggles
+     * snapping for the move, like the 2D tools.
+     */
+    const snapTranslate = (kind: 'axis' | 'plane', moved: Vec3, dir: Vec3, start: Vec3, e: PointerEvent): Vec3 => {
+      const snap = snapRef.current;
+      if (!snap) return moved;
+      const hit = snapActive(snap.enabled, e.ctrlKey || e.metaKey)
+        ? snapGizmoTranslate({
+            kind,
+            start,
+            moved,
+            dir,
+            view: { camera, orthoView: orthoView ?? null, width: compWidth, height: compHeight },
+            points: snap.points,
+            threshold: snap.thresholdWorld,
+          })
+        : null;
+      if (hit || snap.shown) {
+        showSnapIndicator(hit ? pointLines(hit.target, snap.thresholdWorld) : []);
+        snap.shown = hit !== null;
+      }
+      return hit ? hit.pos : moved;
+    };
+
     const onPointerMove = (e: PointerEvent) => {
       const stagePt = getStageLocal(e);
       const compPt = getCompLocal(stagePt);
@@ -309,10 +358,12 @@ export function useGizmo3d(stageRef: React.RefObject<HTMLElement | null>, option
             y: dragState.startPos3D.y + axisDir.y * tAxis,
             z: dragState.startPos3D.z + axisDir.z * tAxis,
           };
+          // An axis pointing at the camera has no screen line to snap along.
+          if (!axisEntry?.degenerate) newPos = snapTranslate('axis', newPos, axisDir, dragState.startPos3D, e);
         } else if (handle === 'plane_xy' || handle === 'plane_xz' || handle === 'plane_yz') {
           const normal = handle === 'plane_xy' ? basis.z : handle === 'plane_xz' ? basis.y : basis.x;
           const hit = Project3D.intersectRayPlane(ray, dragState.startPos3D, normal);
-          if (hit) newPos = hit;
+          if (hit) newPos = snapTranslate('plane', hit, normal, dragState.startPos3D, e);
         } else if (handle === 'rot_x' || handle === 'rot_y' || handle === 'rot_z') {
           // Delta rotation relative to the grab point:
           //   rot_z — true relative angle around the gizmo centre (comp space);
@@ -505,6 +556,18 @@ export function useGizmo3d(stageRef: React.RefObject<HTMLElement | null>, option
           });
         if (initialNodeStates.length === 0) return;
 
+        // Translate drags snap (main viewport only). Features of the dragged
+        // layers themselves are excluded, as a 2D move excludes them.
+        endSnap();
+        if (mainViewRef.current && (hit.startsWith('pos_') || hit.startsWith('plane_'))) {
+          try {
+            const f = getWorkspaceController().ws.snapFeatures(new Set(initialNodeStates.map((s) => s.id)));
+            snapRef.current = { ...f, shown: false };
+          } catch {
+            snapRef.current = null;
+          }
+        }
+
         // Fresh centroid + first-node rot/scale (mirrors the render-path math).
         const n = initialNodeStates.length;
         const startPos: Vec3 = {
@@ -548,6 +611,7 @@ export function useGizmo3d(stageRef: React.RefObject<HTMLElement | null>, option
           /* best-effort */
         }
         endViewportGesture();
+        endSnap();
         dragRef.current = null;
         if (dragHudRaf.current !== null) {
           cancelAnimationFrame(dragHudRaf.current);
@@ -576,6 +640,7 @@ export function useGizmo3d(stageRef: React.RefObject<HTMLElement | null>, option
         endViewportGesture();
         dragRef.current = null;
       }
+      endSnap();
       if (dragHudRaf.current !== null) {
         cancelAnimationFrame(dragHudRaf.current);
         dragHudRaf.current = null;

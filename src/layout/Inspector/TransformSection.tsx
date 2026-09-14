@@ -34,8 +34,23 @@ import { MultiPropertyRow } from './MultiPropertyRow';
 import { SectionPresetMenu } from './SectionPresetMenu';
 import { ThreeDControl } from './ThreeDControl';
 import { useInspectorSelection } from './inspectorSelection';
+import { ValueFieldDisplayContext } from '@components/ValueField/ValueField';
+import { useCompositionStore } from '@stores/compositionStore';
+import {
+  anchorPercentDisplay,
+  loadTransformUnits,
+  positionPercentDisplay,
+  saveTransformUnits,
+  type TransformUnits,
+  type UnitDisplay,
+} from '@core/scene/transformUnits';
 
 import styles from './TransformSection.module.css';
+
+/** Show the rows below in a display unit (AE "Edit Value…" units) — or as-is. */
+function withUnit(display: UnitDisplay | null, el: JSX.Element): JSX.Element {
+  return display ? <ValueFieldDisplayContext.Provider value={display}>{el}</ValueFieldDisplayContext.Provider> : el;
+}
 
 /** Rotation-flavored props get a purpose-built dial next to their number —
  *  the dial writes through the SAME path as the ValueField, so keyframing,
@@ -140,6 +155,10 @@ function TransformSectionInner({ nodeId }: { nodeId: string }): JSX.Element | nu
   const time = useCurrentTime();
   const node = defaultSceneGraph.getNode(nodeId);
   const [linkedScale, setLinkedScale] = useState(true);
+  // Position / Anchor units (px | %), remembered across mounts.
+  const [units, setUnits] = useState<TransformUnits>(loadTransformUnits);
+  const compW = useCompositionStore((s) => s.width);
+  const compH = useCompositionStore((s) => s.height);
 
   // NO early return before the hooks below — the hook count must not depend
   // on whether the node exists (deleting a selected layer with this panel open
@@ -227,6 +246,33 @@ function TransformSectionInner({ nodeId }: { nodeId: string }): JSX.Element | nu
     return Math.abs(anchorX - target.x) < 1.5 && Math.abs(anchorY - target.y) < 1.5;
   };
 
+  // Units menu on Position (px | % of composition) and Anchor Point (px | % of
+  // layer). Scale has none — it is already a percentage.
+  const unitToggle = (key: keyof TransformUnits, label: string, ofWhat: string): JSX.Element => {
+    const pct = units[key] === '%';
+    return (
+      <button
+        type="button"
+        className={`${styles.lockToggle} ${pct ? styles.lockToggleActive : ''}`}
+        title={pct ? `${label} shown as % of ${ofWhat} — switch to pixels` : `${label} shown in pixels — switch to % of ${ofWhat}`}
+        aria-label={`${label} units: ${pct ? `percent of ${ofWhat}` : 'pixels'}`}
+        aria-pressed={pct}
+        onClick={(e) => {
+          e.stopPropagation();
+          const next: TransformUnits = { ...units, [key]: pct ? 'px' : '%' };
+          setUnits(next);
+          saveTransformUnits(next);
+        }}
+      >
+        {pct ? '%' : 'px'}
+      </button>
+    );
+  };
+  const posX = units.position === '%' ? positionPercentDisplay(compW) : null;
+  const posY = units.position === '%' ? positionPercentDisplay(compH) : null;
+  const ancX = units.anchor === '%' ? anchorPercentDisplay(bounds.width) : null;
+  const ancY = units.anchor === '%' ? anchorPercentDisplay(bounds.height) : null;
+
   const positionProps = ['x', 'y', ...(hasDepth ? ['z'] : [])];
   const rotationProps = ['rotation', ...(is3D ? ['rotationX', 'rotationY'] : [])];
 
@@ -247,7 +293,7 @@ function TransformSectionInner({ nodeId }: { nodeId: string }): JSX.Element | nu
       <div className={styles.inlineRows}>
         {!isCamera && (
           <>
-            {subhead('Anchor', anyAnimated(['anchorX', 'anchorY']), groupStopwatch('Anchor', ['anchorX', 'anchorY']))}
+            {subhead('Anchor', anyAnimated(['anchorX', 'anchorY']), groupStopwatch('Anchor', ['anchorX', 'anchorY']), unitToggle('anchor', 'Anchor Point', 'layer'))}
             <div className={styles.anchorMatrixRow}>
               <div
                 className={styles.anchorOriginBox}
@@ -268,14 +314,14 @@ function TransformSectionInner({ nodeId }: { nodeId: string }): JSX.Element | nu
                 ))}
               </div>
             </div>
-            {row('anchorX')}
-            {row('anchorY')}
+            {withUnit(ancX, row('anchorX'))}
+            {withUnit(ancY, row('anchorY'))}
           </>
         )}
 
-        {subhead('Position', anyAnimated(positionProps), groupStopwatch('Position', positionProps))}
-        {row('x')}
-        {row('y')}
+        {subhead('Position', anyAnimated(positionProps), groupStopwatch('Position', positionProps), unitToggle('position', 'Position', 'composition'))}
+        {withUnit(posX, row('x'))}
+        {withUnit(posY, row('y'))}
         {hasDepth && row('z')}
 
         <div className={styles.subhead}>

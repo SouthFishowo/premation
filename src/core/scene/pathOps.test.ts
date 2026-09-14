@@ -18,6 +18,54 @@ describe('shapeOutline', () => {
     expect(pts[0]!.x).toBeCloseTo(50);
     expect(pts[1]!.y).toBeCloseTo(50);
   });
+
+  it('all-zero cornerRadii is byte-identical to no radii at all', () => {
+    expect(shapeOutline('rect', 100, 60, 48, 0, [0, 0, 0, 0])).toEqual(shapeOutline('rect', 100, 60));
+    expect(shapeOutline('rect', 100, 60, 48, 2, [0, 0, 0, 0])).toEqual(shapeOutline('rect', 100, 60, 48, 2));
+  });
+
+  it('cornerRadii round the outline: arc points sit at radius r from each corner centre', () => {
+    const r = 20;
+    const pts = shapeOutline('rect', 100, 60, 48, 0, [r, r, r, r]);
+    // Many more points than 4 (flattened arcs)…
+    expect(pts.length).toBeGreaterThan(20);
+    // …every point on the outline is either on a straight edge (|x| = 50 or
+    // |y| = 30) or exactly r from its corner's arc centre.
+    const centres = [
+      { x: -50 + r, y: -30 + r }, { x: 50 - r, y: -30 + r },
+      { x: 50 - r, y: 30 - r }, { x: -50 + r, y: 30 - r },
+    ];
+    for (const p of pts) {
+      const onEdge =
+        (Math.abs(Math.abs(p.x) - 50) < 1e-6 && Math.abs(p.y) <= 30 - r + 1e-6)
+        || (Math.abs(Math.abs(p.y) - 30) < 1e-6 && Math.abs(p.x) <= 50 - r + 1e-6);
+      const onArc = centres.some((c) => Math.abs(Math.hypot(p.x - c.x, p.y - c.y) - r) < 1e-6);
+      expect(onEdge || onArc).toBe(true);
+    }
+    // The sharp corner itself is GONE.
+    expect(pts.some((p) => Math.abs(p.x) > 50 - 1e-6 && Math.abs(p.y) > 30 - 1e-6)).toBe(false);
+    // Adaptive density on the arcs: consecutive ARC points are within the
+    // chain's own ~2.5px chord budget.
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1]!;
+      const b = pts[i]!;
+      const bothOnOneArc = centres.some(
+        (c) =>
+          Math.abs(Math.hypot(a.x - c.x, a.y - c.y) - r) < 1e-6
+          && Math.abs(Math.hypot(b.x - c.x, b.y - c.y) - r) < 1e-6,
+      );
+      if (bothOnOneArc) expect(Math.hypot(b.x - a.x, b.y - a.y)).toBeLessThanOrEqual(2.6);
+    }
+  });
+
+  it('independent radii round only the corners that ask for it', () => {
+    const pts = shapeOutline('rect', 100, 60, 48, 0, [20, 0, 0, 0]);
+    // TL is rounded away; the other three sharp corners survive.
+    expect(pts.some((p) => Math.abs(p.x + 50) < 1e-6 && Math.abs(p.y + 30) < 1e-6)).toBe(false);
+    expect(pts.some((p) => Math.abs(p.x - 50) < 1e-6 && Math.abs(p.y + 30) < 1e-6)).toBe(true);
+    expect(pts.some((p) => Math.abs(p.x - 50) < 1e-6 && Math.abs(p.y - 30) < 1e-6)).toBe(true);
+    expect(pts.some((p) => Math.abs(p.x + 50) < 1e-6 && Math.abs(p.y - 30) < 1e-6)).toBe(true);
+  });
 });
 
 describe('zigzag', () => {
@@ -126,6 +174,135 @@ describe('offsetPath', () => {
     expect(out[0]!.x).toBeCloseTo(0);
   });
 });
+
+describe('offsetPath joins', () => {
+  const { offsetPath, offsetPathRuns } = require('./pathOps');
+  const sq: Pt[] = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
+  // A right-angle open elbow: the outer corner shows the join.
+  const elbow: Pt[] = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }];
+
+  it('miter (the default) extends outer corners to the true edge intersection', () => {
+    // Offsetting the square OUTWARD (this winding: negative amount) puts each
+    // corner's miter apex diagonally at amount·√2 — the two offset edges meet
+    // exactly there, unlike the old averaged-normal point at amount·1.
+    const out = offsetPath(sq, true, -2);
+    expect(out).toHaveLength(4);
+    expect(out[0]!.x).toBeCloseTo(-2, 6);
+    expect(out[0]!.y).toBeCloseTo(-2, 6);
+  });
+
+  it('a corner past the miter limit falls back to a bevel', () => {
+    // 90° corner: miter ratio = √2 ≈ 1.414. Limit 1 forces the bevel — the
+    // apex is replaced by the two offset-edge endpoints.
+    const out = offsetPath(elbow, false, -2, 'miter', 1) as Pt[];
+    expect(out).toHaveLength(4); // start, two bevel points, end
+    expect(out[1]).toEqual({ x: 10, y: -2 });
+    expect(out[2]).toEqual({ x: 12, y: 0 });
+    // …and a generous limit keeps the apex.
+    const kept = offsetPath(elbow, false, -2, 'miter', 4) as Pt[];
+    expect(kept).toHaveLength(3);
+    expect(kept[1]!.x).toBeCloseTo(12, 6);
+    expect(kept[1]!.y).toBeCloseTo(-2, 6);
+  });
+
+  it('round joins sweep an arc of radius |amount| about the vertex', () => {
+    const out = offsetPath(elbow, false, -2, 'round') as Pt[];
+    expect(out.length).toBeGreaterThan(4);
+    for (const p of out.slice(1, -1)) {
+      expect(Math.hypot(p.x - 10, p.y - 0)).toBeCloseTo(2, 6);
+    }
+  });
+
+  it('bevel joins cut straight across', () => {
+    const out = offsetPath(elbow, false, -2, 'bevel') as Pt[];
+    expect(out).toHaveLength(4);
+    expect(out[1]).toEqual({ x: 10, y: -2 });
+    expect(out[2]).toEqual({ x: 12, y: 0 });
+  });
+
+  it('a convex shape offset past its inradius collapses to nothing (AE behaviour)', () => {
+    expect(offsetPathRuns(sq, true, 6)).toEqual([]);
+  });
+
+  it('concave corners no longer self-intersect: the crossed loop is removed', () => {
+    // An L: offsetting INWARD (positive amount on this winding) pinches the
+    // reflex corner. The naive offset left a bow-tie; the cleanup must return
+    // simple ring(s) only.
+    const L: Pt[] = [
+      { x: 0, y: 0 }, { x: 20, y: 0 }, { x: 20, y: 8 },
+      { x: 8, y: 8 }, { x: 8, y: 20 }, { x: 0, y: 20 },
+    ];
+    const runs = offsetPathRuns(L, true, 3) as Pt[][];
+    expect(runs.length).toBeGreaterThan(0);
+    for (const ring of runs) {
+      expect(hasSelfIntersection(ring)).toBe(false);
+    }
+    // Total surviving area is smaller than the source's (it shrank).
+    const area = (ring: Pt[]): number => {
+      let a = 0;
+      for (let i = 0; i < ring.length; i++) {
+        const p = ring[i]!;
+        const q = ring[(i + 1) % ring.length]!;
+        a += p.x * q.y - q.x * p.y;
+      }
+      return Math.abs(a / 2);
+    };
+    const total = runs.reduce((s, r) => s + area(r), 0);
+    expect(total).toBeGreaterThan(0);
+    expect(total).toBeLessThan(20 * 20 - 12 * 12); // the L's own area
+  });
+
+  it('a leg thinner than the offset vanishes; the thicker one survives, un-crossed', () => {
+    // Horizontal leg 4 thick (vanishes at ±3), vertical leg 8 thick (survives
+    // as a 2-wide strip). The naive offset left the vanished leg as an
+    // inverted bow-tie loop; the cleanup must drop it.
+    const L: Pt[] = [
+      { x: 0, y: 0 }, { x: 20, y: 0 }, { x: 20, y: 4 },
+      { x: 8, y: 4 }, { x: 8, y: 20 }, { x: 0, y: 20 },
+    ];
+    const runs = offsetPathRuns(L, true, 3) as Pt[][];
+    expect(runs.length).toBeGreaterThan(0);
+    for (const ring of runs) expect(hasSelfIntersection(ring)).toBe(false);
+    // Nothing survives inside the vanished horizontal leg (x beyond the
+    // vertical strip).
+    for (const ring of runs) for (const p of ring) expect(p.x).toBeLessThan(10);
+  });
+
+  it('offsetting an L OUTWARD stays a single simple ring with a joined reflex corner', () => {
+    const L: Pt[] = [
+      { x: 0, y: 0 }, { x: 20, y: 0 }, { x: 20, y: 8 },
+      { x: 8, y: 8 }, { x: 8, y: 20 }, { x: 0, y: 20 },
+    ];
+    const runs = offsetPathRuns(L, true, -2) as Pt[][];
+    expect(runs).toHaveLength(1);
+    expect(hasSelfIntersection(runs[0]!)).toBe(false);
+  });
+});
+
+/** Brute-force segment-pair test (fine for test-sized rings). */
+function hasSelfIntersection(ring: Pt[]): boolean {
+  const n = ring.length;
+  const seg = (i: number): [Pt, Pt] => [ring[i]!, ring[(i + 1) % n]!];
+  const crosses = (a: Pt, b: Pt, c: Pt, d: Pt): boolean => {
+    const o = (p: Pt, q: Pt, r: Pt): number => (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+    const eps = 1e-9;
+    const o1 = o(a, b, c);
+    const o2 = o(a, b, d);
+    const o3 = o(c, d, a);
+    const o4 = o(c, d, b);
+    return ((o1 > eps && o2 < -eps) || (o1 < -eps && o2 > eps))
+      && ((o3 > eps && o4 < -eps) || (o3 < -eps && o4 > eps));
+  };
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 2; j < n; j++) {
+      if (i === 0 && j === n - 1) continue; // adjacent around the wrap
+      const [a, b] = seg(i);
+      const [c, d] = seg(j);
+      if (crosses(a, b, c, d)) return true;
+    }
+  }
+  return false;
+}
 
 describe('roughen', () => {
   const { roughen } = require('./pathOps');

@@ -12,6 +12,7 @@
 import type { Vec2 } from '../math/Vec2';
 import type { Rect } from '../math/Rect';
 import * as R from '../math/Rect';
+import * as Mat from '../math/Mat2D';
 import {
   spacingCandidates,
   equalSizeCandidates,
@@ -34,6 +35,19 @@ export interface SnapSettings {
    * takes away the measuring, not the magnet.
    */
   smartGuides: boolean;
+  /**
+   * AE snap FEATURES beyond box edges, each gated additionally by `toObjects`.
+   * Optional so a settings literal written before they existed still type-
+   * checks; absent reads as ON.
+   *
+   *  • toAnchors      — other layers' anchor points
+   *  • toMaskVertices — vertices of other layers' masks and shape paths
+   *  • to3D           — 3D layers' projected anchor + corners (in the active
+   *                     view, i.e. screen space — see `featurePoints`)
+   */
+  toAnchors?: boolean;
+  toMaskVertices?: boolean;
+  to3D?: boolean;
   /** Snap threshold in screen pixels. */
   thresholdPx: number;
 }
@@ -46,6 +60,9 @@ export const DEFAULT_SNAP_SETTINGS: SnapSettings = {
   toEdges: true,
   toCenters: true,
   smartGuides: true,
+  toAnchors: true,
+  toMaskVertices: true,
+  to3D: true,
   /*
    * The magnet's reach, in SCREEN px.
    *
@@ -59,7 +76,36 @@ export const DEFAULT_SNAP_SETTINGS: SnapSettings = {
   thresholdPx: 3,
 };
 
-export type SnapSource = 'grid' | 'guide' | 'object-edge' | 'object-center' | 'object-corner';
+export type SnapSource =
+  | 'grid'
+  | 'guide'
+  | 'object-edge'
+  | 'object-center'
+  | 'object-corner'
+  | 'anchor-point'
+  | 'mask-vertex'
+  | 'projected-3d';
+
+/**
+ * A 2-D snap FEATURE — a point both axes lock to at once (AE snaps to anchor
+ * points and path vertices as points, not as alignment lines). Checked before
+ * the 1-D line targets: a point in reach is the stronger, more specific magnet.
+ */
+export interface SnapPointTarget {
+  x: number;
+  y: number;
+  source: SnapSource;
+}
+
+/** The subset of a workspace node the feature extractor reads. */
+export interface SnapFeatureNode {
+  readonly worldMatrix: Mat.Mat2D;
+  readonly anchor?: Vec2;
+  readonly is3D?: boolean;
+  readonly worldCorners?: readonly Vec2[];
+  readonly pathPoints?: readonly Vec2[];
+  readonly maskPaths?: ReadonlyArray<{ readonly points: readonly Vec2[] }>;
+}
 
 /** A 1-D line the geometry can snap to, in world coordinates. */
 export interface SnapTarget {
@@ -154,10 +200,66 @@ export class SnapEngine {
     return targets;
   }
 
-  /** Snap a single world point. */
-  snapPoint(point: Vec2, targets: readonly SnapTarget[], thresholdWorld: number): SnapResult<Vec2> {
-    if (!this.settings.enabled) {
+  /**
+   * Point features of a set of nodes, in world (= active-view screen-projected)
+   * space:
+   *
+   *  • 2D layer — its anchor (`anchor-point`), plus every vertex of its shape
+   *    path and masks (`mask-vertex`), all mapped through `worldMatrix`.
+   *  • 3D layer — its anchor and its four `worldCorners` as `projected-3d`.
+   *    The host has already projected those through the active view, so
+   *    snapping against them is snapping in SCREEN space in that view: exact at
+   *    the corners, and at the anchor wherever the projection's affine
+   *    approximation holds (it is exact for a centred anchor). Mask vertices of
+   *    a 3D layer are mapped through the same affine and share that caveat.
+   */
+  static featurePoints(nodes: readonly SnapFeatureNode[]): SnapPointTarget[] {
+    const out: SnapPointTarget[] = [];
+    for (const n of nodes) {
+      const m = n.worldMatrix;
+      const anchor = Mat.apply(m, n.anchor ?? { x: 0, y: 0 });
+      out.push({ x: anchor.x, y: anchor.y, source: n.is3D ? 'projected-3d' : 'anchor-point' });
+      if (n.is3D && n.worldCorners) {
+        for (const c of n.worldCorners) out.push({ x: c.x, y: c.y, source: 'projected-3d' });
+      }
+      const vertex = (p: Vec2): void => {
+        const w = Mat.apply(m, p);
+        out.push({ x: w.x, y: w.y, source: 'mask-vertex' });
+      };
+      for (const p of n.pathPoints ?? []) vertex(p);
+      for (const mask of n.maskPaths ?? []) for (const p of mask.points) vertex(p);
+    }
+    return out;
+  }
+
+  /**
+   * Snap a single world point.
+   *
+   * `force` ignores the master `enabled` switch (the per-source switches still
+   * apply) — the Pan Behind tool's Ctrl gesture TOGGLES snapping, so with
+   * snapping off Ctrl has to be able to turn it on for one drag.
+   */
+  snapPoint(
+    point: Vec2,
+    targets: readonly SnapTarget[],
+    thresholdWorld: number,
+    points?: readonly SnapPointTarget[],
+    opts?: { force?: boolean },
+  ): SnapResult<Vec2> {
+    if (!this.settings.enabled && !opts?.force) {
       return { value: point, delta: { x: 0, y: 0 }, snapped: false, lines: [], spacing: [] };
+    }
+    const pointMatch = points && points.length ? this.bestPoint([point], points, thresholdWorld) : null;
+    if (pointMatch) {
+      const dx = pointMatch.target.x - pointMatch.moving.x;
+      const dy = pointMatch.target.y - pointMatch.moving.y;
+      return {
+        value: { x: point.x + dx, y: point.y + dy },
+        delta: { x: dx, y: dy },
+        snapped: true,
+        lines: pointLines(pointMatch.target, thresholdWorld),
+        spacing: [],
+      };
     }
     const xMatch = this.bestMatch([point.x], targets, 'x', thresholdWorld);
     const yMatch = this.bestMatch([point.y], targets, 'y', thresholdWorld);
@@ -180,9 +282,29 @@ export class SnapEngine {
      * nothing and get byte-identical results.
      */
     others?: readonly Rect[],
+    /**
+     * Point features (anchors, path vertices, projected 3D points). The rect's
+     * corners, centre and edge midpoints are matched against them first; a
+     * point in reach claims BOTH axes and alignment/spacing are skipped.
+     */
+    points?: readonly SnapPointTarget[],
   ): SnapResult<Rect> {
     if (!this.settings.enabled) {
       return { value: rect, delta: { x: 0, y: 0 }, snapped: false, lines: [], spacing: [] };
+    }
+    if (points && points.length) {
+      const moving = rectKeyPoints(rect, this.settings.toEdges, this.settings.toCenters);
+      const pm = this.bestPoint(moving, points, thresholdWorld);
+      if (pm) {
+        const d = { x: pm.target.x - pm.moving.x, y: pm.target.y - pm.moving.y };
+        return {
+          value: R.translate(rect, d),
+          delta: d,
+          snapped: true,
+          lines: pointLines(pm.target, thresholdWorld),
+          spacing: [],
+        };
+      }
     }
     const xCoords: number[] = [rect.x];
     const yCoords: number[] = [rect.y];
@@ -257,10 +379,38 @@ export class SnapEngine {
     return out;
   }
 
+  /** Whether a snap source is switched on (for hosts that match features themselves). */
+  sourceAllowed(source: SnapSource): boolean {
+    return this.allowed(source);
+  }
+
   private allowed(source: SnapSource): boolean {
-    if (source === 'grid') return this.settings.toGrid;
-    if (source === 'guide') return this.settings.toGuides;
-    return this.settings.toObjects;
+    const s = this.settings;
+    if (source === 'grid') return s.toGrid;
+    if (source === 'guide') return s.toGuides;
+    if (source === 'anchor-point') return s.toObjects && s.toAnchors !== false;
+    if (source === 'mask-vertex') return s.toObjects && s.toMaskVertices !== false;
+    if (source === 'projected-3d') return s.toObjects && s.to3D !== false;
+    return s.toObjects;
+  }
+
+  /** Nearest (Euclidean) allowed point feature to any moving point, in reach. */
+  private bestPoint(
+    moving: readonly Vec2[],
+    points: readonly SnapPointTarget[],
+    threshold: number,
+  ): { target: SnapPointTarget; moving: Vec2; distance: number } | null {
+    let best: { target: SnapPointTarget; moving: Vec2; distance: number } | null = null;
+    for (const target of points) {
+      if (!this.allowed(target.source)) continue;
+      for (const mp of moving) {
+        const distance = Math.hypot(target.x - mp.x, target.y - mp.y);
+        if (distance <= threshold && (best === null || distance < best.distance)) {
+          best = { target, moving: mp, distance };
+        }
+      }
+    }
+    return best;
   }
 
   private bestMatch(
@@ -303,4 +453,34 @@ export class SnapEngine {
     const to = t.extentTo ?? perp + 40;
     return { axis: t.axis, position: t.position, from, to, source: t.source };
   }
+}
+
+/**
+ * The points of a moving rect that can land on a point feature: its corners
+ * always, edge midpoints with `toEdges`, the centre with `toCenters`.
+ */
+function rectKeyPoints(rect: Rect, edges: boolean, centers: boolean): Vec2[] {
+  const x0 = rect.x;
+  const y0 = rect.y;
+  const x1 = rect.x + rect.width;
+  const y1 = rect.y + rect.height;
+  const cx = rect.x + rect.width / 2;
+  const cy = rect.y + rect.height / 2;
+  const pts: Vec2[] = [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }];
+  if (edges) pts.push({ x: cx, y: y0 }, { x: x1, y: cy }, { x: cx, y: y1 }, { x: x0, y: cy });
+  if (centers) pts.push({ x: cx, y: cy });
+  return pts;
+}
+
+/**
+ * The indicator for a POINT snap: a short cross through the feature, drawn by
+ * the host exactly like alignment lines (same `SnapLine` shape, same colour).
+ * Its arm length follows the threshold so it reads the same at every zoom.
+ */
+export function pointLines(p: SnapPointTarget, thresholdWorld: number): SnapLine[] {
+  const arm = Math.max(thresholdWorld * 4, 1e-6);
+  return [
+    { axis: 'x', position: p.x, from: p.y - arm, to: p.y + arm, source: p.source },
+    { axis: 'y', position: p.y, from: p.x - arm, to: p.x + arm, source: p.source },
+  ];
 }

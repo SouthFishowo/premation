@@ -44,7 +44,7 @@
 }
 
 .panel {
-  width: 224px;
+  width: 248px;
   display: flex;
   flex-direction: column;
 }
@@ -138,3 +138,69 @@
   color: var(--color-text-tertiary);
   text-align: center;
 }
+
+/* Favourite star — a real button inside the row, so it is reachable and
+   announced; hidden until the row is hovered or active unless it is ON. */
+.star {
+  flex: none;
+  background: none;
+  border: none;
+  padding: 0 2px;
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  line-height: 1;
+  color: var(--color-text-muted);
+  opacity: 0;
+}
+.item:hover .star,
+.itemActive .star,
+.star:focus-visible,
+.starOn {
+  opacity: 1;
+}
+.star:hover { color: var(--color-text-primary); }
+.starOn { color: var(--color-accent); }
+
+/* Section labels: Recent / All fonts / the style strip's family. */
+.sectionLabel {
+  padding: var(--space-2) var(--space-3) var(--space-1);
+  font-size: var(--font-size-micro);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.recentList {
+  padding-top: var(--space-1);
+}
+.recentRow {
+  height: 26px;
+}
+
+/* Real per-family styles (Local Font Access faces). */
+.faces {
+  border-top: 1px solid var(--color-border-subtle);
+  padding-bottom: var(--space-2);
+}
+.faceList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  padding: 0 var(--space-2);
+  max-height: 96px;
+  overflow-y: auto;
+}
+.face {
+  font-size: var(--font-size-xs);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.face:hover { color: var(--color-text-primary); background: var(--color-surface-2); }

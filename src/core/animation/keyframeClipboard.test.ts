@@ -60,4 +60,18 @@ describe('keyframeClipboard spatial fidelity', () => {
     expect(x0.value).toBe(0);
     expect(x1.value).toBe(100);
   });
+
+  it('round-trips the per-keyframe spatial interpolation mode', () => {
+    defaultAnimation.setKeyframe('src', 'x', 0, 0);
+    defaultAnimation.setKeyframe('src', 'x', 1, 100);
+    defaultAnimation.setSpatialInterp('src', 'x', 0, 'linear');
+    defaultAnimation.setSpatialInterp('src', 'x', 1, 'auto');
+
+    copyKeyframes(new Set([makeKeyframeId('src', 'x', 0), makeKeyframeId('src', 'x', 1)]));
+    pasteKeyframes(['dst'], 2);
+
+    const kfs = defaultAnimation.getTrackKeyframes('dst', 'x')!;
+    expect(kfs.find((k) => Math.abs(k.t - 2) < 1e-6)!.spatialInterp).toBe('linear');
+    expect(kfs.find((k) => Math.abs(k.t - 3) < 1e-6)!.spatialInterp).toBe('auto');
+  });
 });

@@ -37,7 +37,7 @@ describe('track-header column model', () => {
   const EXPECTED = {
     preinfo: 72,
     name: 190,
-    switches: 178,
+    switches: 256,
     mode: 70,
     matte: 58,
     parent: 120,
@@ -47,10 +47,12 @@ describe('track-header column model', () => {
     expect(cssVar(n)).toBe(px);
   });
 
-  it('the switch column is exactly its seven 22px cells and six 4px gaps', () => {
+  it('the switch column is exactly its ten 22px cells and nine 4px gaps', () => {
     // A narrower column centre-justifies the switches and spills them into the
     // neighbouring divider rules — the bug the width was introduced to fix.
-    expect(cssVar('switches')).toBe(7 * 22 + 6 * 4);
+    // Ten: shy, collapse/continuous-raster, quality, fx, frame blending, motion
+    // blur, adjustment, guide, preserve transparency, 3D.
+    expect(cssVar('switches')).toBe(10 * 22 + 9 * 4);
   });
 
   it('the A/V gutter is exactly its three 22px cells and two 3px gaps', () => {
@@ -76,13 +78,13 @@ describe('headerWidthFor', () => {
   });
 
   it('fits the switch column on its own', () => {
-    expect(headerWidthFor('switches')).toBe(8 + 88 + 4 + 190 + 4 + 178 + 16);
+    expect(headerWidthFor('switches')).toBe(8 + 88 + 4 + 190 + 4 + 256 + 16);
   });
 
   it('needs both blocks plus a gap when both are shown', () => {
     const W = { switches: headerWidthFor('switches'), modes: headerWidthFor('modes') };
     // `both` is the two column sets sharing one gutter and one name column.
-    expect(headerWidthFor('both')).toBe(W.modes + 4 + 178 + 16);
+    expect(headerWidthFor('both')).toBe(W.modes + 4 + 256 + 16);
     expect(headerWidthFor('both')).toBeGreaterThan(W.switches);
   });
 

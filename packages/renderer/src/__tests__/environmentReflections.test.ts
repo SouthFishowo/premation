@@ -33,7 +33,7 @@ import {
   type MaterialDescriptor,
 } from '../shaders/Material';
 import { ENV_SAMPLER_BINDING, ENV_TEXTURE_BINDING } from '../gpu/types';
-import { packSolid3D, packTextured3D, AO3D_FLOATS, SHADE3D_FLOATS, SHADOW3D_TAIL_FLOATS, type Shade3D } from '../pipeline/uniforms';
+import { packSolid3D, packTextured3D, AO3D_FLOATS, REFL3D_FLOATS, SHADE3D_FLOATS, SHADOW3D_TAIL_FLOATS, type Shade3D } from '../pipeline/uniforms';
 import type { Mat4 } from '../core/math/Mat4';
 import type { Rect } from '../core/math/geometry';
 import type { Color } from '../core/math/Color';
@@ -75,7 +75,7 @@ describe('the gate: no environment light ⇒ the arithmetic that shipped before'
   it('packs envParams as four zeros when the shade carries no env', () => {
     const out = packSolid3D(MVP4, COLOR, 1, undefined, LIT);
     // Zero x is what the shader tests, so this IS the gate.
-    const envAt = out.length - SHADOW3D_TAIL_FLOATS - AO3D_FLOATS - 4;
+    const envAt = out.length - SHADOW3D_TAIL_FLOATS - AO3D_FLOATS - REFL3D_FLOATS - 4;
     expect([...out.slice(envAt, envAt + 4)]).toEqual([0, 0, 0, 0]);
   });
 
@@ -94,10 +94,19 @@ describe('the gate: no environment light ⇒ the arithmetic that shipped before'
       env: { intensity: 0.75, rotationRad: 0.5, scale: 2.5 },
     });
     expect(withEnv.length).toBe(without.length);
-    const envAt = without.length - SHADOW3D_TAIL_FLOATS - AO3D_FLOATS - 4;
+    const envAt = without.length - SHADOW3D_TAIL_FLOATS - AO3D_FLOATS - REFL3D_FLOATS - 4;
     expect([...withEnv.slice(0, envAt)]).toEqual([...without.slice(0, envAt)]);
     expect([...withEnv.slice(envAt, envAt + 4)]).toEqual([1, 0.75, 0.5, 2.5]);
-    expect([...withEnv.slice(envAt + 4)]).toEqual(new Array(AO3D_FLOATS + SHADOW3D_TAIL_FLOATS).fill(0));
+    // The Advanced-3D material block sits between envParams and the AO block.
+    // A present shade packs its IDENTITY, not zeros — Reflection Intensity's
+    // no-op is 1, and the F0 slot always carries the default IOR's Fresnel
+    // base (inert while both rolloffs are 0). Identical with and without env.
+    const F0_152 = Math.fround(((1.52 - 1) / (1.52 + 1)) ** 2);
+    expect([...withEnv.slice(envAt + 4, envAt + 4 + REFL3D_FLOATS)])
+      .toEqual([1, 0, 0, F0_152, 0, 0, 0, 0]);
+    expect([...without.slice(envAt + 4, envAt + 4 + REFL3D_FLOATS)])
+      .toEqual([1, 0, 0, F0_152, 0, 0, 0, 0]);
+    expect([...withEnv.slice(envAt + 4 + REFL3D_FLOATS)]).toEqual(new Array(AO3D_FLOATS + SHADOW3D_TAIL_FLOATS).fill(0));
   });
 
   it('reserves exactly one vec4 for it in the shade tail', () => {
@@ -106,10 +115,12 @@ describe('the gate: no environment light ⇒ the arithmetic that shipped before'
     // this pins the third side of the triangle — the field COUNT.
     expect(SHADE3D_FLOATS % 4).toBe(0);
     const noShade = packSolid3D(MVP4, COLOR, 1);
-    // No shade at all ⇒ a zero-filled tail ⇒ the lit flag, the env flag AND the
-    // shadow flag all off.
-    expect([...noShade.slice(noShade.length - SHADOW3D_TAIL_FLOATS - AO3D_FLOATS - 4)])
-      .toEqual(new Array(SHADOW3D_TAIL_FLOATS + AO3D_FLOATS + 4).fill(0));
+    // No shade at all ⇒ a zero-filled tail ⇒ the lit flag, the env flag, the
+    // transparency AND the shadow flag all off (reflParams' non-zero identity
+    // is only packed for a PRESENT shade — with no shade the lit flag is 0 and
+    // the shader never reads the block).
+    expect([...noShade.slice(noShade.length - SHADOW3D_TAIL_FLOATS - AO3D_FLOATS - REFL3D_FLOATS - 4)])
+      .toEqual(new Array(SHADOW3D_TAIL_FLOATS + AO3D_FLOATS + REFL3D_FLOATS + 4).fill(0));
   });
 
   it.each(SHADE_SHADERS.map((s) => s.name))('%s gates its reflection on envParams.x', (name) => {

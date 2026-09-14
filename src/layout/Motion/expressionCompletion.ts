@@ -114,7 +114,84 @@ interface MemberDef {
   hint: string;
 }
 
+/** `text.sourceText` — a string with `.style` and `.getStyleAt(i)`. */
+const SOURCE_TEXT_MEMBERS: readonly MemberDef[] = [
+  { name: 'style', hint: 'text style — getters and chainable setters (AE 25)' },
+  { name: 'getStyleAt()', insert: 'getStyleAt(0)', hint: 'style of one character (0-based) — reads rich-text runs' },
+  { name: 'length', hint: 'number of characters' },
+  { name: 'split()', insert: "split(' ')", hint: 'split into an array of strings' },
+  { name: 'toUpperCase()', hint: 'upper-cased copy' },
+  { name: 'toLowerCase()', hint: 'lower-cased copy' },
+  { name: 'slice()', insert: 'slice(0, 3)', hint: 'part of the text' },
+  { name: 'replace()', insert: "replace('a', 'b')", hint: 'replace the first match' },
+];
+
+/**
+ * The AE 25 text style object — getters then setters. Setters take an optional
+ * `(value, startIndex, numChars)` range for per-character styling, and every
+ * setter returns a new style, so they chain.
+ */
+const STYLE_MEMBERS: readonly MemberDef[] = [
+  { name: 'fontSize', hint: 'font size, px' },
+  { name: 'font', hint: 'font family name' },
+  { name: 'fillColor', hint: '[r, g, b] 0..1' },
+  { name: 'strokeColor', hint: '[r, g, b] 0..1' },
+  { name: 'strokeWidth', hint: 'stroke width, px' },
+  { name: 'tracking', hint: 'tracking, 1/1000 em' },
+  { name: 'leading', hint: 'line spacing, px' },
+  { name: 'isFauxBold', hint: 'bold on?' },
+  { name: 'isFauxItalic', hint: 'italic on?' },
+  { name: 'isAllCaps', hint: 'all caps on?' },
+  { name: 'isSmallCaps', hint: 'small caps on?' },
+  { name: 'applyFill', hint: 'fill drawn?' },
+  { name: 'applyStroke', hint: 'stroke drawn?' },
+  { name: 'baselineShift', hint: 'baseline shift, px' },
+  { name: 'horizontalScaling', hint: '1 = 100%' },
+  { name: 'verticalScaling', hint: '1 = 100%' },
+  { name: 'justification', hint: '"alignLeft" · "alignCenter" · "alignRight" · "justifyLastLine…"' },
+  { name: 'firstLineIndent', hint: 'paragraph first-line indent, px' },
+  { name: 'leftMargin', hint: 'paragraph left margin, px' },
+  { name: 'rightMargin', hint: 'paragraph right margin, px' },
+  { name: 'spaceBefore', hint: 'space before paragraphs, px' },
+  { name: 'spaceAfter', hint: 'space after paragraphs, px' },
+  { name: 'direction', hint: '"dirLeftToRight" · "dirRightToLeft"' },
+  { name: 'leadingType', hint: '"leadingRoman" · "leadingEastAsian"' },
+  { name: 'setFontSize()', insert: 'setFontSize(80)', hint: 'font size — optional (value, start, count) range' },
+  { name: 'setFont()', insert: "setFont('Inter')", hint: 'font family — optional range' },
+  { name: 'setFillColor()', insert: 'setFillColor([1, 0, 0])', hint: 'fill colour [r,g,b] 0..1 — optional range' },
+  { name: 'setStrokeColor()', insert: 'setStrokeColor([0, 0, 0])', hint: 'stroke colour — optional range (layer-wide only renders)' },
+  { name: 'setStrokeWidth()', insert: 'setStrokeWidth(2)', hint: 'stroke width, px' },
+  { name: 'setTracking()', insert: 'setTracking(50)', hint: 'tracking, 1/1000 em — optional range' },
+  { name: 'setLeading()', insert: 'setLeading(60)', hint: 'line spacing, px' },
+  { name: 'setFauxBold()', insert: 'setFauxBold(true)', hint: 'bold — optional range' },
+  { name: 'setFauxItalic()', insert: 'setFauxItalic(true)', hint: 'italic — optional range' },
+  { name: 'setAllCaps()', insert: 'setAllCaps(true)', hint: 'all caps — optional range' },
+  { name: 'setSmallCaps()', insert: 'setSmallCaps(true)', hint: 'small caps' },
+  { name: 'setApplyFill()', insert: 'setApplyFill(false)', hint: 'draw the fill' },
+  { name: 'setApplyStroke()', insert: 'setApplyStroke(false)', hint: 'draw the stroke' },
+  { name: 'setBaselineShift()', insert: 'setBaselineShift(4)', hint: 'baseline shift, px' },
+  { name: 'setHorizontalScaling()', insert: 'setHorizontalScaling(1.2)', hint: '1 = 100%' },
+  { name: 'setVerticalScaling()', insert: 'setVerticalScaling(1.2)', hint: '1 = 100%' },
+  { name: 'setJustification()', insert: "setJustification('alignCenter')", hint: 'paragraph alignment' },
+  { name: 'setFirstLineIndent()', insert: 'setFirstLineIndent(20)', hint: 'paragraph first-line indent' },
+  { name: 'setLeftMargin()', insert: 'setLeftMargin(10)', hint: 'paragraph left margin' },
+  { name: 'setRightMargin()', insert: 'setRightMargin(10)', hint: 'paragraph right margin' },
+  { name: 'setSpaceBefore()', insert: 'setSpaceBefore(8)', hint: 'space before paragraphs' },
+  { name: 'setSpaceAfter()', insert: 'setSpaceAfter(8)', hint: 'space after paragraphs' },
+  { name: 'setDirection()', insert: "setDirection('dirRightToLeft')", hint: 'paragraph direction' },
+  { name: 'setLeadingType()', insert: "setLeadingType('leadingRoman')", hint: 'leading type' },
+  { name: 'setText()', insert: "setText('New text')", hint: 'replace the text this style applies to' },
+];
+
 const OBJECT_MEMBERS: Readonly<Record<string, readonly MemberDef[]>> = {
+  text: [{ name: 'sourceText', hint: 'this layer’s Source Text' }],
+  'text.sourceText': SOURCE_TEXT_MEMBERS,
+  'text.sourceText.style': STYLE_MEMBERS,
+  'thisLayer.text': [{ name: 'sourceText', hint: 'this layer’s Source Text' }],
+  'thisLayer.text.sourceText': SOURCE_TEXT_MEMBERS,
+  'thisLayer.text.sourceText.style': STYLE_MEMBERS,
+  // On the Source Text property `value` is the text, so its style is `value.style`.
+  'value.style': STYLE_MEMBERS,
   thisComp: [
     { name: 'width', hint: 'composition width in pixels' },
     { name: 'height', hint: 'composition height in pixels' },
@@ -134,6 +211,7 @@ const OBJECT_MEMBERS: Readonly<Record<string, readonly MemberDef[]>> = {
     { name: 'toWorld()', insert: 'toWorld([0, 0])', hint: 'layer point → world coords' },
     { name: 'fromWorld()', insert: 'fromWorld([960, 540])', hint: 'world point → layer coords' },
     { name: 'marker', insert: 'marker.nearestKey(time).time', hint: 'THIS LAYER’s markers' },
+    { name: 'text', insert: 'text.sourceText', hint: 'this layer’s Source Text' },
   ],
   thisProperty: [
     { name: 'value', hint: 'the keyframed value' },
@@ -313,5 +391,23 @@ export function completionsAt(
 ): { word: CaretWord; items: CompletionItem[] } {
   const word = wordAtCaret(text, caret);
   if (word.word === '') return { word, items: [] };
+  // A CHAINED style setter: `…style.setFontSize(80).setFi`. The run left of the
+  // caret starts at the dot after `)`, so there is no object name to look up —
+  // but a call chain that passed through `.style` or `.getStyleAt(` returns a
+  // style object, and offering the style members is the only useful answer.
+  const before = text.slice(0, word.start);
+  if (word.word.startsWith('.') && /\)\s*$/.test(before) && /\.(?:style\b|getStyleAt\()/.test(before)) {
+    return { word, items: completions(word.member, STYLE_CHAIN_API, { limit }) };
+  }
   return { word, items: completions(word.member, api, { object: word.object, limit }) };
 }
+
+/**
+ * Style members as top-level items whose insert keeps the leading dot — what
+ * `applyCompletion` needs when the replaced run is `.setFi` with no object.
+ */
+const STYLE_CHAIN_API: readonly ApiItem[] = STYLE_MEMBERS.map((m) => ({
+  label: m.name,
+  insert: `.${m.insert ?? m.name}`,
+  hint: m.hint,
+}));

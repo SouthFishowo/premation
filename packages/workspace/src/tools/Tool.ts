@@ -110,6 +110,13 @@ export interface ToolContext {
   /** Convenience: run snapping on a rect using freshly-built targets. */
   snapRect(rect: Rect, excludeIds?: ReadonlySet<string>): SnapResult<Rect>;
   /**
+   * Snap one world point against grid / guides / object edges AND point
+   * features (anchors, mask/shape vertices, projected 3D points). `force`
+   * ignores the master snap switch (Ctrl toggling snapping on for one drag).
+   * Optional so a hand-built test context without it still type-checks.
+   */
+  snapPoint?(point: Vec2, excludeIds?: ReadonlySet<string>, opts?: { force?: boolean }): SnapResult<Vec2>;
+  /**
    * Neighbours this rect is nearly the same size as — the equal-SIZE half of
    * smart guides, for RESIZE gestures.
    *

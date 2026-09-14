@@ -525,3 +525,42 @@ describe('mixHex', () => {
     expect(mixHex(undefined, '#123456', 0.5)).toBe('#123456');
   });
 });
+
+describe('2-D animator blur', () => {
+  it('a scalar-blur stack never grows a blurY field (legacy glyph shape)', () => {
+    const g = evaluateTextAnimators('AB', [anim({ blur: 4 })]);
+    expect(g[0]!.blur).toBe(4);
+    expect('blurY' in g[0]!).toBe(false);
+  });
+
+  it('blurY equal to blur stays linked — output identical to the scalar', () => {
+    const g = evaluateTextAnimators('A', [anim({ blur: 3, blurY: 3 })]);
+    expect(g[0]!.blur).toBe(3);
+    expect(g[0]!.blurY).toBeUndefined();
+  });
+
+  it('an unlinked animator diverges the Y radius', () => {
+    const g = evaluateTextAnimators('A', [anim({ blur: 2, blurY: 8 })]);
+    expect(g[0]!.blur).toBe(2);
+    expect(g[0]!.blurY).toBe(8);
+  });
+
+  it('a scalar animator stacked over an unlinked one feeds BOTH axes', () => {
+    const g = evaluateTextAnimators('A', [anim({ blur: 2, blurY: 8 }), anim({ blur: 5 })]);
+    expect(g[0]!.blur).toBe(7);
+    expect(g[0]!.blurY).toBe(13);
+  });
+
+  it('…and in the other order, to the same result', () => {
+    const g = evaluateTextAnimators('A', [anim({ blur: 5 }), anim({ blur: 2, blurY: 8 })]);
+    expect(g[0]!.blur).toBe(7);
+    expect(g[0]!.blurY).toBe(13);
+  });
+
+  it('normalizeAnimator carries blurY through and never invents one', () => {
+    const withY = normalizeAnimator({ id: 'a', x: 0, y: 0, scale: 100, rotation: 0, opacity: 100, tracking: 0, blur: 2, blurY: 6 } as TextAnimatorData);
+    expect(withY.blurY).toBe(6);
+    const without = normalizeAnimator({ id: 'a', x: 0, y: 0, scale: 100, rotation: 0, opacity: 100, tracking: 0, blur: 2 } as TextAnimatorData);
+    expect('blurY' in without).toBe(false);
+  });
+});

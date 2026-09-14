@@ -5,15 +5,20 @@
  * is simultaneously:
  *   • a scrubbable slider — click-drag horizontally to adjust (AE/Blender)
  *   • a text input — click (without dragging) to type an exact value
- *   • modifier-aware — Shift = 10× step, Alt = 0.1× step; ↑/↓ nudge
+ *   • modifier-aware — Shift = 10× step, Ctrl/Cmd (or Alt) = 0.1× step; ↑/↓ nudge
  *   • a calculator — accepts math: `960/2`, `+15`, `*1.5`, `(3+4)*2`
+ *   • unit-aware — a `ValueFieldDisplayContext` above it shows and accepts the
+ *     value in another unit (Position as % of the comp) and converts back on
+ *     every write, so the callers below keep speaking pixels
  *
  * The spec calls this the make-or-break interaction: "If this one interaction
  * feels perfect, the entire application feels professional."
  */
 
 import {
+  createContext,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -84,7 +89,77 @@ export interface ValueFieldProps {
 
 // clamp / format / stepScale live in scrubMath.ts (pure + unit-tested).
 
-export function ValueField({
+/**
+ * An affine display unit for every ValueField below the provider:
+ * `display = (value + offset) × scale`. Written values are converted back, so
+ * the owner of the field never sees the display unit.
+ */
+export interface ValueFieldDisplay {
+  scale: number;
+  offset?: number;
+  /** Unit label shown instead of the field's own. */
+  unit?: string;
+  /** Decimal places while in this unit. */
+  precision?: number;
+}
+
+export const ValueFieldDisplayContext = createContext<ValueFieldDisplay | null>(null);
+
+const PLAIN_NUMBER = /^[-]?(?:\d+\.?\d*|\.\d+)$/;
+const RELATIVE_ADD = /^\+\s*(\d+\.?\d*|\.\d+)$/;
+
+/**
+ * The props a field shows and reports in `display` units, wrapping the
+ * pixel-speaking ones it was given. Pure — exported for tests.
+ */
+export function toDisplayProps(props: ValueFieldProps, display: ValueFieldDisplay): ValueFieldProps {
+  const k = display.scale;
+  const off = display.offset ?? 0;
+  const toD = (v: number): number => (v + off) * k;
+  const fromD = (v: number): number => v / k - off;
+  const { onChange, onScrub, onRelative, onCommitText } = props;
+  return {
+    ...props,
+    value: toD(props.value),
+    min: props.min !== undefined && Number.isFinite(props.min) ? toD(props.min) : props.min,
+    max: props.max !== undefined && Number.isFinite(props.max) ? toD(props.max) : props.max,
+    // Same pixels-per-drag feel whatever the unit: one step of travel still
+    // moves the underlying value by one of ITS steps.
+    step: (props.step ?? 1) * k,
+    precision: display.precision ?? Math.max(props.precision ?? 2, 2),
+    unit: display.unit ?? props.unit,
+    onChange: (v) => onChange(fromD(v)),
+    onScrub: onScrub ? (v) => onScrub(fromD(v)) : undefined,
+    // A delta has no offset — only the scale applies.
+    onRelative: onRelative ? (delta, cumulative) => onRelative(delta / k, cumulative) : undefined,
+    onCommitText: onCommitText
+      ? (raw) => {
+          const s = raw.trim();
+          if (PLAIN_NUMBER.test(s)) {
+            onChange(fromD(Number(s)));
+            return true;
+          }
+          const add = RELATIVE_ADD.exec(s);
+          if (add) return onCommitText(`+${Number(add[1]) / k}`);
+          // `*2` / `/2` are unit-free when there is no offset; anything else is
+          // handed through as typed (in the underlying unit).
+          return onCommitText(raw);
+        }
+      : undefined,
+  };
+}
+
+/**
+ * The public field: the scrub/type control, re-expressed in a display unit
+ * when a `ValueFieldDisplayContext` is present.
+ */
+export function ValueField(props: ValueFieldProps): JSX.Element {
+  const display = useContext(ValueFieldDisplayContext);
+  if (!display || !(display.scale > 0) || !Number.isFinite(display.scale)) return <ValueFieldBase {...props} />;
+  return <ValueFieldBase {...toDisplayProps(props, display)} />;
+}
+
+function ValueFieldBase({
   value,
   onChange,
   onScrub,

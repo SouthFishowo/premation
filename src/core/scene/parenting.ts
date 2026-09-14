@@ -233,16 +233,30 @@ function compensateReparent(childId: string, targetId: string, worldBefore: Matr
   if (Math.abs(kx - 1) > EPS && Math.abs(kx - ky) < EPS) offsetTrack(childId, 'scale', 0, kx);
 }
 
+/** How a parenting gesture treats the child's transform. */
+export interface ReparentOptions {
+  /** false = keep the LOCAL values (importer path; the Alt legacy gesture). */
+  preserveWorld?: boolean;
+  /**
+   * AE's "Parent & Link" with Shift: the child JUMPS onto the parent — its
+   * position becomes the parent's anchor point.
+   */
+  jump?: boolean;
+}
+
 /**
  * Turn the modifier keys held during a parenting gesture into the option
  * `reparentNode` takes.
  *
- * ALT (Option) is After Effects' "jump" variant: link the layer but leave its
- * transform values alone, so it moves into the parent's coordinate space
- * instead of staying put. It is the right gesture when the child's values are
- * ALREADY authored relative to the parent — building a rig from measured
- * offsets, or re-attaching something you deliberately positioned in parent
- * space — where the compensation would be undone by hand immediately after.
+ * PLAIN: AE's default — the child keeps its world pose (compensated).
+ *
+ * SHIFT: AE's Parent & Link jump — the child snaps onto the parent, its
+ * position set to the parent's anchor point (see `jumpToParent`). This is how
+ * AE users attach a prop to a hand or a label to a null in one gesture.
+ *
+ * ALT (Option): the older "keep values" variant — link without compensating,
+ * so the layer's typed values are reinterpreted in the parent's space. Kept as
+ * an alias because rigs are built with it; Shift wins when both are held.
  *
  * Lives here, next to the thing it configures, because four surfaces parent
  * (the inspector's picker, the compositing panel's, the timeline's Parent &
@@ -250,9 +264,33 @@ function compensateReparent(childId: string, targetId: string, worldBefore: Matr
  * four times is a modifier that means four things.
  */
 export function parentOptionsFor(
-  modifiers: { altKey?: boolean } | undefined,
-): { preserveWorld?: boolean } | undefined {
+  modifiers: { altKey?: boolean; shiftKey?: boolean } | undefined,
+): ReparentOptions | undefined {
+  if (modifiers?.shiftKey === true) return { jump: true };
   return modifiers?.altKey === true ? { preserveWorld: false } : undefined;
+}
+
+/**
+ * Move an already-relinked child onto its parent's anchor point: in parent
+ * space the anchor is the origin (position places the anchor — see
+ * `centreAnchorInContent`), so the child's position becomes 0,0 AT THE
+ * PLAYHEAD. An animated position is re-based rigidly, keeping its motion
+ * relative to the new home rather than being flattened to one keyframe.
+ */
+function jumpToParent(childId: string): void {
+  const node = defaultSceneGraph.getNode(childId);
+  if (!node) return;
+  const have = localTransformAt(childId, playheadCompTime()) ?? baseLocal(node);
+  const dx = -have.x;
+  const dy = -have.y;
+  const comp = node.components.find((c) => typeof (c.props as Record<string, unknown>).x === 'number');
+  if (comp) {
+    const p = comp.props as Record<string, unknown>;
+    defaultSceneGraph.writeProp(childId, comp.id, 'x', (p.x as number) + dx);
+    defaultSceneGraph.writeProp(childId, comp.id, 'y', (typeof p.y === 'number' ? p.y : 0) + dy);
+  }
+  if (Math.abs(dx) > EPS) offsetTrack(childId, 'x', dx);
+  if (Math.abs(dy) > EPS) offsetTrack(childId, 'y', dy);
 }
 
 /**
@@ -293,7 +331,7 @@ export function setParentPreservingWorld(childId: string, targetId: string): voi
 export function reparentNode(
   childId: string,
   newParentId: string | null,
-  options: { preserveWorld?: boolean } = {},
+  options: ReparentOptions = {},
 ): boolean {
   if (!canReparent(childId, newParentId)) return false;
   // Un-parenting returns the layer to ITS OWN composition root. Defaulting to
@@ -301,7 +339,13 @@ export function reparentNode(
   // the same disappearance as parenting across comps, reached by the dropdown's
   // most-used entry.
   const target = newParentId ?? enclosingCompRootOf(childId) ?? COMP_ROOT;
-  if (options.preserveWorld ?? true) {
+  if (options.jump && newParentId !== null) {
+    // Shift: Parent & Link jump. Relink without compensating, then put the
+    // child on the parent's anchor. "None" has no anchor to jump to, so it
+    // falls through to the ordinary compensated un-parent below.
+    defaultSceneGraph.setParent(childId, target, { preserveWorld: false });
+    jumpToParent(childId);
+  } else if (options.preserveWorld ?? true) {
     setParentPreservingWorld(childId, target);
   } else {
     defaultSceneGraph.setParent(childId, target, { preserveWorld: false });

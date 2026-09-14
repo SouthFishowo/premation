@@ -48,6 +48,14 @@ describe('chordFromEvent separates the numpad', () => {
     // reports something else); the numpad must not join it.
     expect(chordFromEvent(ev({ key: '1', code: 'Numpad1' })).key).toBe('1');
     expect(chordFromEvent(ev({ key: 'Enter', code: 'NumpadEnter' })).key).toBe('Enter');
-    expect(chordFromEvent(ev({ key: '+', code: 'NumpadAdd' })).key).toBe('+');
+  });
+
+  it('names Numpad + / - distinctly from the main keyboard (AE rotate / scale nudges)', () => {
+    expect(chordFromEvent(ev({ key: '+', code: 'NumpadAdd' })).key).toBe('Numpad+');
+    expect(chordFromEvent(ev({ key: '-', code: 'NumpadSubtract' })).key).toBe('Numpad-');
+    // The main row's + and - (zoom) are unchanged chords.
+    expect(chordFromEvent(ev({ key: '-', code: 'Minus' })).key).toBe('-');
+    expect(chordFromEvent(ev({ key: '=', code: 'Equal' })).key).toBe('=');
+    expect(chordFromEvent(ev({ key: '+', code: 'NumpadAdd', alt: true }))).toMatchObject({ key: 'Numpad+', alt: true });
   });
 });

@@ -34,7 +34,8 @@ import { clipRippleMenuItems } from '@layout/Timeline/clipEditCommands';
 import { useSpaceTransport } from '@hooks/useSpaceTransport';
 import { getTimelineController, getRemappedTime, compToKeyframeTime, keyframeToCompTime } from '@core/timeline/TimelineController';
 import { staticOrDefaultValue, writeStaticPropertyValue } from '@core/inspector/propertyValue';
-import { MASK_ANIM_PROP } from '@core/timeline/propertyTree';
+import { MASK_ANIM_PROP, buildStaticPropertyTree } from '@core/timeline/propertyTree';
+import { modifiedPropertyRows } from '@core/animation/modifiedProps';
 import { deriveTimelineTracks } from '@layout/Timeline/deriveTimelineTracks';
 import { runSceneEditDetection } from '@core/tracking/sceneEditCommand';
 import { bindAdaptiveResolution } from '@stores/renderQualityStore';
@@ -93,6 +94,7 @@ import {
 import { useCompositionStore } from '@stores/compositionStore';
 import { readNodeKind, flattenScene } from '@core/scene/sceneDerive';
 import { toggleLayerAudioMute } from '@core/audio/audioLayerSwitches';
+import { applyTimeStretch, isRetimableLayer, stretchValueOf } from '@core/animation/layerTimeCommands';
 import { AUDIO_WAVEFORM_ROW } from '@core/timeline/propertyTree';
 import { AUDIO_LEVEL_DB_PROP, AUDIO_PAN_PROP } from '@core/audio/audioParams';
 import { openLayerOnDoubleClick } from '@layout/LayerViewer/openLayer';
@@ -425,19 +427,28 @@ function EditorShellInner(): JSX.Element {
   useEffect(() => {
     // AE reveal shortcuts, filtering which property sub-rows show:
     //   U   → toggle *animated* properties on the selected layers
-    //   UU  → toggle *animated* properties across ALL layers (reveal/hide all)
-    //   P/S/R/T → position / scale / rotation / opacity on the selection
-    // (True AE `UU` = "all modified incl. non-keyframed" awaits a modified-prop
-    //  source; today the model surfaces animated props only.)
+    //   UU  → toggle *modified* properties (animated, expressed, or set away
+    //         from the default) — see `modifiedProps.ts`
+    //   P/S/R/T/A → position / scale / rotation / opacity / anchor
+    //   M / F / MM → mask shape / mask feather / all mask properties
+    //   E   → effects
+    //   L / LL → audio levels / waveform
+    //   Shift+<key> → ADD that property to what is already revealed
     // Each list names every row id that property can appear as: the raw engine
     // props, the merged 'Position' pseudo-row, and the static '__static:*'
     // placeholder shown before any keyframes exist.
+    //
+    // Masks: the shape is ONE whole-mask track (`setMaskAnim` stores
+    // snapshots); feather / opacity / expansion are per-path tracks
+    // (`mask.<pathId>.<key>`, see maskPropPath). M = shape, F = feather rows,
+    // MM = every mask row the property tree lists.
     const REVEAL: Record<string, ReadonlyArray<string>> = {
       p: ['x', 'y', 'z', POSITION_PSEUDO_PROP, '__static:position'],
       s: ['scale', 'scaleX', 'scaleY', '__static:scale'],
       r: ['rotation', 'rotationX', 'rotationY', '__static:rotation'],
       t: ['opacity', '__static:opacity'],
-      m: ['mask'],
+      m: [MASK_ANIM_PROP, 'mask'],
+      f: [MASK_ANIM_PROP, 'mask.feather'],
       a: ['anchorX', 'anchorY', '__static:anchor'],
       // AE's L = "show only Audio Levels". This named the GROUP key ('audio'),
       // but the filter matches on a row's `prop` — so L expanded the layer and
@@ -452,6 +463,27 @@ function EditorShellInner(): JSX.Element {
     // UU path because single L never was a command: it is this listener.
     const DOUBLE_TAP_MS = 400;
     let lastL = 0;
+    let lastM = 0;
+
+    /** Rows derived from the property TREE — the model only builds rows for expanded tracks. */
+    const effectRows = (ids: readonly string[]): string[] => [
+      ...new Set(ids.flatMap((id) => buildStaticPropertyTree(id).filter((r) => r.group === 'effects').map((r) => r.prop))),
+    ];
+    const allMaskRows = (ids: readonly string[]): string[] => [
+      ...new Set([MASK_ANIM_PROP, ...ids.flatMap((id) => buildStaticPropertyTree(id).filter((r) => r.group === 'masks').map((r) => r.prop))]),
+    ];
+    /** Shift+U: the animated rows, spelled the way the timeline draws them. */
+    const animatedRows = (ids: readonly string[]): string[] => {
+      const rows = new Set<string>();
+      for (const id of ids) {
+        const separated = defaultSceneGraph.getNode(id)?.components.find((c) => c.type === 'Transform')?.props.separateDimensions === true;
+        for (const p of defaultAnimation.animatedProps(id)) {
+          if (!separated && (p === 'x' || p === 'y' || p === 'z')) rows.add(POSITION_PSEUDO_PROP);
+          else rows.add(p);
+        }
+      }
+      return [...rows];
+    };
 
     // AE's Alt+Shift+<prop> — add a keyframe for that property on every
     // selected layer at the playhead, enabling animation if needed. The engine
@@ -504,15 +536,41 @@ function EditorShellInner(): JSX.Element {
         return;
       }
 
-      // 'u' is handled by CommandSystem/EventBus RevealAnimatedProps
-      if (REVEAL[key] === undefined) return;
+      // Bare 'u' is the registry command (CommandSystem → RevealAnimatedProps);
+      // only Shift+U — add animated props to the reveal — lands here.
+      const isReveal = REVEAL[key] !== undefined || key === 'e' || (key === 'u' && e.shiftKey);
+      if (!isReveal) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
 
       // Expand the selection and switch which props are shown.
       const sel = useSelectionStore.getState().ids;
       if (sel.length === 0) return;
+      let rows: ReadonlyArray<string> =
+        key === 'e' ? effectRows(sel)
+        : key === 'u' ? animatedRows(sel)
+        // F: the per-path `mask.<pathId>.feather` rows (plus the shape row).
+        : key === 'f' ? allMaskRows(sel).filter((p) => p === MASK_ANIM_PROP || p.endsWith('.feather'))
+        : REVEAL[key]!;
+      if (key === 'm' && !e.shiftKey) {
+        // AE's MM: a second M within the double-tap window reveals every mask
+        // property; a third falls back to the shape alone.
+        const now = Date.now();
+        if (now - lastM < DOUBLE_TAP_MS) {
+          rows = allMaskRows(sel);
+          lastM = 0;
+        } else {
+          lastM = now;
+        }
+      }
+      if (rows.length === 0) return;
       e.preventDefault();
-      let rows = REVEAL[key]!;
+      if (e.shiftKey) {
+        // AE's Shift+<reveal key>: ADD to what is revealed rather than replace.
+        const add = rows;
+        setRevealFilter((cur) => (cur === null ? add : [...new Set([...cur, ...add])]));
+        setExpandedIds((cur) => [...new Set([...cur, ...sel])]);
+        return;
+      }
       if (key === 'l') {
         const now = Date.now();
         // LL shows only the waveform; a third L within the window falls back to
@@ -572,7 +630,27 @@ function EditorShellInner(): JSX.Element {
         return;
       }
 
-      if (mode === 'animated' || mode === 'modified') {
+      if (mode === 'modified') {
+        // AE's UU: animated, expressed, OR set away from the default — read
+        // from the scene and engine, not the model (which only builds rows for
+        // expanded tracks and cannot see an un-keyed 50 % scale).
+        const withRows = targetIds
+          .map((id) => ({ id, rows: modifiedPropertyRows(id) }))
+          .filter((v) => v.rows.length > 0);
+        const filter = new Set<string>();
+        for (const v of withRows) for (const r of v.rows) filter.add(r);
+        setRevealFilter(filter.size > 0 ? [...filter] : null);
+        setExpandedIds((cur) => {
+          const revealed = targetIds.every((id: string) => cur.includes(id));
+          const set = new Set(cur);
+          if (revealed) for (const id of targetIds) set.delete(id);
+          else for (const v of withRows) set.add(v.id);
+          return [...set];
+        });
+        return;
+      }
+
+      if (mode === 'animated') {
         const animatedInTarget = targetIds.filter((id) => animatedProps(id).length > 0);
         // Filter the revealed rows to the animated ones (AE's U shows only
         // keyframed properties; the chevron twirl shows the whole tree).
@@ -1343,11 +1421,14 @@ function EditorShellInner(): JSX.Element {
         disabled: !nodeId,
         onSelect: async () => {
           if (!nodeId || !time) return;
-          const raw = await customPrompt('Time Stretch', 'Enter new stretch percentage (100% = original speed):', String(time.stretch));
+          const raw = await customPrompt('Time Stretch', 'Enter new stretch percentage (100% = original speed):', String(stretchValueOf(nodeId)));
           if (raw !== null) {
             const parsed = parseFloat(raw);
-            if (!isNaN(parsed) && parsed >= 1 && parsed <= 1000) {
-              updateNodeLayerTime(nodeId, { stretch: parsed });
+            // The shared path: footage changes rate; any other layer bakes bar,
+            // keys and markers (negative = reverse). One undo step either way.
+            const allowed = isRetimableLayer(nodeId) ? parsed >= 1 : parsed !== 0;
+            if (!isNaN(parsed) && allowed && Math.abs(parsed) <= 1000) {
+              void applyTimeStretch([nodeId], parsed, 'in');
               bumpScene();
             }
           }

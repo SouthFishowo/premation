@@ -54,16 +54,20 @@ export { CoordinateSystem } from './coordinates/CoordinateSystem';
 
 // ── Grid / guides / snapping ──────────────────────────────────────
 export { Grid, type GridState, type GridLines } from './grid/Grid';
-export { Guides, type Guide, type GuideAxis } from './guides/Guides';
+export { Guides, type Guide, type GuideAxis, type GuidePatch } from './guides/Guides';
 export {
   SnapEngine,
   DEFAULT_SNAP_SETTINGS,
+  pointLines,
   type SnapSettings,
   type SnapTarget,
   type SnapLine,
   type SnapResult,
   type SnapSource,
+  type SnapPointTarget,
+  type SnapFeatureNode,
 } from './snap/SnapEngine';
+export { layerBoxPoints, resolveAnchorSnap, type AnchorSnapResult } from './snap/anchorSnap';
 export {
   nearestGaps,
   spacingCandidates,
@@ -160,6 +164,7 @@ export {
   drawToolOptions,
   CurvatureTool,
   TextTool,
+  VerticalTextTool,
   createBuiltinTools,
   type Tool,
   type ToolContext,

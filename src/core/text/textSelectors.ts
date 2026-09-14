@@ -27,6 +27,7 @@
 
 import { cubicBezierEase } from '@motion/animation';
 import { clamp01 } from '@utils/lang';
+import { splitGraphemes } from './graphemes';
 
 export type RangeBasedOn =
   | 'characters'
@@ -213,7 +214,9 @@ export interface UnitMap {
  * excluding spaces" staggers at a visibly different rate.
  */
 export function unitPositions(text: string, basedOn: RangeBasedOn): UnitMap {
-  const chars = [...text];
+  // Grapheme clusters, so an emoji sequence or a decomposed accent is ONE
+  // character to a selector, exactly as it is to layout and to runs.
+  const chars = splitGraphemes(text);
   if (basedOn === 'characters') {
     return { count: chars.length, unitOfChar: chars.map((_, i) => i) };
   }

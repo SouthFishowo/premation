@@ -243,4 +243,45 @@ describe('the preview swatch', () => {
   it('falls back to a neutral grey for an unparseable colour', () => {
     expect(() => materialSphereCss(DEFAULT_MATERIAL_PARAMS, 'not-a-colour')).not.toThrow();
   });
+
+  it('answers the Advanced-3D axes too', () => {
+    const base = materialSphereCss(DEFAULT_MATERIAL_PARAMS, '#808080');
+    expect(materialSphereCss({ ...DEFAULT_MATERIAL_PARAMS, reflectionIntensity: 0 }, '#808080')).not.toBe(base);
+    expect(materialSphereCss({ ...DEFAULT_MATERIAL_PARAMS, reflectionSharpness: 100 }, '#808080')).not.toBe(base);
+    expect(materialSphereCss({ ...DEFAULT_MATERIAL_PARAMS, transparency: 80 }, '#808080')).not.toBe(base);
+    // Toon never reflects, so its preview carries no sheen streak either.
+    const toon = materialSphereCss({ ...DEFAULT_MATERIAL_PARAMS, shading: 'toon' }, '#808080');
+    expect(toon).toBe(materialSphereCss({ ...DEFAULT_MATERIAL_PARAMS, shading: 'toon', reflectionIntensity: 20 }, '#808080'));
+  });
+});
+
+describe('Advanced-3D axes (Reflections / Transparency)', () => {
+  it('the rows write the material and stay off the file at defaults', () => {
+    defaultSceneGraph.addNode(threeD('box'));
+    mount();
+    fireEvent.change(screen.getByLabelText('Reflection Intensity slider'), { target: { value: '40' } });
+    fireEvent.change(screen.getByLabelText('Reflection Rolloff slider'), { target: { value: '25' } });
+    fireEvent.change(screen.getByLabelText('Transparency slider'), { target: { value: '60' } });
+    fireEvent.change(screen.getByLabelText('Transparency Rolloff slider'), { target: { value: '50' } });
+    fireEvent.change(screen.getByLabelText('Index of Refraction slider'), { target: { value: '1.33' } });
+    const m = readNodeMaterialParams('box')!;
+    expect(m.reflectionIntensity).toBe(40);
+    expect(m.reflectionRolloff).toBe(25);
+    expect(m.transparency).toBe(60);
+    expect(m.transparencyRolloff).toBe(50);
+    expect(m.ior).toBeCloseTo(1.33, 10);
+    // Writing the default back clears the stored prop (unstored default).
+    fireEvent.change(screen.getByLabelText('Reflection Intensity slider'), { target: { value: '100' } });
+    const t = defaultSceneGraph.getNode('box')!.components.find((c) => c.type === 'Transform')!;
+    expect(t.props.reflectionIntensity).toBeUndefined();
+  });
+
+  it('Toon replaces the reflection rows with an explanation', () => {
+    defaultSceneGraph.addNode(threeD('box', { shadingModel: 'toon' }));
+    mount();
+    expect(noField('Reflection Intensity')).toBeNull();
+    expect(screen.getByText(/Toon shading never reflects/)).toBeInTheDocument();
+    // Transparency is model-independent and stays.
+    expect(field('Transparency')).toBeInTheDocument();
+  });
 });

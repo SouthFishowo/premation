@@ -142,6 +142,12 @@ export const RETIRED_CLAIMS: readonly RetiredClaim[] = [
       'coc-blur interpolates the blur radius per pixel across the quad from corner CoC radii. Still per-layer (no cross-layer depth-buffer gather) — state THAT gap instead.',
     patterns: [/one uniform blur/i, /per-layer uniform blur/i],
   },
+  {
+    claim: 'SSAO is not built / still blocked by the multisampled scene targets',
+    reality:
+      'Shipped: rendergraph/passes/ssao.ts renders a camera-axis linear-depth prepass, estimates hemisphere AO (half/full res) with a depth-aware blur, and shade3d multiplies it into the ambient term (aoParams). UI: Composition Settings ▸ World ▸ Ambient Occlusion. Retired 2026-09-14.',
+    patterns: [/SSAO is not built/i, /SSAO[^.]{0,80}blocked by (the )?multisampled/i, /still open:?[^.]{0,20}\*{0,2}SSAO\*{0,2} \(blocked/i],
+  },
 ];
 
 /** Every `.md` in the repo that is ours to police. */

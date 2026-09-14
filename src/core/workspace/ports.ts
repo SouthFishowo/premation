@@ -48,6 +48,8 @@ import { SCENE_KIND_PROP, type SceneKind } from '@core/scene/seedDefaultScene';
 import { flattenComposition } from '@core/scene/sceneDerive';
 import type { SceneNode, ID } from '@core/types';
 import { useSelectionStore } from '@stores/selectionStore';
+import { useTextEditStore } from '@stores/textEditStore';
+import { MIN_BOX_SIZE } from '@core/text/textExtras';
 import { useGuidesStore, type Camera3dMode } from '@stores/guidesStore';
 import { useViewportDisplayStore } from '@stores/viewportDisplayStore';
 import { subscribeTime } from '@stores/playbackClockStore';
@@ -66,6 +68,7 @@ import { currentViewProjector, currentViewCamera } from '@core/workspace/viewPro
 import { orthoViewOf } from '@core/scene/cameraViewMode';
 import { composeNodeWorld3d, parentWorld3d, resolveNode3DTransform } from '@core/scene/nodeMatrix';
 import { addMaskPath, rectangleMask, ellipseMask, readNodeMask, readNodeMaskAt, setMaskPoints, MaskPath, MaskPoint } from '@core/effects/mask';
+import { defaultPolystar, POLYSTAR_FX_PROP, type PolystarType } from '@core/scene/polystar';
 
 /** Convex hull (monotone chain) of 2D points, counter-clockwise. */
 function convexHull2D(pts: ReadonlyArray<{ x: number; y: number }>): Array<{ x: number; y: number }> {
@@ -502,6 +505,11 @@ const KIND_FOR_CREATE: Record<string, SceneKind> = {
   Pencil: 'shape',
   Brush: 'shape',
   Text: 'text',
+  /** Type tool click-drag: text whose box is the dragged rectangle. */
+  ParagraphText: 'text',
+  /** Vertical Type tool: click (point) and click-drag (box) — `orientation: 'vertical'`. */
+  VerticalText: 'text',
+  VerticalParagraphText: 'text',
   Image: 'image',
   Video: 'video',
 };
@@ -1158,6 +1166,40 @@ function createNode(payload: CreateNodePayload): void {
     return;
   }
 
+  // ── Parametric Polystar (AE parity) ─────────────────────────────────
+  // The Polygon / Star tools create a PARAMETRIC layer: the drag sets the
+  // outer radius, the tool options seed points / inner radius, and the
+  // outline is recomputed from the live parameters every frame
+  // (buildSnapshot ▸ polystarOutline) — so "make it 7 points" is a property
+  // edit, not a redraw. The tool still hands baked points for its on-canvas
+  // preview; they are deliberately NOT stored, or the layer would be a fixed
+  // path with a parameter set painted on top.
+  const polystarType: PolystarType | null =
+    payload.kind === 'Polygon' ? 'polygon' : payload.kind === 'Star' ? 'star' : null;
+  if (polystarType) {
+    const outerR = Math.max(1, Math.max(width, height) / 2);
+    const node = makeNodeAt('shape', payload.kind, cx, cy, false, undefined, outerR * 2, outerR * 2);
+    const t = node.components.find((c) => c.type === 'Transform');
+    // Not 'rect' (makeNodeAt's no-points fallback): the polystar branch owns
+    // the geometry, and 'rect' would draw a square anywhere the config were
+    // ever missing — better to say what the layer is.
+    if (t) (t.props as Record<string, unknown>).shapeType = 'polystar';
+    const cfg = defaultPolystar(
+      polystarType,
+      outerR,
+      polystarType === 'polygon'
+        ? Math.max(3, Math.min(12, Math.round(drawToolOptions.polygonSides)))
+        : Math.max(3, Math.min(12, Math.round(drawToolOptions.starPoints))),
+      drawToolOptions.starInnerRatio,
+    );
+    defaultSceneGraph.addChild(activeCompRootId() as ID, node);
+    defaultSceneGraph.setFxKey(node.id, POLYSTAR_FX_PROP, cfg);
+    enableContinuousRasterByDefault(node.id as string);
+    useSelectionStore.getState().set([node.id]);
+    bumpScene();
+    return;
+  }
+
   // Fit the layer box to the OUTLINE, not to the drag rectangle.
   //
   // A drag rect is only the gesture; the geometry it generates rarely fills it.
@@ -1199,6 +1241,26 @@ function createNode(payload: CreateNodePayload): void {
   }
 
   const node = makeNodeAt(kind, payload.kind, outX, outY, ellipse, outPoints, outW, outH);
+  if (payload.kind === 'ParagraphText' || payload.kind === 'VerticalParagraphText') {
+    // AE paragraph text: the dragged rectangle IS the box. The layer origin is
+    // the rect centre (text content is centred on it), so the box lands exactly
+    // where it was drawn. Fixed height, top aligned — AE's defaults.
+    node.name = 'Text';
+    const textComp = node.components.find((c) => c.type === 'Text');
+    if (textComp) {
+      Object.assign(textComp.props, {
+        boxWidth: Math.max(MIN_BOX_SIZE, Math.round(width)),
+        boxHeight: Math.max(MIN_BOX_SIZE, Math.round(height)),
+        boxAutoSize: 'off',
+      });
+    }
+  }
+  if (payload.kind === 'VerticalText' || payload.kind === 'VerticalParagraphText') {
+    node.name = 'Text';
+    const textComp = node.components.find((c) => c.type === 'Text');
+    // A fresh literal not yet in the graph (see the box props above).
+    if (textComp) Object.assign(textComp.props, { orientation: 'vertical' });
+  }
   const rootId = activeCompRootId() as ID;
   defaultSceneGraph.addChild(rootId, node);
   // The same default every MENU and LIBRARY insert applies. This path — every
@@ -1209,6 +1271,9 @@ function createNode(payload: CreateNodePayload): void {
 
   useSelectionStore.getState().set([node.id]);
   bumpScene();
+  // AE: creating text with the Type tool (click or drag) puts you straight
+  // into typing it.
+  if (kind === 'text') useTextEditStore.getState().begin(node.id as string);
 }
 
 function resizeNode(payload: ResizeNodePayload): void {
@@ -1237,8 +1302,9 @@ function resizeNode(payload: ResizeNodePayload): void {
       // instead. Writing them would move the numbers in the inspector and
       // change nothing on canvas — worse than the scale the drag would
       // otherwise have applied, because it looks like the drag did nothing.
-      // (Reflowing a paragraph box is a `boxWidth` edit, which no resize path
-      // performs today.)
+      // (Reflowing a paragraph box is a `boxWidth`/`boxHeight` edit, made by the
+      // Type-tool / text-editing box handles — layout/Workspace/textBoxReflow.ts —
+      // never by this Selection-tool scale path, exactly as in AE.)
       kind !== 'text';
   }
   /*

@@ -53,6 +53,11 @@ export function CameraSection({ nodeId }: { nodeId: string }): JSX.Element | nul
   const [irisBladesRaw, setIrisBlades] = useNodeComponentProp(defaultSceneGraph, nodeId, tComp?.id, 'irisBlades');
   const [irisRoundnessRaw, setIrisRoundness] = useNodeComponentProp(defaultSceneGraph, nodeId, tComp?.id, 'irisRoundness');
   const [highlightGainRaw, setHighlightGain] = useNodeComponentProp(defaultSceneGraph, nodeId, tComp?.id, 'highlightGain');
+  const [irisRotationRaw, setIrisRotation] = useNodeComponentProp(defaultSceneGraph, nodeId, tComp?.id, 'irisRotation');
+  const [irisAspectRaw, setIrisAspect] = useNodeComponentProp(defaultSceneGraph, nodeId, tComp?.id, 'irisAspect');
+  const [highlightThresholdRaw, setHighlightThreshold] = useNodeComponentProp(defaultSceneGraph, nodeId, tComp?.id, 'highlightThreshold');
+  const [highlightSaturationRaw, setHighlightSaturation] = useNodeComponentProp(defaultSceneGraph, nodeId, tComp?.id, 'highlightSaturation');
+  const [diffractionFringeRaw, setDiffractionFringe] = useNodeComponentProp(defaultSceneGraph, nodeId, tComp?.id, 'diffractionFringe');
   const [poiXRaw, setPoiX] = useNodeComponentProp(defaultSceneGraph, nodeId, tComp?.id, 'poiX');
   const [poiYRaw, setPoiY] = useNodeComponentProp(defaultSceneGraph, nodeId, tComp?.id, 'poiY');
   const [poiZRaw, setPoiZ] = useNodeComponentProp(defaultSceneGraph, nodeId, tComp?.id, 'poiZ');
@@ -271,6 +276,28 @@ export function CameraSection({ nodeId }: { nodeId: string }): JSX.Element | nul
                   max={1}
                   onStatic={(v) => setIrisRoundness(v)}
                 />
+                {/* The remaining AE iris exposes. Each stores nothing at its
+                    neutral value (rotation 0, aspect 1, fringe 0), so an
+                    untouched camera keeps rendering byte-identically. */}
+                <KeyframeRow
+                  nodeId={nodeId}
+                  prop="irisRotation"
+                  label="Iris rotation"
+                  value={typeof irisRotationRaw === 'number' ? irisRotationRaw : 0}
+                  unit="°"
+                  min={-180}
+                  max={180}
+                  onStatic={(v) => setIrisRotation(v === 0 ? undefined : v)}
+                />
+                <KeyframeRow
+                  nodeId={nodeId}
+                  prop="irisAspect"
+                  label="Iris aspect ratio"
+                  value={typeof irisAspectRaw === 'number' ? irisAspectRaw : 1}
+                  min={0.25}
+                  max={4}
+                  onStatic={(v) => setIrisAspect(v === 1 || v <= 0 ? undefined : v)}
+                />
                 <KeyframeRow
                   nodeId={nodeId}
                   prop="highlightGain"
@@ -280,8 +307,38 @@ export function CameraSection({ nodeId }: { nodeId: string }): JSX.Element | nul
                   max={4}
                   onStatic={(v) => setHighlightGain(v <= 0 ? undefined : v)}
                 />
+                <KeyframeRow
+                  nodeId={nodeId}
+                  prop="highlightThreshold"
+                  label="Highlight threshold"
+                  value={typeof highlightThresholdRaw === 'number' ? highlightThresholdRaw : 0}
+                  min={0}
+                  max={1}
+                  onStatic={(v) => setHighlightThreshold(v <= 0 ? undefined : v)}
+                />
+                <KeyframeRow
+                  nodeId={nodeId}
+                  prop="highlightSaturation"
+                  label="Highlight saturation"
+                  value={typeof highlightSaturationRaw === 'number' ? highlightSaturationRaw : 0}
+                  min={0}
+                  max={4}
+                  onStatic={(v) => setHighlightSaturation(v <= 0 ? undefined : v)}
+                />
+                <KeyframeRow
+                  nodeId={nodeId}
+                  prop="diffractionFringe"
+                  label="Diffraction fringe"
+                  value={typeof diffractionFringeRaw === 'number' ? diffractionFringeRaw : 0}
+                  min={0}
+                  max={1}
+                  onStatic={(v) => setDiffractionFringe(v <= 0 ? undefined : v)}
+                />
                 <p style={{ margin: '2px 0 6px', fontSize: 'var(--font-size-micro)', color: 'var(--color-text-tertiary)', lineHeight: 1.5 }}>
-                  Polygonal bokeh (5–11 blades). Roundness 1 ≈ circle; highlight gain blooms speculars in the defocus.
+                  Polygonal bokeh (5–11 blades). Roundness 1 ≈ circle; rotation spins the
+                  polygon and aspect stretches it (anamorphic ovals). Highlight gain blooms
+                  speculars above the threshold, saturation keeps their colour, and
+                  diffraction fringe brightens the bokeh rim.
                 </p>
               </>
             )}

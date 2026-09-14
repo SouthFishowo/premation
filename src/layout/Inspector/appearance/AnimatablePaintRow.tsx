@@ -48,6 +48,7 @@ import styles from '../TransformSection.module.css';
 
 export type PaintProp =
   | 'fillAngle' | 'fillCenterX' | 'fillCenterY' | 'fillRadius' | 'strokeWidth' | 'strokeDashOffset'
+  | 'strokeAngle' | 'strokeCenterX' | 'strokeCenterY' | 'strokeRadius'
   | 'cornerRadius' | 'cornerRadiusTL' | 'cornerRadiusTR' | 'cornerRadiusBR' | 'cornerRadiusBL'
   | 'strokeTaperStartWidth' | 'strokeTaperEndWidth'
   | 'strokeTaperStartLength' | 'strokeTaperEndLength'

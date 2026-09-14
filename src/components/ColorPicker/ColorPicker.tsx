@@ -271,7 +271,9 @@ export function ColorPicker({
         </button>
       </Popover.Trigger>
       <Popover.Portal>
-        <Popover.Content className={styles.content} sideOffset={6} align="start" collisionPadding={12}>
+        {/* Portalled outside the panel that opened it: the keep attribute tells
+            on-canvas text editing that a click in here is still the panel. */}
+        <Popover.Content className={styles.content} sideOffset={6} align="start" collisionPadding={12} data-text-edit-keep="">
           <div className={styles.picker}>
             <ColorManagementReadout />
             <Surface color={color} onChange={onChange} />

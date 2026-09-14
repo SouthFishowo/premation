@@ -27,7 +27,7 @@
  * `refresh`/`hand`/`zoom-in`/`grid`, which are the Hand tool, the Zoom tool and
  * the 2D grid overlay elsewhere in this same toolbar.
  */
-import { useGuidesStore, type CameraTool, type Gizmo3dState, type Gizmo3dAxisMode } from '@stores/guidesStore';
+import { useGuidesStore, type CameraTool, type CameraOrbitPivot, type Gizmo3dState, type Gizmo3dAxisMode } from '@stores/guidesStore';
 import { Icon, type IconName } from '@components/Icon';
 import { Dropdown, type DropdownItem } from '@components/Dropdown';
 import styles from './SceneControls.module.css';
@@ -35,13 +35,20 @@ import { usePreferenceStore } from '@stores/preferenceStore';
 import { useFocusPlaneStore } from '@stores/focusPlaneStore';
 
 const CAMERA_TOOLS: ReadonlyArray<{ id: CameraTool; icon: IconName; label: string }> = [
-  // "Orbit Around Camera POI", because that is what orbitCameraBy actually
-  // pivots on. The old label promised AE's "Orbit Around Cursor", which picks
-  // the scene point under the pointer — a different (unimplemented) pivot; a
-  // tool must not advertise a behaviour it does not have.
-  { id: 'orbit', icon: 'orbit', label: 'Orbit Around Camera POI' },
+  // First, like AE: one armed tool, the mouse button picks the gesture.
+  { id: 'unified', icon: 'camera', label: 'Unified Camera (left orbit · middle pan · right dolly)' },
+  // The orbit PIVOT (cursor / scene / POI) is the option group below the
+  // tools — it steers this tool and the unified tool's left-drag alike.
+  { id: 'orbit', icon: 'orbit', label: 'Orbit Camera' },
   { id: 'pan', icon: 'pan-camera', label: 'Pan Camera' },
   { id: 'dolly', icon: 'perspective', label: 'Dolly Camera (towards/away)' },
+];
+
+/** AE's orbit pivot modes. Radio-style: exactly one is in effect. */
+const ORBIT_PIVOTS: ReadonlyArray<{ id: CameraOrbitPivot; label: string }> = [
+  { id: 'cursor', label: 'Orbit Around Cursor' },
+  { id: 'scene', label: 'Orbit Around Scene' },
+  { id: 'poi', label: 'Orbit Around Camera POI' },
 ];
 
 const GIZMO_MODES: ReadonlyArray<{ id: Gizmo3dState; icon: IconName; label: string }> = [
@@ -73,6 +80,8 @@ const AXIS_MODES: ReadonlyArray<{ id: Gizmo3dAxisMode; icon: IconName; label: st
 export function SceneControls(): JSX.Element {
   const cameraTool = useGuidesStore((s) => s.cameraTool);
   const setCameraTool = useGuidesStore((s) => s.setCameraTool);
+  const cameraOrbitPivot = useGuidesStore((s) => s.cameraOrbitPivot);
+  const setCameraOrbitPivot = useGuidesStore((s) => s.setCameraOrbitPivot);
   const gizmo3dState = useGuidesStore((s) => s.gizmo3dState);
   const setGizmo3dState = useGuidesStore((s) => s.setGizmo3dState);
   const gizmo3dAxisMode = useGuidesStore((s) => s.gizmo3dAxisMode);
@@ -103,6 +112,16 @@ export function SceneControls(): JSX.Element {
       label: t.label,
       icon: t.icon,
       onSelect: () => setCameraTool(t.id),
+    })),
+    { type: 'separator' },
+    // Orbit pivot — a radio group in checkbox rows (exactly one is on;
+    // picking one re-points the orbit gesture, it does not arm a tool).
+    ...ORBIT_PIVOTS.map((p) => ({
+      type: 'checkbox' as const,
+      id: `cam-pivot-${p.id}`,
+      label: p.label,
+      checked: cameraOrbitPivot === p.id,
+      onChange: () => setCameraOrbitPivot(p.id),
     })),
     { type: 'separator' },
     // The buttons armed on click and DISARMED on a second click. A menu item

@@ -57,7 +57,13 @@ import { nearestPrecompRoot, precompAncestorChain, isPrecomp } from '@core/scene
 import { readNodeAnchor } from '@core/scene/anchor';
 import { readNodeLight, lightAttenuationAt, lightReach } from '@core/scene/light';
 import { readNodeParticle, resolveParticleConfig } from '@core/particles/particleSim';
-import { measureTextNodeSize, readMeasuredTextStyle } from '@core/text/measureText';
+import { measureParagraphBox, measureTextNodeSize, readMeasuredTextStyle } from '@core/text/measureText';
+import { hasTextPath, readTextStrokePaint, textExtrasForNode } from '@core/text/textExtras';
+import { applyGradientTracks, TEXT_STROKE_GRADIENT_TRACKS } from './gradientPaintTracks';
+import { withTextMoreOptions } from '@core/text/textMoreOptions';
+import { resolveFontAxes } from '@core/text/fontAxes';
+import { graphemeCount } from '@core/text/graphemes';
+import { alignIndicesToWrap } from '@core/text/lineBreak';
 import { readGeometry } from '@core/workspace/geometry';
 import { readGhostSpec } from '@core/effects/temporalGhosts';
 import { readForceMotionBlur } from '@core/effects/forceMotionBlur';
@@ -66,7 +72,7 @@ import { readNodeQuality } from '@core/effects/layerQuality';
 import { resolveAudioSpectrum, resolveAudioWaveformSamples } from '@core/audio/audioSpectrum';
 import { readNodeMaterial } from '@core/scene/material';
 import { extrusionGeometry, EXTRUSION_WALL_FALLBACK_FILL, GRADIENT_WALL_SEGMENTS, EXTRUSION_SLICE_STEP_PX, MAX_EXTRUSION_SLICES } from '@core/scene/extrusion';
-import { extrusionOutlineFor, extrusionMeshFor } from '@core/scene/extrusionMesh';
+import { extrusionOutlineFor, extrusionMeshFor, type ExtrusionMeshRequest } from '@core/scene/extrusionMesh';
 import { readNodeModelRef, modelPrimitiveFor } from '@core/scene/modelMesh';
 import { primitiveEntryFor, isPrimitiveMeshNode } from '@core/scene/primitiveLayer';
 import { environmentRigFor, environmentSpecularMap } from '@core/scene/environmentLight';
@@ -82,12 +88,15 @@ import { shadeLayer, planeNormalOf, toShaderLights, lightAim3D, aimToCompAngleDe
 import { readNodePaint } from '@core/paint/paintStrokes';
 import { contentAwareFillAt } from '@core/effects/contentAwareFillVideo';
 import { resolvePathOps, applyPathOpChain, shapeOutline, type PolyRun } from '@core/scene/pathOps';
+import { readNodePolystar, resolvePolystar, polystarOutline } from '@core/scene/polystar';
 import { corner } from '../../../packages/workspace/src/math/BezierPoint';
-import { resolveAnimators, evaluateTextAnimators } from '@core/text/textAnimators';
+import { resolveAnimators, evaluateTextAnimators, identityGlyphTransform } from '@core/text/textAnimators';
 import { layoutPerChar3D } from '@core/text/perChar3D';
 import type { ParagraphStyle } from '@core/text/textLayout';
 import { readRuns, normalizeRuns } from '@core/text/richText';
 import { resolveTextPath, resolveTextPathMask, flattenMaskPath } from '@core/text/textPath';
+import { sourceTextExpressionResultFor } from '@core/textExpr/sourceTextProvider';
+import { applySourceTextExpressionResult } from '@core/textExpr/applySourceTextResult';
 import { bracketFrames } from './videoFrameCache';
 import { footageSourceOf, applyLoop } from '@core/source/sourceInfo';
 import { slotFitOf, coverUvRect } from '@core/template/mediaSlots';
@@ -212,6 +221,16 @@ export interface SnapshotComp {
    * original asset, so timing cannot drift. See `@core/assets/proxy`.
    */
   useProxies?: boolean;
+  /**
+   * Honour per-layer Quality = WIREFRAME: such a layer is built but marked
+   * invisible, and the viewport overlay strokes its bounding box instead.
+   *
+   * Same polarity as `useProxies`, for the same reason: absent = off, so every
+   * output path (export, offline render, headless, render tests) renders a
+   * wireframe layer as Best by doing nothing. Only the interactive viewport
+   * hosts pass it. Strictly `=== true`.
+   */
+  wireframeLayers?: boolean;
   /** Comp length in seconds — used to clamp the layer in/out gate frame. */
   durationSeconds?: number;
   /**
@@ -1871,6 +1890,13 @@ export function buildSnapshot(
         ...(iris.highlightGain !== undefined && iris.highlightGain > 0
           ? { highlightGain: iris.highlightGain }
           : {}),
+        // AE iris extras: dofIrisParams emits them only at non-neutral values,
+        // so existing scenes keep byte-identical effect params (and hashes).
+        ...(iris.rotationDeg !== undefined ? { irisRotation: iris.rotationDeg } : {}),
+        ...(iris.aspect !== undefined ? { irisAspect: iris.aspect } : {}),
+        ...(iris.highlightThreshold !== undefined ? { highlightThreshold: iris.highlightThreshold } : {}),
+        ...(iris.highlightSaturation !== undefined ? { highlightSaturation: iris.highlightSaturation } : {}),
+        ...(iris.fringe !== undefined ? { diffractionFringe: iris.fringe } : {}),
       },
     };
   };
@@ -2699,6 +2725,29 @@ export function buildSnapshot(
       pathPoints = resolveAudioWaveformPoints(audioWaveformCfg, layerW, layerH, remapOf(node.id)(t));
     }
 
+    // Parametric Polystar (AE's Polygon / Star): the outline is recomputed
+    // from the LIVE parameter set every frame, so points / radii / roundness
+    // keyframe like any property — and it lands in `pathPoints` HERE, before
+    // the path-operator chain seeds below, so trim / repeater / wiggle apply
+    // on top of the parametric outline. Old baked polygons carry Geometry
+    // points and no `fx.polystar`, so they never enter this branch.
+    const polystarCfg = layerKind === 'shape' ? readNodePolystar(node) : null;
+    if (polystarCfg) {
+      const livePolystar = resolvePolystar(polystarCfg, a);
+      pathPoints = polystarOutline(livePolystar);
+      staticSubpaths = undefined;
+      // The box follows the radius (a keyframed Outer Radius must grow the
+      // raster, not clip at the authored width); rasterPadding covers what
+      // roundness handles push past the vertex circle.
+      const reach = Math.max(
+        1,
+        livePolystar.outerRadius,
+        livePolystar.starType === 'star' ? livePolystar.innerRadius : 0,
+      );
+      layerW = reach * 2;
+      layerH = reach * 2;
+    }
+
     // Live Merge Paths: re-evaluate the boolean from animated operands each
     // frame. Geometry is world-space → recentred onto the result layer.
     let liveBooleanPose: { cx: number; cy: number; width: number; height: number } | null = null;
@@ -3290,7 +3339,9 @@ export function buildSnapshot(
       // layer instead of meeting a gap in the list.
       visible: node.visible !== false
         && (!anySolo || node.solo === true)
-        && !(comp.forExport === true && readIsGuideLayer(node)),
+        && !(comp.forExport === true && readIsGuideLayer(node))
+        // Quality = Wireframe, viewport only: the overlay draws the box.
+        && !(comp.wireframeLayers === true && readNodeQuality(node) === 'wireframe'),
       primitive: pathPoints
         ? 'path'
         : isSolid
@@ -3343,7 +3394,8 @@ export function buildSnapshot(
         // PARAGRAPH text renders WRAPPED. Wrapping is done by the same function
         // the measurement uses, so the box the rasterizer allocates and the
         // lines it draws into it can never disagree about where breaks fall.
-        const boxWidth = readNumProp(node, 'boxWidth');
+        // Text on a path is point text: its box width never wraps it.
+        const boxWidth = hasTextPath(node) ? 0 : readNumProp(node, 'boxWidth');
         if (!boxWidth || boxWidth <= 0 || typeof raw !== 'string') return raw;
         const style = readMeasuredTextStyle(node, { content: raw, boxWidth });
         return style ? style.content : raw;
@@ -3386,6 +3438,34 @@ export function buildSnapshot(
         baselineShift: a?.get('baselineShift') ?? base.baselineShift,
         textStroke: base.textStroke,
         textStrokeWidth: a?.get('strokeWidth') ?? base.textStrokeWidth,
+        // AE paragraph/character extras (textExtras.ts). Paragraph text also
+        // carries which wrapped lines are SOFT, for justification and space
+        // before/after — the same memoized wrap the `text` field used above.
+        // More Options + OpenType features fold in (absent at defaults); the
+        // Grouping Alignment tracks are sampled here.
+        textExtras: withTextMoreOptions((() => {
+          const boxWidth = hasTextPath(node) ? 0 : readNumProp(node, 'boxWidth');
+          if (!boxWidth || boxWidth <= 0) return textExtrasForNode(node);
+          const live = anim.sampleData(node.id, 'text.source', remapOf(node.id)(t));
+          const raw = typeof live === 'string' ? live : base.text;
+          if (typeof raw !== 'string') return textExtrasForNode(node);
+          const style = readMeasuredTextStyle(node, { content: raw, boxWidth });
+          // The style also carries a paragraph box's Fit Text to Box scale,
+          // and an auto-height box's authored height, whose TOP edge holds
+          // while the text grows (the content offset rides as boxOffsetY).
+          const anchored = style?.boxAnchorHeight ? measureParagraphBox(style) : null;
+          return textExtrasForNode(
+            node,
+            style?.softBreakLines,
+            style ? { fitScale: style.fitScale, boxOffsetY: anchored?.lineOffsetY } : undefined,
+          );
+        })(), node, a?.get('groupingAlignX'), a?.get('groupingAlignY')),
+        // A gradient on the text stroke (absent for a solid stroke), with its
+        // keyframed geometry (`strokeAngle` / `strokeCenterX|Y` / `strokeRadius`).
+        textStrokePaint: applyGradientTracks(readTextStrokePaint(node), a, TEXT_STROKE_GRADIENT_TRACKS),
+        // Variable-font axes beyond wght/wdth/slnt, with `text.axis.<tag>`
+        // tracks applied. Undefined unless the layer sets one.
+        fontAxes: resolveFontAxes(node, a),
       } : {}),
       // Depth of field applies to 3D layers only. A 2D layer's `depth` is just
       // the focal length, which matches the DOF focus default — so this looked
@@ -3458,6 +3538,15 @@ export function buildSnapshot(
           ...(mat.shading === 'toon' ? { toonBands: mat.toonBands } : {}),
           ambient: mat.ambient,
           diffuse: mat.diffuse,
+          // Advanced-3D axes, carried SPARSELY: each default is the packer's
+          // own (`packShade3D` fills 1 / 0 / 0 / F0(1.52)), so an untouched
+          // material adds nothing here and packs the exact identity.
+          ...(mat.reflectionIntensity !== 100 ? { reflectionIntensity: mat.reflectionIntensity / 100 } : {}),
+          ...(mat.reflectionSharpness > 0 ? { reflectionSharpness: mat.reflectionSharpness / 100 } : {}),
+          ...(mat.reflectionRolloff > 0 ? { reflectionRolloff: mat.reflectionRolloff / 100 } : {}),
+          ...(mat.transparency > 0 ? { transparency: mat.transparency / 100 } : {}),
+          ...(mat.transparencyRolloff > 0 ? { transparencyRolloff: mat.transparencyRolloff / 100 } : {}),
+          ...(mat.ior !== 1.52 ? { ior: mat.ior } : {}),
         };
       }
     }
@@ -3617,9 +3706,21 @@ export function buildSnapshot(
         // anchors: a drawn curve came back as straight chords the moment any
         // operator was added. Trim was where it showed worst, because trimming
         // is the operator you watch the whole outline while using.
+        // A rounded rect's radii ride INTO the outline (flattened arcs at the
+        // same adaptive density the chain gives drawn curves). The chain sets
+        // `primitive = 'path'`, which takes the rasterizer off the rect branch
+        // — the only place `cornerRadii` used to be honoured — so an outline
+        // without them squared the corners the moment any operator was added.
+        // Radii are the resolved+clamped set the rect branch itself draws with.
         const base = pathPoints && pathPoints.length > 1
           ? flattenOutline(pathPoints, ADAPTIVE, pathOpen === true)
-          : shapeOutline(layer.primitive, layerW, layerH, 48, dense);
+          : shapeOutline(
+              layer.primitive, layerW, layerH, 48, dense,
+              layer.primitive === 'rect'
+                && (resolvedCornerRadius > 0 || hasIndependentCornerRadii(resolvedCornerRadii))
+                ? resolvedCornerRadii
+                : undefined,
+            );
         // Roughen's wiggle rides the layer's OWN time — the same axis `a` was
         // sampled on (valuesOf → remapOf). Handing it comp `t` would leave the
         // noise running at wall-clock speed while the keyframes it animates
@@ -3771,14 +3872,59 @@ export function buildSnapshot(
     // sampled values), so keyframed selectors/offsets animate for free.
     if (layerKind === 'text' && base.text) {
       const anims = resolveAnimators(node, a);
+      // The UNWRAPPED text at this frame (Source Text keyframes beat the static
+      // content): the index space runs, selectors and animator output live in.
+      const liveSource = anim.sampleData(node.id, 'text.source', remapOf(node.id)(t));
+      const rawText = typeof liveSource === 'string' ? liveSource : base.text;
       // Layer-local time drives wiggly-mode selectors (range mode ignores it).
-      if (anims.length > 0) layer.glyphs = evaluateTextAnimators(base.text, anims, remapOf(node.id)(t));
+      if (anims.length > 0) layer.glyphs = evaluateTextAnimators(rawText, anims, remapOf(node.id)(t));
       // Per-character styling. Normalized here rather than at paint so both
       // backends see the same disjoint, clamped spans — and so a document
       // written by an older build can't hand the pen a NaN index. Emitted only
       // when non-empty: presence is what costs a layer the whole-string draw.
-      const runs = normalizeRuns(readRuns(node), [...base.text].length);
+      const runs = normalizeRuns(readRuns(node), graphemeCount(rawText));
       if (runs.length > 0) layer.runs = runs;
+
+      /**
+       * A CJK paragraph wraps between characters by INSERTING a soft break
+       * (lineBreak.ts); runs and animator output index the raw text, so shift
+       * them past every inserted '\n'. The stored string is never touched: the
+       * wrap exists only in `layer.text`, and this is the one seam that maps
+       * logical indices onto it.
+       */
+      const shiftPastInsertedBreaks = (raw: string): void => {
+        if (typeof layer.text !== 'string') return;
+        const aligned = alignIndicesToWrap(raw, layer.text, layer.runs, layer.glyphs, () => identityGlyphTransform('\n'));
+        if (aligned.runs) layer.runs = aligned.runs;
+        if (aligned.glyphs) layer.glyphs = aligned.glyphs;
+      };
+
+      // A Source Text expression (AE's text.sourceText + style API) overrides the
+      // text, its style and per-range runs; animators re-evaluate on the result.
+      // Null (one Map lookup) when the layer has no enabled Source Text expression.
+      const textExpr = sourceTextExpressionResultFor(rawAnim, srcId(node.id), remapOf(node.id)(t), graph);
+      if (textExpr) {
+        // The expression edits the RAW text (the one its runs index), never the wrap.
+        Object.assign(layer, applySourceTextExpressionResult({ ...layer, text: rawText }, textExpr));
+        const exprText = layer.text ?? '';
+        if (anims.length > 0 && exprText) layer.glyphs = evaluateTextAnimators(exprText, anims, remapOf(node.id)(t));
+        // Paragraph text: the expression's text wraps in the box exactly as the
+        // static text does — under the expression's own type style.
+        const exprBoxWidth = hasTextPath(node) ? 0 : readNumProp(node, 'boxWidth');
+        if (exprBoxWidth && exprBoxWidth > 0 && exprText) {
+          const style = readMeasuredTextStyle(node, {
+            content: exprText, boxWidth: exprBoxWidth, fontSize: layer.fontSize, fontFamily: layer.fontFamily,
+            fontWeight: layer.fontWeight, fontStyle: layer.fontStyle, letterSpacing: layer.letterSpacing, lineHeight: layer.lineHeight,
+          });
+          if (style) {
+            layer.text = style.content;
+            if (layer.textExtras?.softBreakLines) layer.textExtras = { ...layer.textExtras, softBreakLines: style.softBreakLines ?? [] };
+          }
+        }
+        shiftPastInsertedBreaks(exprText);
+      } else {
+        shiftPastInsertedBreaks(rawText);
+      }
 
       // Text on a path. The mask is flattened here, once per frame, so both
       // backends get plain geometry instead of reaching into the scene graph.
@@ -3795,6 +3941,9 @@ export function buildSnapshot(
               firstMargin: tp.firstMargin,
               reversed: tp.reversed,
               perpendicular: tp.perpendicular,
+              // Present only when set, so an existing path's key is unchanged.
+              ...(tp.forceAlignment ? { forceAlignment: true } : {}),
+              ...(tp.lastMargin ? { lastMargin: tp.lastMargin } : {}),
             };
           }
         }
@@ -3945,6 +4094,72 @@ export function buildSnapshot(
       });
     }
 
+    // Per-character 3D: replace the single string plane with one plane per
+    // glyph, each carried by its own world matrix so glyphs depth-test,
+    // intersect, and light individually — and a text animator's z /
+    // rotationX / rotationY channels can tumble them in real 3D.
+    // Computed BEFORE the extrusion block below: an extruded per-character
+    // layer builds its body PER GLYPH from these placements (AE 26 extrudes
+    // each character as its own solid), so the block needs them to decide.
+    const perCharGlyphs =
+      is3D && world3d && layer.kind === 'text' && isPerChar3D(node)
+        ? layoutPerChar3D({
+            text: layer.text ?? '',
+            style: {
+              fontSize: layer.fontSize ?? 16,
+              fontFamily: layer.fontFamily,
+              fontWeight: layer.fontWeight,
+              fontStyle: layer.fontStyle,
+              letterSpacing: layer.letterSpacing,
+              fill: typeof layer.fill === 'string' ? layer.fill : undefined,
+              align: layer.align as ParagraphStyle['align'],
+              lineHeight: layer.lineHeight,
+              paragraphSpacing: layer.paragraphSpacing,
+              leftIndent: layer.textExtras?.leftIndent,
+              rightIndent: layer.textExtras?.rightIndent,
+              firstLineIndent: layer.textExtras?.firstLineIndent,
+              spaceBefore: layer.textExtras?.spaceBefore,
+              spaceAfter: layer.textExtras?.spaceAfter,
+            },
+            softBreakLines: layer.textExtras?.softBreakLines,
+            boxWidth: layerW,
+            transforms: layer.glyphs,
+            runs: layer.runs,
+            ...(layer.textExtras?.direction ? { direction: layer.textExtras.direction } : {}),
+            ...(layer.textExtras?.orientation === 'vertical'
+              ? { vertical: { romanUpright: !!layer.textExtras.verticalRomanAlignment, columnLimit: layer.textExtras.boxHeight, tateChuYokoDigits: layer.textExtras.tateChuYokoDigits } }
+              : {}),
+            ...(layer.textExtras?.boxOffsetY ? { boxOffsetY: layer.textExtras.boxOffsetY } : {}),
+          })
+        : [];
+    // A glyph plane is one character already placed by the block layout: the
+    // block-level box offset, vertical columns and RTL reordering must not be
+    // applied again inside it. (Only those — the fields every older document
+    // carried keep reaching the glyph raster exactly as before.)
+    const glyphExtras = perCharGlyphs.length > 0 && layer.textExtras
+      ? (() => {
+          const { boxOffsetY: _o, orientation: _or, verticalRomanAlignment: _r, direction: _d, ...rest } = layer.textExtras;
+          return Object.keys(rest).length > 0 ? rest : undefined;
+        })()
+      : undefined;
+    /**
+     * Per-GLYPH extrusion (set inside the extrusion block below when it
+     * applies): with per-character 3D + depth, each glyph plane gets a
+     * body-only mesh of its own, carried by the glyph's world matrix, so an
+     * animator scattering glyphs in Z / tumbling them keeps every front
+     * attached to its solid. Carries the material context the plane loop
+     * needs to emit those bodies.
+     */
+    let perGlyphExtrusion: {
+      depth: number;
+      bevel: number;
+      bevelStyle: ExtrusionMeshRequest['bevelStyle'];
+      faceMats: ReturnType<typeof readNodeFaceMaterials>;
+      wallFill: string;
+      lit: boolean;
+      mat: ReturnType<typeof readNodeMaterial>;
+    } | null = null;
+
     // TRUE 3D extrusion: a 3D layer with extrusionDepth d > 0 is a real
     // object — synthesize a back cap + side walls as extra RenderLayers
     // ADJACENT in paint order (they share the front face's sort depth, so
@@ -3972,9 +4187,13 @@ export function buildSnapshot(
       edited id; the `::ext-*` carriers never matched it.)
     */
     const textBodySuppressed = layer.kind === 'text' && useTextEditStore.getState().nodeId === node.id;
-    // Per-character 3D keeps the whole-string body (pinned by
-    // buildSnapshotPerChar3D.test) but the FRONT is the glyph planes below —
-    // the mesh must not also paint the string on an inset cap.
+    // Per-character 3D: the FRONT is always the glyph planes below, so the
+    // mesh must not paint the string on an inset cap. The BODY is per glyph
+    // when the mesh path can trace (perGlyphExtrusion, decided below) — each
+    // solid rides its glyph's own animator transform, as AE 26 extrudes each
+    // character as its own solid. Where it cannot (blocking effects/styles,
+    // no canvas to trace from), the whole-string body remains exactly as
+    // before. Pinned by buildSnapshotPerGlyphExtrusion.test.ts.
     const perCharText = layer.kind === 'text' && isPerChar3D(node);
     if (is3D && world3d && extrusionDepth > 0 && !isPrimitiveMeshNode(node) && !textBodySuppressed) {
       const isComplexContent =
@@ -4059,7 +4278,6 @@ export function buildSnapshot(
         background.
       */
       const meshBevel = Math.max(0, a?.get('bevelDepth') ?? d3.bevelDepth);
-      const meshOutline = extrusionOutlineFor(layer, node, layerW, layerH);
       /*
         Who draws the FRONT cap. Normally the layer's own quad — it carries the
         content, styles, mask and effects, and a bevel merely insets it. That
@@ -4109,7 +4327,43 @@ export function buildSnapshot(
         repaint the surface and already reach every face through `wallFill`.
       */
       const meshBlockedByStyles = faceStyles !== undefined;
-      const builtMesh = meshOutline && !meshBlockedByFx && !meshBlockedByStyles
+      /*
+        Per-character 3D + extrusion: one solid PER GLYPH (AE 26), not one
+        shared body under detachable planes. Decided here — the material
+        context is in scope — but emitted in the glyph-plane loop below,
+        which owns each glyph's world matrix. The gate is the same as the
+        whole-string mesh's (colour/LUT effects only, no interior styles)
+        PLUS a probe trace of the first glyph: headless, or a painter that
+        cannot trace, keeps the whole-string body so nothing renders without
+        a solid. Whitespace never traces, but the placements never contain it.
+      */
+      if (perCharText && perCharGlyphs.length > 0 && !meshBlockedByFx && !meshBlockedByStyles) {
+        const probe = perCharGlyphs[0];
+        const probeOutline = probe
+          ? extrusionOutlineFor(
+              { ...layer, text: probe.char, glyphs: undefined, runs: undefined, textExtras: glyphExtras, width: probe.width, height: probe.height },
+              node, probe.width, probe.height,
+            )
+          : null;
+        if (probeOutline) {
+          perGlyphExtrusion = {
+            depth: extrusionDepth,
+            bevel: meshBevel,
+            bevelStyle: d3.bevelStyle,
+            faceMats,
+            wallFill,
+            lit: extLit,
+            mat: extMat,
+          };
+        }
+      }
+      // Traced only when the whole-string mesh can actually be used: a
+      // per-glyph body, a blocking effect or an interior style all leave the
+      // string outline unread, and an animated string re-traces per frame.
+      const meshOutline = perGlyphExtrusion || meshBlockedByFx || meshBlockedByStyles
+        ? null
+        : extrusionOutlineFor(layer, node, layerW, layerH);
+      const builtMesh = meshOutline
         ? extrusionMeshFor(meshOutline, layerW, layerH, { depth: extrusionDepth, bevel: meshBevel, bevelStyle: d3.bevelStyle, frontCap: meshOwnsFront })
         : null;
       let meshEmitted = false;
@@ -4247,6 +4501,9 @@ export function buildSnapshot(
 
       if (meshEmitted) {
         // Body drawn; the quad synthesis below is the fallback only.
+      } else if (perGlyphExtrusion) {
+        // Bodies are emitted per glyph in the glyph-plane loop below, each
+        // under its glyph's own world matrix — no whole-string body at all.
       } else if (isComplexContent) {
         // Contour Volume Extrusion: For text and complex shapes, slice the
         // depth axis (z ∈ [1, extrusionDepth]) into continuous slices matching the exact
@@ -4665,30 +4922,8 @@ export function buildSnapshot(
       }
     }
 
-    // Per-character 3D: replace the single string plane with one plane per
-    // glyph, each carried by its own world matrix so glyphs depth-test,
-    // intersect, and light individually — and a text animator's z /
-    // rotationX / rotationY channels can tumble them in real 3D.
-    const perCharGlyphs =
-      is3D && world3d && layer.kind === 'text' && isPerChar3D(node)
-        ? layoutPerChar3D({
-            text: layer.text ?? '',
-            style: {
-              fontSize: layer.fontSize ?? 16,
-              fontFamily: layer.fontFamily,
-              fontWeight: layer.fontWeight,
-              fontStyle: layer.fontStyle,
-              letterSpacing: layer.letterSpacing,
-              fill: typeof layer.fill === 'string' ? layer.fill : undefined,
-              align: layer.align as ParagraphStyle['align'],
-              lineHeight: layer.lineHeight,
-              paragraphSpacing: layer.paragraphSpacing,
-            },
-            boxWidth: layerW,
-            transforms: layer.glyphs,
-            runs: layer.runs,
-          })
-        : [];
+    // (perCharGlyphs / glyphExtras are computed above the extrusion block —
+    // the per-glyph extrusion decision needs them.)
 
     if (modelMeshLayer) {
       emitLayer(modelMeshLayer, node);
@@ -4702,7 +4937,9 @@ export function buildSnapshot(
           position: { x: g.offsetX, y: g.offsetY, z: g.offsetZ },
           rotation: { x: g.rotationX * DEG, y: g.rotationY * DEG, z: g.rotation * DEG },
           scale: { x: g.scale, y: g.scale, z: 1 },
-          anchor: { x: 0, y: 0, z: 0 },
+          // The animator's per-character Anchor Point (X/Y/Z): rotations and
+          // scale pivot about it, and the glyph sits at −anchor from there.
+          anchor: { x: g.anchorX, y: g.anchorY, z: g.anchorZ },
         });
         const M = Matrix4Math.multiply(world3d as import('@motion/scene').Matrix4, gm);
         const O = project(Matrix4Math.transformPoint(M, { x: 0, y: 0, z: 0 }));
@@ -4726,6 +4963,7 @@ export function buildSnapshot(
           // resolved into this glyph's placement and fill.
           glyphs: undefined,
           runs: undefined,
+          textExtras: glyphExtras,
           width: g.width,
           height: g.height,
           x: O.x,
@@ -4741,6 +4979,83 @@ export function buildSnapshot(
           lighting: undefined,
           shade3d: undefined,
         };
+        /*
+          The glyph's OWN extruded body (perGlyphExtrusion): a body-only mesh
+          traced from this glyph's silhouette — the same painter, box and
+          style fields the plane's raster uses, so the wall meets the front to
+          the trace's ~0.4 px — carried by the SAME world matrix as the plane.
+          An animator pushing the glyph in Z or tumbling it moves both
+          together; the whole-string body could not do that. Emitted BEFORE
+          the plane so the front's antialiased edge blends over the opaque
+          wall. Outline and mesh are LRU-cached by content + box + extrusion
+          params (extrusionMesh.ts), and the animator transform lives in the
+          matrix, not the raster — so repeated characters share one mesh and
+          per-frame animation rebuilds nothing.
+        */
+        if (perGlyphExtrusion) {
+          const pg = perGlyphExtrusion;
+          const bodyOutline = extrusionOutlineFor(glyphLayer, node, g.width, g.height);
+          const body = bodyOutline
+            ? extrusionMeshFor(bodyOutline, g.width, g.height, { depth: pg.depth, bevel: pg.bevel, bevelStyle: pg.bevelStyle })
+            : null;
+          if (body) {
+            // An animator fill colour recolours the glyph's whole solid, as a
+            // per-character solid's surface follows its front in AE.
+            const wallBase = typeof g.fill === 'string' ? g.fill : pg.wallFill;
+            const ranges = body.mesh.ranges.map((r) => {
+              // No frontCap is ever requested for a glyph body, so 'front'
+              // cannot occur — narrowed for the type (a front would take the
+              // wall material if the mesh ever grew one).
+              const role = r.role === 'front' ? 'side' : r.role;
+              const fm = resolveFaceMaterial(pg.faceMats, role, wallBase);
+              // Same rule as the whole-string mesh: an explicit per-face
+              // colour is taken literally, a derived one is dimmed by gain.
+              const gain = pg.faceMats[role]?.fill ? 1 : fm.gain;
+              return { role: r.role, first: r.first, count: r.count, fill: fm.fill, gain };
+            });
+            const bodyLayer: RenderLayer = {
+              id: `${layer.id}::ch${g.index}::ext-mesh`,
+              kind: 'shape',
+              primitive: 'rect',
+              blend: layer.blend,
+              x: glyphLayer.x,
+              y: glyphLayer.y,
+              rotation: glyphLayer.rotation,
+              scaleX: glyphLayer.scaleX,
+              scaleY: glyphLayer.scaleY,
+              matrix: gfm,
+              world3d: M as readonly number[],
+              depth: layer.depth,
+              opacity: layer.opacity * g.opacity,
+              width: g.width,
+              height: g.height,
+              fill: resolveFaceMaterial(pg.faceMats, 'side', wallBase).fill,
+              visible: layer.visible,
+              flatFacet: true,
+              // Colour/LUT effects only (the perGlyphExtrusion gate): the
+              // adapter folds them into the range colours, exactly as it does
+              // for the whole-string carrier's `scrub.effects`.
+              effects: layer.effects,
+              ...(layer.castsShadow3d ? { castsShadow3d: true } : {}),
+              extrudedMesh: { key: body.key, vertices: body.mesh.vertices, indices: body.mesh.indices, ranges },
+            };
+            if (pg.lit) {
+              // Per-fragment from the mesh normals, one-sided — every face of
+              // a glyph body bounds its volume, same as the whole-string mesh.
+              bodyLayer.lighting = [1, 1, 1];
+              bodyLayer.shade3d = {
+                specular: pg.mat.specular / 100,
+                shininess: pg.mat.shininess,
+                oneSided: true,
+                ambient: pg.mat.ambient,
+                diffuse: pg.mat.diffuse,
+                ...(pg.mat.shading === 'pbr' ? { roughness: pg.mat.roughness / 100, metal: pg.mat.metal / 100 } : {}),
+                ...(pg.mat.shading === 'toon' ? { toonBands: pg.mat.toonBands, metal: pg.mat.metal / 100 } : {}),
+              };
+            }
+            emitLayer(bodyLayer, node);
+          }
+        }
         if (pcLit) {
           const lg = shadeLayer(planeNormalOf(M), { x: O.x, y: O.y, z: z3 + g.offsetZ }, sceneLights);
           if (lg) {
@@ -4784,6 +5099,12 @@ export function buildSnapshot(
               ...(iris.highlightGain !== undefined && iris.highlightGain > 0
                 ? { highlightGain: iris.highlightGain }
                 : {}),
+              // Same non-neutral-only rule as dofEffectOf above.
+              ...(iris.rotationDeg !== undefined ? { irisRotation: iris.rotationDeg } : {}),
+              ...(iris.aspect !== undefined ? { irisAspect: iris.aspect } : {}),
+              ...(iris.highlightThreshold !== undefined ? { highlightThreshold: iris.highlightThreshold } : {}),
+              ...(iris.highlightSaturation !== undefined ? { highlightSaturation: iris.highlightSaturation } : {}),
+              ...(iris.fringe !== undefined ? { diffractionFringe: iris.fringe } : {}),
             },
           }]);
         emitLayer({ ...layer, effects }, node);

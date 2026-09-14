@@ -88,6 +88,31 @@ describe('menu submenus', () => {
     ]);
   });
 
+  it('Layer ▸ Transform lists the transform verbs in AE’s order', () => {
+    const kids = resolveChildren(findItem('layer', 'Transform'));
+    const flat = walk(kids).map((k) => k.commandId).filter(Boolean);
+    expect(flat).toEqual([
+      'layer.resetTransform',
+      'layer.centreAnchor',
+      'layer.flipHorizontal',
+      'layer.flipVertical',
+      'layer.centreInComp',
+      'layer.fitToComp',
+      'layer.fitToCompWidth',
+      'layer.fitToCompHeight',
+      'layer.fillComp',
+      'layer.nativeSize',
+      'layer.autoOrient',
+    ]);
+    // Anchor Point is itself a submenu, as in AE.
+    expect(kids.find((k) => k.label === 'Anchor Point')?.children).toBeDefined();
+  });
+
+  it('Freeze On Last Frame sits beside Freeze Frame under Time', () => {
+    const ids = resolveChildren(findItem('animation', 'Time')).map((k) => k.commandId);
+    expect(ids.indexOf('time.freezeOnLastFrame')).toBe(ids.indexOf('time.freezeFrame') + 1);
+  });
+
   it('Scene Edit Detection sits under Layer, where AE puts it', () => {
     const ids = walk(APP_MENU.find((g) => g.id === 'layer')?.items ?? []).map((i) => i.commandId);
     expect(ids).toContain('layer.sceneEditDetect.markers');

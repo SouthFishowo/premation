@@ -120,3 +120,44 @@ export async function runAsOneHistoryEntry<T>(
   });
   return result;
 }
+
+/**
+ * `runAsOneHistoryEntry` for a SYNCHRONOUS edit, with every flag restored
+ * before this returns.
+ *
+ * The async version restores `restoring` and resumes the engine history in a
+ * `finally` that runs after an `await` — a microtask later even when `fn` is
+ * synchronous. Anything that continues synchronously in the same task (a
+ * second control edited in the same turn, a test driving controls in a loop)
+ * then runs with history recording off, and records nothing. A synchronous
+ * edit — Time Stretch from the dialog or the inspector field — has no reason
+ * to leave that gap.
+ */
+export function runAsOneHistoryEntrySync<T>(label: string, fn: () => T): T {
+  useHistoryStore.getState().flush();
+  const before = captureDocument();
+  const history = historyService();
+
+  history?.suspend();
+  useHistoryStore.setState({ restoring: true });
+  let result: T;
+  try {
+    result = fn();
+  } finally {
+    useHistoryStore.setState({ restoring: false });
+    useHistoryStore.getState().runRestoring(() => {});
+    history?.resume();
+  }
+
+  const after = captureDocument();
+  const swapTo = (doc: EditorDocument): void => {
+    history?.suspend();
+    try {
+      restore(doc);
+    } finally {
+      history?.resume();
+    }
+  };
+  history?.push({ label, execute: () => swapTo(after), undo: () => swapTo(before) });
+  return result;
+}

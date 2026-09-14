@@ -92,6 +92,14 @@ describe('extrusionOutlineFor — text', () => {
     expect(traceTextSpec).toHaveBeenCalledTimes(2);
   });
 
+  it('re-traces when a glyph unlinks its Y blur (2-D blur reshapes the silhouette)', () => {
+    const glyph = (blurY?: number) => ({ dx: 0, dy: 0, scale: 1, scaleY: 1, rotation: 0, opacity: 1, fillOpacity: 1, tracking: 0, lineSpacing: 0, blur: 2, skew: 0, ...(blurY !== undefined ? { blurY } : {}) });
+    const linked = extrusionOutlineFor(textLayer({ glyphs: [glyph()] as never }), undefined, 200, 80);
+    const unlinked = extrusionOutlineFor(textLayer({ glyphs: [glyph(8)] as never }), undefined, 200, 80);
+    expect(linked!.key).not.toBe(unlinked!.key);
+    expect(traceTextSpec).toHaveBeenCalledTimes(2);
+  });
+
   it('returns null when the trace has nothing (headless)', () => {
     traceTextSpec.mockReturnValue(null);
     expect(extrusionOutlineFor(textLayer(), undefined, 200, 80)).toBeNull();

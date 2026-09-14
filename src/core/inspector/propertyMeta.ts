@@ -259,6 +259,24 @@ const STATIC: Record<string, MetaSpec> = {
     label: 'Gradient Stops', group: 'fill', type: 'gradient', unit: '',
     step: 1, precision: 0, defaultValue: null, resettable: false, order: ORDER.fill,
   },
+  // Text STROKE gradient geometry (`strokePaint` on the Text component) — the
+  // fill's four, mirrored, in the same units. Sampled by `applyGradientTracks`.
+  strokeAngle: DEG('Stroke Gradient Angle', 'stroke', ORDER.stroke),
+  strokeCenterX: {
+    label: 'Stroke Gradient Center X', group: 'stroke', type: 'percent', unit: '%',
+    min: 0, max: 1, step: 0.01, precision: 0, defaultValue: 0.5, resettable: true,
+    displayScale: 100, order: ORDER.stroke,
+  },
+  strokeCenterY: {
+    label: 'Stroke Gradient Center Y', group: 'stroke', type: 'percent', unit: '%',
+    min: 0, max: 1, step: 0.01, precision: 0, defaultValue: 0.5, resettable: true,
+    displayScale: 100, order: ORDER.stroke,
+  },
+  strokeRadius: {
+    label: 'Stroke Gradient Radius', group: 'stroke', type: 'percent', unit: '%',
+    min: 0.01, max: 2, step: 0.01, precision: 0, defaultValue: 0.5, resettable: true,
+    displayScale: 100, order: ORDER.stroke,
+  },
 
   // Stroke
   strokeWidth: { ...PX('Stroke Width', 'stroke', ORDER.stroke), min: 0, defaultValue: 4 },
@@ -359,6 +377,16 @@ const STATIC: Record<string, MetaSpec> = {
   },
   letterSpacing: PX('Letter Spacing', 'text', ORDER.text),
   lineHeight: { ...MULT('Line Height', 'text', ORDER.text), min: 0, defaultValue: 1.2, step: 0.01 },
+  // Text ▸ More Options ▸ Grouping Alignment (textMoreOptions.ts): % of the
+  // anchor group's box the transform origin is offset by.
+  groupingAlignX: {
+    label: 'Grouping Alignment X', group: 'text', type: 'percent', unit: '%',
+    min: -100, max: 100, step: 1, precision: 1, defaultValue: 0, resettable: true, order: ORDER.text,
+  },
+  groupingAlignY: {
+    label: 'Grouping Alignment Y', group: 'text', type: 'percent', unit: '%',
+    min: -100, max: 100, step: 1, precision: 1, defaultValue: 0, resettable: true, order: ORDER.text,
+  },
 
   // Material Options (3D). Stored as flat props on the Transform component;
   // `readNodeMaterial(node, av)` overrides each with its track when the
@@ -374,6 +402,18 @@ const STATIC: Record<string, MetaSpec> = {
   roughness: { ...PCT('Roughness', 'material', ORDER.material), defaultValue: 50 },
   // Height displacement, px along the normal (B1); negative sinks.
   displacement: { ...PX('Displacement', 'material', ORDER.material), min: -2000, max: 2000 },
+  // Advanced-3D reflection / transparency axes. Reflection Intensity's default
+  // IS 100 (PCT's own) — the identity that reproduces today's IBL exactly; the
+  // other four default 0. IOR is a bare number, 1–4, defaulting to AE's 1.52.
+  reflectionIntensity: PCT('Reflection Intensity', 'material', ORDER.material),
+  reflectionSharpness: { ...PCT('Reflection Sharpness', 'material', ORDER.material), defaultValue: 0 },
+  reflectionRolloff: { ...PCT('Reflection Rolloff', 'material', ORDER.material), defaultValue: 0 },
+  transparency: { ...PCT('Transparency', 'material', ORDER.material), defaultValue: 0 },
+  transparencyRolloff: { ...PCT('Transparency Rolloff', 'material', ORDER.material), defaultValue: 0 },
+  ior: {
+    label: 'Index of Refraction', group: 'material', type: 'number', unit: '',
+    min: 1, max: 4, step: 0.01, precision: 2, defaultValue: 1.52, resettable: true, order: ORDER.material,
+  },
   // Hold tracks: 0/1 for Accepts Lights; 0=Off, 1=On, 2=Only for shadow switches.
   acceptsLights: {
     label: 'Accepts Lights', group: 'material', type: 'boolean', unit: '',
@@ -445,9 +485,29 @@ const STATIC: Record<string, MetaSpec> = {
     label: 'Iris Roundness', group: 'camera', type: 'number', unit: '',
     min: 0, max: 1, step: 0.01, precision: 2, defaultValue: 0.65, resettable: true, order: ORDER.camera,
   },
+  // AE's remaining iris/highlight exposes. Defaults are the render-identical
+  // neutrals (rotation 0, aspect 1, threshold/saturation/fringe 0) — see
+  // readNodeDof, which forwards each only at a non-neutral value.
+  irisRotation: { ...DEG('Iris Rotation', 'camera', ORDER.camera), min: -180, max: 180 },
+  irisAspect: {
+    label: 'Iris Aspect Ratio', group: 'camera', type: 'number', unit: '',
+    min: 0.25, max: 4, step: 0.05, precision: 2, defaultValue: 1, resettable: true, order: ORDER.camera,
+  },
   highlightGain: {
     label: 'Highlight Gain', group: 'camera', type: 'number', unit: '',
     min: 0, max: 4, step: 0.05, precision: 2, defaultValue: 0, resettable: true, order: ORDER.camera,
+  },
+  highlightThreshold: {
+    label: 'Highlight Threshold', group: 'camera', type: 'number', unit: '',
+    min: 0, max: 1, step: 0.01, precision: 2, defaultValue: 0, resettable: true, order: ORDER.camera,
+  },
+  highlightSaturation: {
+    label: 'Highlight Saturation', group: 'camera', type: 'number', unit: '',
+    min: 0, max: 4, step: 0.05, precision: 2, defaultValue: 0, resettable: true, order: ORDER.camera,
+  },
+  diffractionFringe: {
+    label: 'Diffraction Fringe', group: 'camera', type: 'number', unit: '',
+    min: 0, max: 1, step: 0.01, precision: 2, defaultValue: 0, resettable: true, order: ORDER.camera,
   },
 
   // ── Light Options ──
@@ -678,7 +738,7 @@ const PATHOP_PARAM_LABEL: Record<string, Record<string, string>> = {
   roundCorners: { amount: 'Radius', detail: 'Steps' },
   pucker: { amount: 'Amount' },
   twist: { amount: 'Angle' },
-  offset: { amount: 'Offset' },
+  offset: { amount: 'Amount', miterLimit: 'Miter Limit' },
   roughen: { amount: 'Size', detail: 'Detail' },
   zigzag: { amount: 'Amount', detail: 'Ridges' },
   // The repeater's, matching the labels the inspector card shows — a timeline
@@ -739,7 +799,13 @@ function resolvePathOpParam(path: string, nodeId?: string): PropertyMeta | null 
   const pct = type === 'trim' && PATHOP_PERCENT_PARAMS.has(param);
   // The repeater's rows keep the bounds they had as `rep.*` entries. Spread
   // LAST so they win over the generic defaults below, which is the whole point.
-  const rep = type === 'repeater' ? REPEATER_PARAM_META[param] : undefined;
+  // Offset Paths' miter cap: floored at 1 (no miter exists below it) and reset
+  // to 4, the Canvas2D convention its renderer applies when the field is absent.
+  const rep = type === 'repeater'
+    ? REPEATER_PARAM_META[param]
+    : type === 'offset' && param === 'miterLimit'
+      ? { min: 1, step: 0.1, precision: 2, defaultValue: 4 }
+      : undefined;
   return {
     path,
     label: `${PATHOP_TYPE_LABEL[type] ?? 'Path Operator'} ${label}`,
@@ -759,6 +825,46 @@ function resolvePathOpParam(path: string, nodeId?: string): PropertyMeta | null 
     resettable: true,
     order: type === 'repeater' ? ORDER.repeater : ORDER.trim,
     ...rep,
+  };
+}
+
+/**
+ * `polystar.<param>` — one parameter of the parametric Polygon / Star.
+ *
+ * Plain keys (not id-scoped like `pathop.*`) because a layer has at most ONE
+ * polystar — it IS the layer's geometry. Labels match the inspector section
+ * (`polystarParamSpecs`), prefixed so a timeline row reads "Polystar Points"
+ * rather than a bare "Points" among the transform rows.
+ */
+const POLYSTAR_PARAM_META: Record<string, { label: string; unit: string; min?: number; max?: number; step: number; precision: number; defaultValue: number }> = {
+  points: { label: 'Points', unit: '', min: 3, max: 100, step: 1, precision: 0, defaultValue: 5 },
+  rotation: { label: 'Rotation', unit: '°', step: 1, precision: 1, defaultValue: 0 },
+  outerRadius: { label: 'Outer Radius', unit: 'px', min: 0, step: 1, precision: 1, defaultValue: 100 },
+  innerRadius: { label: 'Inner Radius', unit: 'px', min: 0, step: 1, precision: 1, defaultValue: 50 },
+  outerRoundness: { label: 'Outer Roundness', unit: '%', step: 1, precision: 1, defaultValue: 0 },
+  innerRoundness: { label: 'Inner Roundness', unit: '%', step: 1, precision: 1, defaultValue: 0 },
+};
+
+function resolvePolystarParam(path: string): PropertyMeta | null {
+  const m = /^polystar\.(.+)$/.exec(path);
+  if (!m) return null;
+  const meta = POLYSTAR_PARAM_META[m[1] ?? ''];
+  if (!meta) return null;
+  return {
+    path,
+    label: `Polystar ${meta.label}`,
+    // The shape-geometry bucket, same as the path operators (see the group
+    // note in resolvePathOpParam — 'trim' was named for its first occupant).
+    group: 'trim',
+    type: 'number',
+    unit: meta.unit,
+    ...(meta.min !== undefined ? { min: meta.min } : {}),
+    ...(meta.max !== undefined ? { max: meta.max } : {}),
+    step: meta.step,
+    precision: meta.precision,
+    defaultValue: meta.defaultValue,
+    resettable: true,
+    order: ORDER.trim,
   };
 }
 
@@ -951,9 +1057,51 @@ const ANIMATOR_PARAM_META: Record<string, { label: string; unit: string; type: P
   tracking: { label: 'Tracking', unit: 'px', type: 'number' },
   lineSpacing: { label: 'Line Spacing', unit: 'px', type: 'number' },
   characterOffset: { label: 'Character Offset', unit: '', type: 'number' },
-  blur: { label: 'Blur', unit: 'px', type: 'number' },
+  blur: { label: 'Blur X', unit: 'px', type: 'number' },
+  blurY: { label: 'Blur Y', unit: 'px', type: 'number' },
   strokeWidth: { label: 'Stroke Width', unit: 'px', type: 'number' },
+  // Optional properties (Add ▸ Property).
+  anchorX: { label: 'Anchor Point X', unit: 'px', type: 'number' },
+  anchorY: { label: 'Anchor Point Y', unit: 'px', type: 'number' },
+  anchorZ: { label: 'Anchor Point Z', unit: 'px', type: 'number' },
+  skewAxis: { label: 'Skew Axis', unit: '°', type: 'angle' },
+  lineAnchor: { label: 'Line Anchor', unit: '%', type: 'percent' },
+  characterValue: { label: 'Character Value', unit: '', type: 'number' },
+  fillHue: { label: 'Fill Hue', unit: '°', type: 'angle' },
+  fillSaturation: { label: 'Fill Saturation', unit: '%', type: 'percent' },
+  fillBrightness: { label: 'Fill Brightness', unit: '%', type: 'percent' },
+  strokeOpacity: { label: 'Stroke Opacity', unit: '%', type: 'percent' },
+  strokeHue: { label: 'Stroke Hue', unit: '°', type: 'angle' },
+  strokeSaturation: { label: 'Stroke Saturation', unit: '%', type: 'percent' },
+  strokeBrightness: { label: 'Stroke Brightness', unit: '%', type: 'percent' },
 };
+
+/** `text.axis.<tag>` and `textPath.<param>` — the Character panel's variable
+ *  axes and Path Options, labelled like AE's Text ▸ Path Options group. */
+function resolveTextOptionPath(path: string): PropertyMeta | null {
+  const axis = /^text\.axis\.([A-Za-z0-9]{4})$/.exec(path);
+  const tp = /^textPath\.(firstMargin|lastMargin|reversed|perpendicular|forceAlignment)$/.exec(path);
+  if (!axis && !tp) return null;
+  const base = { path, group: 'text' as const, resettable: true, order: ORDER.text, defaultValue: null };
+  if (axis) {
+    return { ...base, label: `Font Axis ${axis[1]}`, type: 'number', unit: '', step: 1, precision: 1 };
+  }
+  const param = tp![1]!;
+  const LABELS: Record<string, string> = {
+    firstMargin: 'First Margin', lastMargin: 'Last Margin', reversed: 'Reverse Path',
+    perpendicular: 'Perpendicular To Path', forceAlignment: 'Force Alignment',
+  };
+  const flag = param === 'reversed' || param === 'perpendicular' || param === 'forceAlignment';
+  return {
+    ...base,
+    label: `Path Options ${LABELS[param]}`,
+    type: flag ? 'boolean' : 'number',
+    unit: flag ? '' : 'px',
+    ...(flag ? { min: 0, max: 1 } : {}),
+    step: 1,
+    precision: flag ? 0 : 1,
+  };
+}
 
 /** Selector-0 parameters that kept their legacy flat path (`ta.0.offset`). */
 const LEGACY_SELECTOR_PARAMS = new Set(['start', 'end', 'offset', 'wiggleFreq']);
@@ -998,7 +1146,8 @@ function resolveTextAnimator(path: string, nodeId?: string): PropertyMeta | null
     }
   }
 
-  const paramLabel = meta?.label ?? titleCase(param);
+  const axisTag = /^axis([A-Za-z0-9]{4})$/.exec(param)?.[1];
+  const paramLabel = meta?.label ?? (axisTag ? `Font Axis ${axisTag}` : titleCase(param));
   return {
     path,
     label: `${animLabel} ${selLabel}${paramLabel}`,
@@ -1047,8 +1196,10 @@ const RESOLVERS: ReadonlyArray<(path: string, nodeId?: string) => PropertyMeta |
   resolvePointOfInterest,
   resolveColorChannel,
   resolveTextAnimator,
+  resolveTextOptionPath,
   resolveEffectParam,
   resolvePathOpParam,
+  resolvePolystarParam,
 ];
 
 // ── Public API ──────────────────────────────────────────────────────

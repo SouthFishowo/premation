@@ -11,15 +11,14 @@
  *
  * "None" parents the layer back to the composition root.
  *
- * ── ALT: the "jump" variant ──────────────────────────────────────────────
- * Holding Alt (Option) while picking links the layer WITHOUT compensating its
- * transform, so its values stay as typed and the layer jumps into the parent's
- * coordinate space. After Effects has exactly this, and it is the right
- * behaviour when you are building a rig whose children are already authored
- * relative to the parent. The engine has always supported it — the Lottie
- * importer parents this way, because its locals are parent-relative already —
- * it simply had no gesture. See `parentOptionsFor` for the one place the
- * modifier is turned into an option, shared by every surface that parents.
+ * ── Modifiers (After Effects) ────────────────────────────────────────────
+ * PLAIN picks parent WITHOUT a jump: the layer keeps its world pose.
+ * SHIFT is AE's Parent & Link jump: the layer snaps onto the parent, its
+ * position set to the parent's anchor point.
+ * ALT (Option) is the older "keep values" variant — link without compensating,
+ * so typed values are reinterpreted in the parent's space (the Lottie importer
+ * parents this way). See `parentOptionsFor` for the one place the modifiers
+ * become options, shared by every surface that parents.
  */
 
 import { Icon } from '@components/Icon';
@@ -63,7 +62,7 @@ export function ParentControl({ nodeId }: { nodeId: string }): JSX.Element | nul
     <div className={styles.row}>
       <span className={styles.label}>Parent</span>
       <PickWhip
-        label="Parent pick-whip — drag onto a layer (Alt: keep values, layer jumps)"
+        label="Parent pick-whip — drag onto a layer (Shift: jump to the parent · Alt: keep values)"
         // The same question the dropdown's list answers, asked of one id:
         // `eligibleParents` already excludes this layer and its descendants,
         // so a cycle cannot be dropped and the line greys out over one.
