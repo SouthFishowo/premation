@@ -7,12 +7,14 @@
  * available and completely optional, and to be honest about what pressing the
  * button does.
  *
- * ── Why the URL is shown, and editable ─────────────────────────────────
+ * ── Why the URLs are shown, and editable ───────────────────────────────
  * Pressing Install makes an HTTPS request to a third-party host from an
  * application whose entire pitch is that it does not do that unless asked. The
- * host is therefore on screen before the request, not buried in a release note.
- * It is editable because the best available model is a moving target and nobody
- * should wait for a release to try a better one.
+ * hosts are therefore on screen before the request, not buried in a release
+ * note. They are editable because the best available model is a moving target
+ * and nobody should wait for a release to try a better one. TWO fields, not
+ * one: SAM-class checkpoints ship as an encoder/decoder pair (samPipeline.ts),
+ * and a single-file URL cannot produce a working segmenter.
  *
  * After one install the model is cached locally and loaded at boot with no
  * network at all.
@@ -42,7 +44,8 @@ export function ObjectMatteControl(): JSX.Element {
   const remove = useSamModelStore((s) => s.remove);
   const cancel = useSamModelStore((s) => s.cancel);
   const restore = useSamModelStore((s) => s.restore);
-  const [url, setUrl] = useState<string>(SUGGESTED_MODEL.url);
+  const [encoderUrl, setEncoderUrl] = useState<string>(SUGGESTED_MODEL.encoderUrl);
+  const [decoderUrl, setDecoderUrl] = useState<string>(SUGGESTED_MODEL.decoderUrl);
 
   // The store is process-wide and boot already restores a cached model, but the
   // dialog can be the first thing to open in a session that skipped boot
@@ -83,9 +86,12 @@ export function ObjectMatteControl(): JSX.Element {
             Remove
           </Button>
         </div>
-        {/* The source, kept and shown: "which model is running on my footage,
+        {/* The sources, kept and shown: "which model is running on my footage,
             and where did it come from" is a fair question to be able to answer. */}
         <div className={styles.source} title={status.sourceUrl}>{status.sourceUrl}</div>
+        {status.decoderUrl ? (
+          <div className={styles.source} title={status.decoderUrl}>{status.decoderUrl}</div>
+        ) : null}
       </div>
     );
   }
@@ -115,25 +121,33 @@ export function ObjectMatteControl(): JSX.Element {
 
   return (
     <div className={styles.root}>
+      <Input
+        size="sm"
+        fullWidth
+        value={encoderUrl}
+        onChange={(e) => setEncoderUrl(e.target.value)}
+        aria-label="Object Matte encoder model URL"
+        spellCheck={false}
+      />
       <div className={styles.installRow}>
         <Input
           size="sm"
           fullWidth
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          aria-label="Object Matte model URL"
+          value={decoderUrl}
+          onChange={(e) => setDecoderUrl(e.target.value)}
+          aria-label="Object Matte decoder model URL"
           spellCheck={false}
         />
-        <Button variant="secondary" size="sm" onClick={() => { void install(url); }}>
+        <Button variant="secondary" size="sm" onClick={() => { void install(encoderUrl, decoderUrl); }}>
           Install
         </Button>
       </div>
       {status.kind === 'failed' ? <div className={styles.error}>{status.message}</div> : null}
       <div className={styles.hint}>
-        Optional. Downloads about {megabytes(SUGGESTED_MODEL.approxBytes)} from the host above, once,
-        and keeps it on this device. Without it the Roto tool still works — this
-        build bundles a neural model, and clicks fall back to the classical matte
-        only when neither is available.
+        Optional. Downloads an encoder/decoder pair — about {megabytes(SUGGESTED_MODEL.approxBytes)} from
+        the hosts above, once — and keeps it on this device. Without it the Roto
+        tool still works — this build bundles a neural model, and clicks fall
+        back to the classical matte only when neither is available.
       </div>
     </div>
   );
