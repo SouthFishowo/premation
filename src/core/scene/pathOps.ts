@@ -17,6 +17,7 @@
  */
 
 import { trimSegments, trimPolyline, type Pt } from './trimPath';
+import { rectOutline } from '@core/geometry/extrudeMesh';
 import type { SceneNode } from '@core/types';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { bumpScene } from '@stores/sceneStore';
@@ -459,6 +460,17 @@ const DEG = Math.PI / 180;
  * A shape's outline as a closed polyline in local space (centred at 0,0).
  * `subdivide` inserts extra points along rect edges (0 = plain corners) so
  * pucker/twist deform smoothly rather than just moving the four corners.
+ *
+ * `cornerRadii` (uniform, or per-corner TL→TR→BR→BL) rounds a rect's corners
+ * INTO the polyline. The chain's output is drawn verbatim as a path, so a
+ * rounded rect whose seed came out sharp stayed sharp for good — the radii
+ * fields have no meaning once the primitive is gone.
+ *
+ * `cornerAxisScale` is `RenderLayer.cornerRadiusScale`: the |scaleX|,|scaleY|
+ * the compositor will draw this geometry at. The radii are authored in
+ * COMPOSITION pixels (see `roundRect` in vectorDraw), so the outline is built
+ * in comp space and mapped back — which makes the corner an ellipse HERE that
+ * comes out a circle THERE, exactly as the no-operator raster draws it.
  */
 export function shapeOutline(
   primitive: string | undefined,
@@ -466,6 +478,8 @@ export function shapeOutline(
   h: number,
   ellipseSteps = 48,
   subdivide = 0,
+  cornerRadii?: number | readonly [number, number, number, number],
+  cornerAxisScale?: readonly [number, number],
 ): Pt[] {
   if (primitive === 'ellipse') {
     const pts: Pt[] = [];
@@ -474,6 +488,37 @@ export function shapeOutline(
       pts.push({ x: Math.cos(a) * (w / 2), y: Math.sin(a) * (h / 2) });
     }
     return pts;
+  }
+  const rr = typeof cornerRadii === 'number'
+    ? ([cornerRadii, cornerRadii, cornerRadii, cornerRadii] as const)
+    : cornerRadii;
+  if (rr && (rr[0] > 0 || rr[1] > 0 || rr[2] > 0 || rr[3] > 0)) {
+    // A degenerate scale falls back to 1 rather than dividing by zero — the
+    // same guard `roundRect` applies to the same pair.
+    const kx = cornerAxisScale && cornerAxisScale[0] > 1e-6 ? cornerAxisScale[0] : 1;
+    const ky = cornerAxisScale && cornerAxisScale[1] > 1e-6 ? cornerAxisScale[1] : 1;
+    // Reuse the extrusion pipeline's exact rounded-rect polygon (per-corner
+    // radii + clamping) rather than flattening a rounded rect a third way.
+    // 12 segments per 90° arc matches the ellipse default's 48 per circle.
+    const ring = rectOutline(w * kx, h * ky, rr, 12)[0]!;
+    const pts: Pt[] = [];
+    for (const p of ring.points) {
+      const q = { x: p.x / kx, y: p.y / ky };
+      const prev = pts[pts.length - 1];
+      // Full-radius corners (a capsule, a squircle at the clamp) meet at a
+      // shared arc endpoint; downstream operators divide by segment length.
+      if (!prev || Math.hypot(q.x - prev.x, q.y - prev.y) > 1e-6) pts.push(q);
+    }
+    if (pts.length > 1) {
+      const first = pts[0]!;
+      const last = pts[pts.length - 1]!;
+      if (Math.hypot(first.x - last.x, first.y - last.y) <= 1e-6) pts.pop();
+    }
+    if (subdivide <= 0) return pts;
+    // The arcs are already dense; it is the straight edges between them that
+    // would starve pucker/twist. Same budget as the sharp rect: `subdivide`
+    // extra points across a full edge, applied here as a max segment length.
+    return densifyClosed(pts, Math.max(w, h) / (subdivide + 1));
   }
   const corners: Pt[] = [
     { x: -w / 2, y: -h / 2 },
@@ -488,6 +533,22 @@ export function shapeOutline(
     const b = corners[(i + 1) % corners.length]!;
     for (let s = 0; s < subdivide + 1; s++) {
       const t = s / (subdivide + 1);
+      out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+    }
+  }
+  return out;
+}
+
+/** Split any segment of a closed ring longer than `maxLen` into equal pieces. */
+function densifyClosed(pts: readonly Pt[], maxLen: number): Pt[] {
+  if (!(maxLen > 0)) return [...pts];
+  const out: Pt[] = [];
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i]!;
+    const b = pts[(i + 1) % pts.length]!;
+    const n = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / maxLen));
+    for (let s = 0; s < n; s++) {
+      const t = s / n;
       out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
     }
   }
