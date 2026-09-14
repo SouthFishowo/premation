@@ -12,12 +12,16 @@ import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { flattenComposition, readNodeKind } from '@core/scene/sceneDerive';
 import { activeCompRootId } from '@core/scene/activeComp';
 import { is3DEnabled } from '@core/scene/threeD';
-import { defaultFocalLength, viewCameraNode } from '@core/scene/camera3d';
+import { cameraFromNode, defaultFocalLength, viewCameraNode } from '@core/scene/camera3d';
 import { isSceneCameraView, orthoViewOf, type CameraViewMode } from '@core/scene/cameraViewMode';
+import { nodeWorldWithParents3d } from '@core/scene/liveWorld3d';
+import { readGeometry } from '@core/workspace/geometry';
 import { applyNodePropsKeyframed } from '@core/workspace/ports';
 import { bumpScene } from '@stores/sceneStore';
-import { useGuidesStore, type Camera3dMode } from '@stores/guidesStore';
-import type { Camera3D, OrthoView } from '@motion/scene';
+import { useGuidesStore, type Camera3dMode, type CameraOrbitPivot } from '@stores/guidesStore';
+import { useCompositionStore } from '@stores/compositionStore';
+import { getTime } from '@stores/playbackClockStore';
+import { Matrix4Math, Project3D, type Camera3D, type OrthoView, type Vec3 } from '@motion/scene';
 import { getWorkspaceController } from '@core/workspace/WorkspaceController';
 import {
   customViewCamera,
@@ -34,8 +38,23 @@ import {
 /** The three camera navigation modes (AE: Orbit / Track XY / Track Z). */
 export type CameraNavMode = 'orbit' | 'pan' | 'dolly';
 
-/** The camera-tool cycle order for the C key: orbit → pan → dolly → orbit. */
-export const CAMERA_TOOL_CYCLE: readonly CameraNavMode[] = ['orbit', 'pan', 'dolly'];
+/**
+ * The camera-tool cycle order for the C key (see guidesStore.cycleCameraTool):
+ * unified → orbit → pan → dolly → unified. 'unified' is AE's Unified Camera —
+ * one armed tool where the mouse BUTTON picks the mode (left = orbit,
+ * middle = pan, right = dolly); {@link unifiedNavModeFor} is that mapping.
+ */
+export const CAMERA_TOOL_CYCLE: ReadonlyArray<'unified' | CameraNavMode> =
+  ['unified', 'orbit', 'pan', 'dolly'];
+
+/**
+ * The Unified Camera tool's button → gesture mapping (AE: left orbits, middle
+ * tracks XY, right tracks Z). `button` is PointerEvent.button; anything else
+ * (back/forward buttons) is not a camera gesture.
+ */
+export function unifiedNavModeFor(button: number): CameraNavMode | null {
+  return button === 0 ? 'orbit' : button === 1 ? 'pan' : button === 2 ? 'dolly' : null;
+}
 
 export interface CameraNavTarget {
   nodeId: string;
@@ -128,6 +147,207 @@ export function orbitCameraBy(nav: CameraNavTarget, dx: number, dy: number): voi
   const pitch = Math.max(-89, Math.min(89, (readCamProp(nav.nodeId, 'orbitPitch') ?? 0) + dy * 0.4));
   writeCamProps(nav, { orbitYaw: yaw, orbitPitch: pitch });
   bumpScene();
+}
+
+// ── Orbit about an arbitrary world pivot (AE's Orbit Around Cursor / Scene) ──
+
+const DEGR = Math.PI / 180;
+const v3 = (x: number, y: number, z: number): Vec3 => ({ x, y, z });
+const sub3 = (a: Vec3, b: Vec3): Vec3 => v3(a.x - b.x, a.y - b.y, a.z - b.z);
+const add3 = (a: Vec3, b: Vec3): Vec3 => v3(a.x + b.x, a.y + b.y, a.z + b.z);
+
+/** Rx(pitch) then Ry(yaw) — the same axis order `Project3D.orbitCamera` uses,
+ *  so an incremental pivot orbit and the POI orbit turn the same way. */
+function rotYawPitch(v: Vec3, yawDeg: number, pitchDeg: number): Vec3 {
+  const cx = Math.cos(pitchDeg * DEGR);
+  const sx = Math.sin(pitchDeg * DEGR);
+  const y1 = cx * v.y - sx * v.z;
+  const z1 = sx * v.y + cx * v.z;
+  const cy = Math.cos(yawDeg * DEGR);
+  const sy = Math.sin(yawDeg * DEGR);
+  return v3(cy * v.x + sy * z1, y1, -sy * v.x + cy * z1);
+}
+
+/** Inverse of {@link rotYawPitch}: Ry(−yaw) then Rx(−pitch). */
+function rotYawPitchInv(v: Vec3, yawDeg: number, pitchDeg: number): Vec3 {
+  const cy = Math.cos(yawDeg * DEGR);
+  const sy = Math.sin(yawDeg * DEGR);
+  const x1 = cy * v.x - sy * v.z;
+  const z1 = sy * v.x + cy * v.z;
+  const cx = Math.cos(pitchDeg * DEGR);
+  const sx = Math.sin(pitchDeg * DEGR);
+  return v3(x1, cx * v.y + sx * z1, -sx * v.y + cx * z1);
+}
+
+/**
+ * Orbit the WHOLE camera rig rigidly about `pivot` — the cursor point or the
+ * scene origin, not the camera's own target.
+ *
+ * The existing orbit props cannot express this (orbitYaw/orbitPitch always
+ * pivot on the POI / comp centre), so the rotation is folded back into the
+ * props the camera model already has:
+ *
+ *  - **Two-node camera** — the eye AND the Point of Interest rotate about the
+ *    pivot (a rigid move, so the shot keeps framing its subject while the rig
+ *    swings around the pivot). orbitYaw/orbitPitch stay untouched; the BASE
+ *    position is solved so the resolved eye lands where the rigid rotation
+ *    put it. The pivot itself is never written into the POI — orbiting around
+ *    the cursor must not re-target the camera.
+ *  - **One-node camera** — the eye rotates about the pivot and the in-place
+ *    aim follows by ADDING the deltas to orbitYaw/orbitPitch (additive Euler,
+ *    exactly how the POI orbit composes drags); the base position is solved
+ *    back through the new angles so the resolved eye is the rotated one.
+ *
+ * One `writeCamProps` call per drag tick = one undo entry per gesture, the
+ * same contract every other nav write keeps.
+ */
+export function orbitCameraAboutPivot(
+  nav: CameraNavTarget,
+  dx: number,
+  dy: number,
+  pivot: Vec3,
+  compWidth: number,
+  compHeight: number,
+): void {
+  const dYaw = dx * 0.4;
+  const focal = readCamProp(nav.nodeId, 'focalLength') ?? defaultFocalLength(compWidth || 1920);
+  const base = v3(
+    readCamProp(nav.nodeId, 'x') ?? compWidth / 2,
+    readCamProp(nav.nodeId, 'y') ?? compHeight / 2,
+    readCamProp(nav.nodeId, 'z') ?? -focal,
+  );
+  const yaw = readCamProp(nav.nodeId, 'orbitYaw') ?? 0;
+  const pitch = readCamProp(nav.nodeId, 'orbitPitch') ?? 0;
+  const poiX = readCamProp(nav.nodeId, 'poiX');
+  const poiY = readCamProp(nav.nodeId, 'poiY');
+  const poiZ = readCamProp(nav.nodeId, 'poiZ');
+  const hasPOI = poiX !== undefined || poiY !== undefined || poiZ !== undefined;
+
+  if (hasPOI) {
+    const poi = v3(poiX ?? compWidth / 2, poiY ?? compHeight / 2, poiZ ?? 0);
+    const eye = Project3D.orbitCamera(base, poi, yaw, pitch).position;
+    const dPitch = dy * 0.4;
+    const eye2 = add3(pivot, rotYawPitch(sub3(eye, pivot), dYaw, dPitch));
+    const poi2 = add3(pivot, rotYawPitch(sub3(poi, pivot), dYaw, dPitch));
+    const base2 = add3(poi2, rotYawPitchInv(sub3(eye2, poi2), yaw, pitch));
+    writeCamProps(nav, {
+      x: base2.x, y: base2.y, z: base2.z,
+      poiX: poi2.x, poiY: poi2.y, poiZ: poi2.z,
+    });
+  } else {
+    const centre = v3(compWidth / 2, compHeight / 2, 0);
+    const eye = Project3D.orbitCamera(base, centre, yaw, pitch).position;
+    const newYaw = yaw + dYaw;
+    // The same ±89° pitch clamp as the POI orbit; the rigid rotation applies
+    // only the pitch that survived the clamp, so eye and aim stay in step.
+    const newPitch = Math.max(-89, Math.min(89, pitch + dy * 0.4));
+    const dPitch = newPitch - pitch;
+    const eye2 = add3(pivot, rotYawPitch(sub3(eye, pivot), dYaw, dPitch));
+    const base2 = add3(centre, rotYawPitchInv(sub3(eye2, centre), newYaw, newPitch));
+    writeCamProps(nav, {
+      x: base2.x, y: base2.y, z: base2.z,
+      orbitYaw: newYaw, orbitPitch: newPitch,
+    });
+  }
+  bumpScene();
+}
+
+/**
+ * The world-space pivot the CURRENT orbit-pivot mode asks for, resolved at
+ * DRAG START (the pivot must not slide mid-gesture), or null when the drag
+ * should use the classic POI orbit ('poi' mode, and every non-scene target).
+ *
+ * `cursor` is the pointer in COMP px (`ws.screenToWorld` of the pointer).
+ * Cursor mode projects it into the scene:
+ *
+ *  1. the plane of the FRONTMOST 3D layer under the cursor (nearest ray hit
+ *     whose intersection lands inside the layer's box), else
+ *  2. the ground plane (y = compHeight + groundLevel — where the 3D ground
+ *     grid actually draws; the comp's floor, not the top edge), else
+ *  3. the POI-distance plane facing the camera, so empty space still orbits
+ *     at a sensible depth.
+ */
+export function resolveOrbitPivot(
+  cursor: { x: number; y: number } | null,
+  compWidth: number,
+  compHeight: number,
+  mode: CameraOrbitPivot = useGuidesStore.getState().cameraOrbitPivot,
+): Vec3 | null {
+  if (mode === 'poi') return null;
+  if (mode === 'scene') return v3(0, 0, 0);
+  if (!cursor) return null;
+
+  const rootId = activeCompRootId();
+  const view = useGuidesStore.getState().camera3dMode;
+  const camNode = viewCameraNode(defaultSceneGraph, view, rootId);
+  const cam = camNode
+    ? cameraFromNode(camNode, compWidth, compHeight)
+    : Project3D.defaultCamera(compWidth, compHeight);
+  const ray = Project3D.unprojectScreenRay(cursor.x, cursor.y, cam, null, compWidth, compHeight);
+  const rayT = (p: Vec3): number =>
+    (p.x - ray.origin.x) * ray.direction.x
+    + (p.y - ray.origin.y) * ray.direction.y
+    + (p.z - ray.origin.z) * ray.direction.z;
+
+  // 1) Frontmost 3D layer plane under the cursor.
+  const time = getTime();
+  let best: { t: number; p: Vec3 } | null = null;
+  for (const n of flattenComposition(defaultSceneGraph, rootId)) {
+    const kind = readNodeKind(n);
+    if (kind === 'camera' || kind === 'light') continue;
+    if (n.visible === false || !is3DEnabled(n)) continue;
+    const g = readGeometry(n);
+    if (!g || !(g.width > 0) || !(g.height > 0)) continue;
+    const m = nodeWorldWithParents3d(n, time);
+    if (!m) continue;
+    const origin = Matrix4Math.transformPoint(m, v3(0, 0, 0));
+    const zTip = Matrix4Math.transformPoint(m, v3(0, 0, 1));
+    const hit = Project3D.intersectRayPlane(ray, origin, sub3(zTip, origin));
+    if (!hit) continue;
+    const inv = Matrix4Math.invert(m);
+    if (!inv) continue;
+    const local = Matrix4Math.transformPoint(inv, hit);
+    if (local.x < 0 || local.x > g.width || local.y < 0 || local.y > g.height) continue;
+    const t = rayT(hit);
+    if (t <= 0) continue;
+    if (!best || t < best.t) best = { t, p: hit };
+  }
+  if (best) return best.p;
+
+  // 2) The ground plane, where the 3D ground grid draws.
+  const groundLevel = useCompositionStore.getState().groundLevel ?? 0;
+  const ground = Project3D.intersectRayPlane(
+    ray, v3(0, compHeight + groundLevel, 0), v3(0, 1, 0),
+  );
+  if (ground && rayT(ground) > 0) return ground;
+
+  // 3) The POI-distance plane facing the camera.
+  const dist = poiDistanceOf(camNode?.id ?? null, cam, compWidth, compHeight);
+  const fwd = Project3D.unprojectScreenRay(compWidth / 2, compHeight / 2, cam, null, compWidth, compHeight).direction;
+  const planePoint = add3(cam.position, v3(fwd.x * dist, fwd.y * dist, fwd.z * dist));
+  const facing = Project3D.intersectRayPlane(ray, planePoint, fwd);
+  return facing && rayT(facing) > 0 ? facing : planePoint;
+}
+
+/** Eye → POI distance for a two-node camera; the focal length otherwise (the
+ *  comp-plane distance a fresh camera sits at). */
+function poiDistanceOf(
+  nodeId: string | null,
+  cam: Camera3D,
+  compWidth: number,
+  compHeight: number,
+): number {
+  if (nodeId) {
+    const px = readCamProp(nodeId, 'poiX');
+    const py = readCamProp(nodeId, 'poiY');
+    const pz = readCamProp(nodeId, 'poiZ');
+    if (px !== undefined || py !== undefined || pz !== undefined) {
+      const poi = v3(px ?? compWidth / 2, py ?? compHeight / 2, pz ?? 0);
+      const d = Math.hypot(poi.x - cam.position.x, poi.y - cam.position.y, poi.z - cam.position.z);
+      if (d > 1e-3) return d;
+    }
+  }
+  return Math.max(1, cam.focalLength);
 }
 
 /**
@@ -270,9 +490,21 @@ function readView(viewId: CustomViewId) {
  */
 const ORTHO_ORBIT_PROMOTES_TO: CustomViewId = 'custom1';
 
-/** Orbit through the mode-aware target (0.4°/px on every path). */
-export function orbitNavBy(t: NavTarget, dx: number, dy: number): void {
+/**
+ * Orbit through the mode-aware target (0.4°/px on every path).
+ *
+ * `pivot` (from {@link resolveOrbitPivot}, captured at DRAG START) swings a
+ * SCENE camera about that world point instead of its POI. View targets ignore
+ * it on purpose: an orthographic/custom view keeps its existing
+ * promote-to-custom-view orbit, exactly as before.
+ */
+export function orbitNavBy(t: NavTarget, dx: number, dy: number, pivot?: Vec3 | null): void {
   if (t.kind === 'scene') {
+    if (pivot) {
+      const comp = useCompositionStore.getState();
+      orbitCameraAboutPivot(t, dx, dy, pivot, comp.width, comp.height);
+      return;
+    }
     orbitCameraBy(t, dx, dy);
     return;
   }

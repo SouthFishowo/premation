@@ -15,6 +15,7 @@ export type {
   Keyframe,
   PropertyTrack,
   SceneValueSnapshot,
+  SpatialInterp,
 } from './types';
 
 // ── Interpolation / sampling ──────────────────────────────────────
@@ -22,6 +23,7 @@ export {
   cubicBezierEase, ease, sampleTrack, upsertKeyframe,
   sampleSpeed, applyRoving, applyRovingSpatial,
   cubicValueAt, smoothTrackTangents, clearTrackTangents,
+  autoSpatialTangents, effectiveSpatialTangents,
   EASY_EASE_BEZIER, EASY_EASE_OUT_BEZIER, EASY_EASE_IN_BEZIER,
 } from './interpolate';
 
@@ -45,6 +47,30 @@ export type {
   ExprMarker,
   ExprMarkerData,
 } from './expressions';
+
+// ── Source Text expressions (AE `text.sourceText` + the AE 25 style API) ──
+export {
+  SOURCE_TEXT_PROP,
+  MAX_SOURCE_TEXT_LENGTH,
+  MAX_RANGE_OVERRIDES,
+  makeSourceTextValue,
+  coerceSourceTextResult,
+  resolveSourceTextStyle,
+  sampleAfterResult,
+  cssToRgb01,
+  rgb01ToCss,
+  splitSourceGraphemes,
+} from './sourceText';
+export type {
+  SourceTextStyle,
+  SourceTextRun,
+  SourceTextRunStyle,
+  SourceTextSample,
+  SourceTextStyleOverrides,
+  SourceTextRangeKey,
+  SourceTextRangeOverride,
+  SourceTextExpressionResult,
+} from './sourceText';
 
 // The raw parser/evaluator, for callers that need their own scope rather than
 // the property-expression one (text expression SELECTORS see `textIndex` /
@@ -82,4 +108,5 @@ export type {
   LayerResolver,
   BaseValueProvider,
   MarkerProvider,
+  SourceTextProvider,
 } from './AnimationEngine';

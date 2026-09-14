@@ -18,6 +18,7 @@ import {
   expandKeyframeProp,
   type EasingKind,
   type BezierHandles,
+  type SpatialInterp,
 } from '@motion/animation';
 import { useSelectionStore } from '@stores/selectionStore';
 import { useKeyframeSelectionStore } from '@stores/keyframeSelectionStore';
@@ -175,6 +176,7 @@ interface ClipboardState {
     /** Spatial motion-path tangents (value-space offsets). */
     si?: number;
     so?: number;
+    spatialInterp?: SpatialInterp;
     continuous?: boolean;
     roving?: boolean;
   }> | null;
@@ -219,6 +221,7 @@ export function copySelection(): void {
           bezier: kf.bezier,
           si: kf.si,
           so: kf.so,
+          spatialInterp: kf.spatialInterp,
           continuous: kf.continuous,
           roving: kf.roving,
         });
@@ -335,6 +338,9 @@ export async function pasteSelection(): Promise<PasteResult> {
           }
           if (kf.si !== undefined || kf.so !== undefined) {
             defaultAnimation.setSpatialTangent(layerId, kf.prop, layerT, { si: kf.si, so: kf.so });
+          }
+          if (kf.spatialInterp !== undefined) {
+            defaultAnimation.setSpatialInterp(layerId, kf.prop, layerT, kf.spatialInterp);
           }
           if (kf.continuous !== undefined || kf.roving !== undefined) {
             defaultAnimation.updateKeyframe(layerId, kf.prop, layerT, {

@@ -185,6 +185,9 @@ export interface PropertyRowProps {
    * editor. Spans every grid column so it aligns with the row above it.
    */
   below?: ReactNode;
+  /** Focus entering / leaving the row — lets a shortcut act on "the focused property". */
+  onFocusCapture?: (e: React.FocusEvent<HTMLDivElement>) => void;
+  onBlurCapture?: (e: React.FocusEvent<HTMLDivElement>) => void;
 }
 
 /**
@@ -214,12 +217,16 @@ export function PropertyRow({
   error,
   trailing,
   below,
+  onFocusCapture,
+  onBlurCapture,
 }: PropertyRowProps): JSX.Element {
   const a11yLabel = srLabel ?? label;
   return (
     <div
       className={cn(styles.row, compact && styles.compact, below !== undefined && styles.withBelow, className)}
       onContextMenu={onContextMenu}
+      onFocusCapture={onFocusCapture}
+      onBlurCapture={onBlurCapture}
       style={depth > 0 ? { paddingLeft: depth * 16 } : undefined}
       data-property-row
       data-mixed={mixed || undefined}

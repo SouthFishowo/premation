@@ -50,7 +50,24 @@ export interface Keyframe {
    */
   si?: number;
   so?: number;
+  /**
+   * Spatial interpolation MODE of this keyframe's vertex on a motion path
+   * (After Effects' Keyframe Interpolation ▸ Spatial Interpolation). Absent =
+   * legacy behaviour: `si`/`so` are used exactly as stored.
+   *
+   *  • `linear`     — the vertex is a corner: stored `si`/`so` are IGNORED, so
+   *                   both adjacent segments leave/arrive straight.
+   *  • `auto`       — Auto Bezier: tangents are COMPUTED from the neighbours
+   *                   at sample time (Catmull-Rom), so the path stays smooth
+   *                   when a neighbour moves. Stored `si`/`so` are ignored.
+   *  • `continuous` — Continuous Bezier: stored tangents, kept collinear.
+   *  • `bezier`     — Bezier: stored tangents, broken (independent).
+   */
+  spatialInterp?: SpatialInterp;
 }
+
+/** AE spatial interpolation modes — see `Keyframe.spatialInterp`. */
+export type SpatialInterp = 'linear' | 'bezier' | 'continuous' | 'auto';
 
 export interface PropertyTrack {
   nodeId: string;

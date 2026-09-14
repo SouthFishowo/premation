@@ -1,4 +1,4 @@
-import { readNodeQuality, setNodeQuality, getNodeQuality, toggleNodeQuality } from './layerQuality';
+import { readNodeQuality, setNodeQuality, getNodeQuality, toggleNodeQuality, nextQuality } from './layerQuality';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import type { SceneNode } from '@core/types';
 
@@ -30,6 +30,15 @@ describe('layer quality', () => {
     expect(getNodeQuality('a')).toBe('draft');
     setNodeQuality('a', 'best');
     expect(getNodeQuality('a')).toBe('best');
+  });
+
+  it('round-trips wireframe, and the switch cycle is Best → Draft → Wireframe → Best', () => {
+    addNode('a');
+    setNodeQuality('a', 'wireframe');
+    expect(getNodeQuality('a')).toBe('wireframe');
+    expect(nextQuality('best')).toBe('draft');
+    expect(nextQuality('draft')).toBe('wireframe');
+    expect(nextQuality('wireframe')).toBe('best');
   });
 
   it('toggles', () => {

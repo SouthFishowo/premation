@@ -46,6 +46,7 @@ import {
   setNodeHeightMap,
   setNodeDisplacement,
   setNodeDisplacementSubdivisions,
+  setNodeIor,
   MATERIAL_PCT_DEFAULTS,
   type MaterialParams,
 } from '@core/scene/material';
@@ -83,8 +84,10 @@ function hexToRgb(hex: string): [number, number, number] {
 
 const clamp255 = (v: number): number => Math.max(0, Math.min(255, Math.round(v)));
 
-function shade(rgb: readonly [number, number, number], k: number): string {
-  return `rgb(${clamp255(rgb[0] * k)}, ${clamp255(rgb[1] * k)}, ${clamp255(rgb[2] * k)})`;
+function shade(rgb: readonly [number, number, number], k: number, a = 1): string {
+  return a >= 1
+    ? `rgb(${clamp255(rgb[0] * k)}, ${clamp255(rgb[1] * k)}, ${clamp255(rgb[2] * k)})`
+    : `rgba(${clamp255(rgb[0] * k)}, ${clamp255(rgb[1] * k)}, ${clamp255(rgb[2] * k)}, ${a.toFixed(3)})`;
 }
 
 /**
@@ -120,6 +123,23 @@ export function materialSphereCss(p: MaterialParams, baseColor: string): string 
   ];
   const highlight = `radial-gradient(circle at 34% 27%, rgba(${clamp255(hi[0])}, ${clamp255(hi[1])}, ${clamp255(hi[2])}, ${specA.toFixed(2)}) 0%, rgba(${clamp255(hi[0])}, ${clamp255(hi[1])}, ${clamp255(hi[2])}, 0) ${hotspot.toFixed(0)}%)`;
 
+  // Advanced-3D axes, previewed coarsely (the renderer is the truth):
+  //  • an environment "sheen" streak — Reflection Intensity is its opacity,
+  //    Sharpness tightens it, Rolloff slides it toward the rim. Toon never
+  //    reflects (the shader excludes it), so the streak is absent there.
+  //  • Transparency fades the body ramp; its Rolloff eases the fade, standing
+  //    in for the facing-transmits-more Fresnel the shader applies for real.
+  const reflI = p.reflectionIntensity / 100;
+  const reflSharp = p.reflectionSharpness / 100;
+  const reflRoll = p.reflectionRolloff / 100;
+  const sheenA = p.shading === 'toon' ? 0 : 0.16 * reflI * (1 - rough * (1 - reflSharp));
+  const sheenAt = 62 + reflRoll * 22;
+  const sheenSpan = 9 + (1 - reflSharp) * 15;
+  const sheen = sheenA > 0.001
+    ? `radial-gradient(circle at ${sheenAt.toFixed(0)}% 38%, rgba(255, 255, 255, ${sheenA.toFixed(3)}) 0%, rgba(255, 255, 255, 0) ${sheenSpan.toFixed(0)}%), `
+    : '';
+  const bodyA = 1 - 0.65 * (p.transparency / 100) * (1 - 0.35 * (p.transparencyRolloff / 100));
+
   let body: string;
   if (p.shading === 'toon') {
     const bands = Math.max(2, Math.min(8, Math.round(p.toonBands)));
@@ -128,13 +148,13 @@ export function materialSphereCss(p: MaterialParams, baseColor: string): string 
       const k = litK - (litK - ambientK) * (i / (bands - 1));
       const from = (i / bands) * 100;
       const to = ((i + 1) / bands) * 100;
-      stops.push(`${shade(rgb, k)} ${from.toFixed(1)}% ${to.toFixed(1)}%`);
+      stops.push(`${shade(rgb, k, bodyA)} ${from.toFixed(1)}% ${to.toFixed(1)}%`);
     }
     body = `radial-gradient(circle at 36% 30%, ${stops.join(', ')})`;
   } else {
-    body = `radial-gradient(circle at 36% 30%, ${shade(rgb, litK)} 0%, ${shade(rgb, (litK + ambientK) / 2)} 55%, ${shade(rgb, ambientK)} 100%)`;
+    body = `radial-gradient(circle at 36% 30%, ${shade(rgb, litK, bodyA)} 0%, ${shade(rgb, (litK + ambientK) / 2, bodyA)} 55%, ${shade(rgb, ambientK, bodyA)} 100%)`;
   }
-  return `${highlight}, ${body}`;
+  return `${sheen}${highlight}, ${body}`;
 }
 
 /** The layer's own fill — the colour the preview and the shader both start from. */
@@ -161,6 +181,7 @@ function MaterialRow({
   value,
   min = 0,
   max = 100,
+  step = 1,
   unit = '%',
   onChange,
 }: {
@@ -168,6 +189,7 @@ function MaterialRow({
   value: number;
   min?: number;
   max?: number;
+  step?: number;
   unit?: string;
   onChange: (v: number) => void;
 }): JSX.Element {
@@ -179,7 +201,7 @@ function MaterialRow({
         className={s.slider}
         min={min}
         max={max}
-        step={1}
+        step={step}
         value={value}
         onChange={(e) => onChange(Number(e.currentTarget.value))}
         aria-label={`${label} slider`}
@@ -189,7 +211,7 @@ function MaterialRow({
           value={value}
           min={min}
           max={max}
-          step={1}
+          step={step}
           unit={unit}
           onChange={onChange}
           aria-label={label}
@@ -497,6 +519,77 @@ export function MaterialSection({ nodeId }: { nodeId: string }): JSX.Element | n
       {material.shading === 'toon' && material.specular === 0 && (
         <p className={s.hint}>
           Metal tints the specular highlight — raise Specular to see it.
+        </p>
+      )}
+
+      <div className={s.divider} />
+
+      {/* ── Reflections (AE Advanced 3D, scoped honestly) ────────── */}
+      {/* These act on ENVIRONMENT reflections — the IBL specular term the
+          comp's environment light provides. There is no layer-to-layer
+          reflection pass, which is also why AE's fourth axis (Appears in
+          Reflections) has no control here: a switch that changes no pixel
+          is worse than no switch. */}
+      <span className={s.groupHeader}>Reflections</span>
+      {material.shading === 'toon' ? (
+        <p className={s.hint}>
+          Toon shading never reflects — a mirrored room in the highlight would
+          undo the cel banding. Switch to Phong or Physical to use these.
+        </p>
+      ) : (
+        <>
+          <MaterialRow
+            label="Reflection Intensity"
+            value={material.reflectionIntensity}
+            onChange={(v) => setNodeMaterialPct(nodeId, 'reflectionIntensity', v, MATERIAL_PCT_DEFAULTS.reflectionIntensity)}
+          />
+          <MaterialRow
+            label="Reflection Sharpness"
+            value={material.reflectionSharpness}
+            onChange={(v) => setNodeMaterialPct(nodeId, 'reflectionSharpness', v, MATERIAL_PCT_DEFAULTS.reflectionSharpness)}
+          />
+          <MaterialRow
+            label="Reflection Rolloff"
+            value={material.reflectionRolloff}
+            onChange={(v) => setNodeMaterialPct(nodeId, 'reflectionRolloff', v, MATERIAL_PCT_DEFAULTS.reflectionRolloff)}
+          />
+          <p className={s.hint}>
+            Reflections mirror the comp&rsquo;s Environment light — add one to see
+            them. Like Specular, they render on lit surfaces (Accepts Lights on).
+          </p>
+        </>
+      )}
+
+      <div className={s.divider} />
+
+      {/* ── Transparency (AE Advanced 3D) ────────────────────────── */}
+      {/* View-dependent alpha at the shading stage — distinct from Opacity
+          because Rolloff makes it angle-dependent (glass). No refraction is
+          rendered; IOR only shapes the Fresnel falloff. */}
+      <span className={s.groupHeader}>Transparency</span>
+      <MaterialRow
+        label="Transparency"
+        value={material.transparency}
+        onChange={(v) => setNodeMaterialPct(nodeId, 'transparency', v, MATERIAL_PCT_DEFAULTS.transparency)}
+      />
+      <MaterialRow
+        label="Transparency Rolloff"
+        value={material.transparencyRolloff}
+        onChange={(v) => setNodeMaterialPct(nodeId, 'transparencyRolloff', v, MATERIAL_PCT_DEFAULTS.transparencyRolloff)}
+      />
+      <MaterialRow
+        label="Index of Refraction"
+        value={material.ior}
+        min={1}
+        max={4}
+        step={0.01}
+        unit=""
+        onChange={(v) => setNodeIor(nodeId, v)}
+      />
+      {material.transparency > 0 && !material.acceptsLights && (
+        <p className={s.hint}>
+          Transparency applies at the shading stage — turn Accepts Lights on
+          (with at least one light in the comp) for it to render.
         </p>
       )}
 

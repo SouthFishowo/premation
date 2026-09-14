@@ -274,7 +274,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
    * now scrolls rather than truncates, so this is a starting point, not a
    * floor.
    */
-  timelineHeaderWidth: 796,
+  timelineHeaderWidth: 874,
   retainOriginalSvg: true,
   idleCacheWorkArea: true,
   // The previous hardcoded budget, so nobody's cache changes size by upgrading.

@@ -145,6 +145,10 @@ export default tseslint.config(
       'build/**',
       'node_modules/**',
       'coverage/**',
+      // Downloaded model runtimes (ONNX Runtime wasm glue for Object Matte).
+      // Gitignored like dist/, fetched at setup — vendored code, not source;
+      // one file alone was 119 lint errors on a machine that had downloaded it.
+      'public/models/**',
       '**/*.d.ts',
       'packages/render-tests/**/__snapshots__/**',
       // Agent/editor tool harnesses and vendored browser scripts — not project

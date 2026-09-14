@@ -345,3 +345,75 @@ describe('a fill stack', () => {
     expect(stack[0]?.stops.find((s) => s.id === 'b')?.offset).toBe(1);
   });
 });
+
+// ── A text layer's stroke gradient ───────────────────────────────────
+
+describe('a text stroke gradient', () => {
+  /** The layer gains a Text component carrying a horizontal red→blue stroke ramp. */
+  function withStrokeGradient(): void {
+    // Re-added through the graph: the node `getNode` hands back is not the
+    // stored one, so mutating it would add nothing.
+    const node = shapeNode(ID);
+    try { defaultSceneGraph.removeNode(ID); } catch { /* fresh */ }
+    node.components.push({
+      id: `${ID}_text`,
+      type: 'Text',
+      props: {
+        text: 'Hi',
+        strokePaint: {
+          type: 'linear',
+          angle: 0,
+          stops: [
+            { id: 's0', offset: 0, color: '#ff0000' },
+            { id: 's1', offset: 1, color: '#0000ff' },
+          ],
+        },
+      },
+    } as never);
+    defaultSceneGraph.addNode(node);
+  }
+  const strokeOf = () =>
+    defaultSceneGraph.getNode(ID)!.components.find((c) => c.type === 'Text')!.props.strokePaint as LinearFill;
+
+  it('offers a Fill/Stroke chip, and on Stroke a stop drag edits the stroke, not the fill', () => {
+    withStrokeGradient();
+    linearFillOn(ID);
+    useGradientEditStore.getState().arm(ID, 0, 'stroke');
+    const { container } = render(<GradientHandleOverlay />);
+    const chips = container.querySelectorAll('[aria-label="Which paint to edit"] button');
+    expect([...chips].map((b) => [b.textContent, b.getAttribute('aria-pressed')])).toEqual([
+      ['Fill', 'false'],
+      ['Stroke', 'true'],
+    ]);
+
+    const svg = container.querySelector('svg')!;
+    fireEvent.pointerDown(svg, { clientX: 100, clientY: 0, pointerId: 1 });
+    fireEvent.pointerMove(svg, { clientX: 0, clientY: 0, pointerId: 1 });
+    fireEvent.pointerUp(svg, { clientX: 0, clientY: 0, pointerId: 1 });
+
+    expect(strokeOf().stops.find((s) => s.id === 's1')?.offset).toBeCloseTo(0.5);
+    expect(currentStops().map((s) => s.offset)).toEqual([0, 1]);
+
+    fireEvent.click(chips[0]!);
+    expect(useGradientEditStore.getState().target).toBe('fill');
+  });
+
+  it('a grip drag keyframes strokeAngle when that track is live — ONE undo entry, static paint untouched', () => {
+    withStrokeGradient();
+    defaultAnimation.setKeyframe(ID, 'strokeAngle', 0, 0);
+    useGradientEditStore.getState().arm(ID, 0, 'stroke');
+    const { container } = render(<GradientHandleOverlay />);
+    const svg = container.querySelector('svg')!;
+    const before = undoDepth();
+
+    // The end grip stands 15px past the axis end (100, 0).
+    fireEvent.pointerDown(svg, { clientX: 115, clientY: 0, pointerId: 1 });
+    fireEvent.pointerMove(svg, { clientX: 20, clientY: 60, pointerId: 1 });
+    fireEvent.pointerMove(svg, { clientX: 0, clientY: 90, pointerId: 1 });
+    fireEvent.pointerUp(svg, { clientX: 0, clientY: 90, pointerId: 1 });
+
+    expect(defaultAnimation.sample(ID, 'strokeAngle', 0)).toBeCloseTo(90);
+    expect(strokeOf().angle).toBe(0);
+    expect(undoDepth() - before).toBe(1);
+  });
+});

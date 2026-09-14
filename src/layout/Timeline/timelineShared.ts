@@ -66,7 +66,8 @@ export const TL_COLUMN_WIDTHS = {
   rule: 16,
   preInfo: 72,
   name: 190,
-  switches: 178,
+  /** Ten 22px switches + nine 4px gaps — mirrors `--tl-col-switches`. */
+  switches: 256,
   mode: 70,
   matte: 58,
   parent: 120,

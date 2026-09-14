@@ -12,10 +12,16 @@
  *
  * Kerning comes from the canvas (measuring prefixes), not from the font
  * tables, so the outlines land exactly where the rendered glyphs are.
+ *
+ * A VARIABLE face is outlined at the instance the layer draws: its weight as
+ * `wght`, width / slant as `wdth` / `slnt`, and every other `fontAxes` tag
+ * (`axisValuesOf`), or the caller's sampled values when it has them.
  */
 
 import { parseFont, type ParsedFont } from './openType';
+import { registerOpticalOutlineFace } from './opticalKerning';
 import { weightFromStyle } from './fontCatalog';
+import { axisValuesOf } from './fontAxes';
 import type { MeasuredTextStyle, MeasuredText } from './measureText';
 
 interface LocalFontData {
@@ -58,7 +64,10 @@ export async function loadLocalFace(family: string, weight: number, italic: bool
   if (!p) {
     p = (async () => {
       try {
-        return parseFont(await (await best.blob!()).arrayBuffer());
+        const font = parseFont(await (await best.blob!()).arrayBuffer());
+        // Its outlines also serve optical kerning (faces not yet profiled).
+        if (font) registerOpticalOutlineFace(family, weight, italic, font);
+        return font;
       } catch {
         return null;
       }
@@ -79,13 +88,20 @@ export interface OutlineRun {
  * `measure` must be the SAME 2D context configuration the rasteriser uses —
  * the caller sets the font on it. `boxes` positions the block so the result
  * coincides with what is drawn: the draw origin sits at (0, −ink.offsetY).
+ *
+ * `axes` (user-space tag → value) picks a variable face's instance; absent,
+ * the style's own axes are used. A static face ignores both.
  */
 export function outlineRuns(
   style: MeasuredTextStyle,
   _boxes: MeasuredText,
-  font: ParsedFont,
+  parsed: ParsedFont,
   measure: CanvasRenderingContext2D,
+  axes?: Readonly<Record<string, number>>,
 ): OutlineRun[] {
+  const font = parsed.axes && parsed.axes.length > 0 && parsed.instance
+    ? parsed.instance(axes ?? axisValuesOf(style))
+    : parsed;
   const s = style.fontSize / font.unitsPerEm;
   const lines = style.content.split('\n');
   const n = lines.length;

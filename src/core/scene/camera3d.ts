@@ -393,6 +393,24 @@ export interface DofConfig {
   irisRoundness?: number;
   /** Extra weight on bright taps (specular bloom in the bokeh). 0 = off. */
   highlightGain?: number;
+  /** Iris rotation in degrees — spins the polygon (AE's Iris Rotation).
+   *  Absent/0 keeps the un-rotated iris, so existing shots do not re-grade. */
+  irisRotation?: number;
+  /** Iris aspect ratio (AE's Iris Aspect Ratio): > 1 stretches the bokeh
+   *  horizontally, < 1 vertically (anamorphic ovals). Absent/1 = circular. */
+  irisAspect?: number;
+  /**
+   * Luminance floor (0..1) below which `highlightGain` does not boost a tap
+   * (AE's Highlight Threshold). Absent/0 reproduces the pre-threshold
+   * weighting exactly — the gain then ramps from black, as it always has.
+   */
+  highlightThreshold?: number;
+  /** Extra chroma on gain-boosted highlights (AE's Highlight Saturation).
+   *  0 = off. */
+  highlightSaturation?: number;
+  /** Diffraction fringe (0..1): brightens the rim of the bokeh disk, the way
+   *  a real iris diffracts at its edge (AE's Iris Diffraction Fringe). 0 = off. */
+  diffractionFringe?: number;
 }
 
 /**
@@ -467,13 +485,36 @@ export function dofIrisParams(dof: DofConfig): {
   blades?: number;
   roundness?: number;
   highlightGain?: number;
+  /** Degrees; present only when non-zero (0 is the byte-identical default). */
+  rotationDeg?: number;
+  /** Present only when meaningfully ≠ 1 (1 is the byte-identical default). */
+  aspect?: number;
+  /** 0..1; present only when > 0. */
+  highlightThreshold?: number;
+  /** Present only when > 0. */
+  highlightSaturation?: number;
+  /** 0..1; present only when > 0. */
+  fringe?: number;
 } {
   const blades = dof.irisBlades;
   if (blades === undefined || blades < 3) return {};
+  // The extras appear only at NON-NEUTRAL values, mirroring readNodeDof: the
+  // per-layer blur effect params (and their content hashes) must be identical
+  // to the pre-iris-extras build for every existing scene.
+  const rotation = dof.irisRotation ?? 0;
+  const aspect = Math.max(0.05, Math.min(20, dof.irisAspect ?? 1));
+  const threshold = Math.max(0, Math.min(1, dof.highlightThreshold ?? 0));
+  const saturation = Math.max(0, dof.highlightSaturation ?? 0);
+  const fringe = Math.max(0, Math.min(1, dof.diffractionFringe ?? 0));
   return {
     blades: Math.max(3, Math.min(11, Math.round(blades))),
     roundness: Math.max(0, Math.min(1, dof.irisRoundness ?? 0.65)),
     highlightGain: Math.max(0, dof.highlightGain ?? 0),
+    ...(rotation !== 0 ? { rotationDeg: rotation } : {}),
+    ...(aspect !== 1 ? { aspect } : {}),
+    ...(threshold > 0 ? { highlightThreshold: threshold } : {}),
+    ...(saturation > 0 ? { highlightSaturation: saturation } : {}),
+    ...(fringe > 0 ? { fringe } : {}),
   };
 }
 
@@ -561,6 +602,11 @@ export function readNodeDof(
   let irisBlades: number | undefined;
   let irisRoundness: number | undefined;
   let highlightGain: number | undefined;
+  let irisRotation: number | undefined;
+  let irisAspect: number | undefined;
+  let highlightThreshold: number | undefined;
+  let highlightSaturation: number | undefined;
+  let diffractionFringe: number | undefined;
   for (const c of node.components) {
     const p = c.props as Record<string, unknown>;
     strength = num(p.dofStrength) ?? strength;
@@ -571,6 +617,11 @@ export function readNodeDof(
     irisBlades = num(p.irisBlades) ?? irisBlades;
     irisRoundness = num(p.irisRoundness) ?? irisRoundness;
     highlightGain = num(p.highlightGain) ?? highlightGain;
+    irisRotation = num(p.irisRotation) ?? irisRotation;
+    irisAspect = num(p.irisAspect) ?? irisAspect;
+    highlightThreshold = num(p.highlightThreshold) ?? highlightThreshold;
+    highlightSaturation = num(p.highlightSaturation) ?? highlightSaturation;
+    diffractionFringe = num(p.diffractionFringe) ?? diffractionFringe;
   }
   strength = sample?.(node.id, 'dofStrength') ?? strength;
   focus = sample?.(node.id, 'focusDistance') ?? focus;
@@ -579,6 +630,11 @@ export function readNodeDof(
   irisBlades = sample?.(node.id, 'irisBlades') ?? irisBlades;
   irisRoundness = sample?.(node.id, 'irisRoundness') ?? irisRoundness;
   highlightGain = sample?.(node.id, 'highlightGain') ?? highlightGain;
+  irisRotation = sample?.(node.id, 'irisRotation') ?? irisRotation;
+  irisAspect = sample?.(node.id, 'irisAspect') ?? irisAspect;
+  highlightThreshold = sample?.(node.id, 'highlightThreshold') ?? highlightThreshold;
+  highlightSaturation = sample?.(node.id, 'highlightSaturation') ?? highlightSaturation;
+  diffractionFringe = sample?.(node.id, 'diffractionFringe') ?? diffractionFringe;
   if (!strength || strength <= 0) return null;
   const lens = focal ?? Project3D.defaultCamera(width, height).focalLength;
   return {
@@ -594,6 +650,14 @@ export function readNodeDof(
     ...(irisBlades !== undefined && irisBlades >= 3 ? { irisBlades } : {}),
     ...(irisRoundness !== undefined ? { irisRoundness } : {}),
     ...(highlightGain !== undefined && highlightGain > 0 ? { highlightGain } : {}),
+    // The AE iris extras follow the same rule as fStop: present ONLY at a
+    // non-neutral value, so a camera that never touched them resolves to a
+    // DofConfig identical to the pre-extras build (and renders identically).
+    ...(irisRotation !== undefined && irisRotation !== 0 ? { irisRotation } : {}),
+    ...(irisAspect !== undefined && irisAspect > 0 && irisAspect !== 1 ? { irisAspect } : {}),
+    ...(highlightThreshold !== undefined && highlightThreshold > 0 ? { highlightThreshold } : {}),
+    ...(highlightSaturation !== undefined && highlightSaturation > 0 ? { highlightSaturation } : {}),
+    ...(diffractionFringe !== undefined && diffractionFringe > 0 ? { diffractionFringe } : {}),
   };
 }
 

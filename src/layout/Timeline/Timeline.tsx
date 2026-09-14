@@ -38,6 +38,8 @@ import { collectClipSnapTargets, snapClipTime } from './clipSnap';
 import { collectClipCuts, findClipCutNear, type ClipCut } from './clipCuts';
 import { useTimelineEditModeStore } from './timelineEditMode';
 import { readTransitionDrag, isTransitionDrag } from './transitionPalette';
+import { hasCanvasDrag, readCanvasDrag } from '@core/dnd/canvasDrag';
+import { replaceLayerSourceWithAsset, resolveReplaceTarget } from '@core/scene/replaceSourceDrop';
 import {
   layoutTransitions,
   durationFromEdgeDrag,
@@ -102,6 +104,9 @@ import { AUDIO_WAVEFORM_ROW } from '@core/timeline/propertyTree';
 import { DragHud, type DragHudState } from './DragHudOverlay';
 import { Minimap, Ruler, generateRulerTicks } from './RulerStack';
 import { TrackHeader, PropertyHeader, TrackCategoryHeader } from './TrackHeaderColumn';
+import { canResetProperties, resetProperties, resetTransforms } from '@core/scene/layerTransformOps';
+import { expressionMenuItems } from '@core/animation/expressionCommands';
+import { useCompositionStore } from '@stores/compositionStore';
 import { TrackContent, LaneRow } from './Lanes';
 import { Keyframes } from './KeyframeLayer';
 import { useClipDrag } from './useClipDrag';
@@ -1294,9 +1299,29 @@ function Timeline({
    * rather than rendered — and the strip that lights up is left purely
    * decorative.
    */
+  /** The layer (track) id under a client Y in the lanes, or null. */
+  const lanesTrackIdAt = useCallback(
+    (clientY: number): string | null => {
+      const lanes = lanesRef.current;
+      if (!lanes) return null;
+      const rect = lanes.getBoundingClientRect();
+      const y = clientY - rect.top + lanes.scrollTop - rulerStackHeight - TIMELINE_TOP_PADDING;
+      const row = y >= 0 ? rows[Math.floor(y / trackHeight)] : undefined;
+      return row ? (row.track.id as string) : null;
+    },
+    [rulerStackHeight, trackHeight, rows],
+  );
+
   const onLanesDragOver = useCallback(
     (e: ReactDragEvent<HTMLDivElement>): void => {
-      if (!isTransitionDrag(e.dataTransfer)) return;
+      if (!isTransitionDrag(e.dataTransfer)) {
+        // AE Alt-drag from the Assets panel onto a layer bar: replace source.
+        if (e.altKey && hasCanvasDrag(e)) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'copy';
+        }
+        return;
+      }
       e.preventDefault();
       e.dataTransfer.dropEffect = 'copy';
       setChipDragging(true);
@@ -1312,13 +1337,22 @@ function Timeline({
       const kind = readTransitionDrag(e.dataTransfer);
       setDropCutKey(null);
       setChipDragging(false);
-      if (!kind) return;
+      if (!kind) {
+        // Alt-drop an asset on a layer's lane → replace that layer's source
+        // (transforms, keyframes and effects kept).
+        const payload = e.altKey ? readCanvasDrag(e) : null;
+        if (payload?.kind === 'asset') {
+          e.preventDefault();
+          replaceLayerSourceWithAsset(resolveReplaceTarget(lanesTrackIdAt(e.clientY)), payload.assetId);
+        }
+        return;
+      }
       e.preventDefault();
       const cut = lanesCutAt(e.clientX, e.clientY);
       setTransitionError(cut ? null : 'Drop a transition on a cut — the point where one clip ends and the next begins.');
       if (cut) applyTransition(cut, kind);
     },
-    [lanesCutAt, applyTransition],
+    [lanesCutAt, applyTransition, lanesTrackIdAt],
   );
 
   /** Double-click a cut → the default 12-frame cross dissolve. */
@@ -1778,7 +1812,10 @@ function Timeline({
             {showSwitches && (
               <span className={styles.colHeadAeSwitches} aria-hidden>
                 <span className={styles.colHeadItem}><Icon name="shy" size="sm" title="Shy" /></span>
+                <span className={styles.colHeadItem}><Icon name="star" size="sm" title="Collapse Transformations / Continuous Rasterize" /></span>
+                <span className={styles.colHeadItem}><span className={styles.fxText} title="Quality">/</span></span>
                 <span className={styles.colHeadItem}><span className={styles.fxText} title="Effects">fx</span></span>
+                <span className={styles.colHeadItem}><Icon name="video" size="sm" title="Frame Blending" /></span>
                 <span className={styles.colHeadItem}><Icon name="motion-blur" size="sm" title="Motion Blur" /></span>
                 <span className={styles.colHeadItem}><Icon name="adjustment" size="sm" title="Adjustment Layer" /></span>
                 <span className={styles.colHeadItem}><Icon name="frame" size="sm" title="Guide Layer (not rendered)" /></span>
@@ -1894,6 +1931,12 @@ function Timeline({
                     count={row.count}
                     style={categoryStyle}
                     onToggle={() => toggleCategory(row.track.id, row.categoryKey)}
+                    // AE's Transform group "Reset": keyframes off, defaults back.
+                    onReset={
+                      row.categoryKey === 'transform'
+                        ? () => { resetTransforms([row.track.id], useCompositionStore.getState()); }
+                        : undefined
+                    }
                   />
                 );
               }
@@ -1957,6 +2000,25 @@ function Timeline({
                       : undefined
                   }
                   onSeek={onScrub}
+                  contextMenuItems={() => {
+                    // Every real prop behind the row — a merged Position row
+                    // resets x, y (and z) together, as AE's Reset does.
+                    const props = row.prop.stopwatchProps ?? row.prop.valueProps ?? [row.prop.prop];
+                    return [
+                      {
+                        id: 'reset',
+                        label: 'Reset',
+                        disabled: !canResetProperties(row.track.id, props),
+                        onSelect: () => {
+                          resetProperties(row.track.id, props, useCompositionStore.getState(), `Reset ${row.prop.label}`);
+                        },
+                      },
+                      { id: 'expr-sep', separator: true },
+                      // AE's Add / Enable-Disable / Remove Expression — the same
+                      // helper (and undo step) as the inspector's `=` toggle.
+                      ...expressionMenuItems(row.track.id, props),
+                    ];
+                  }}
                 />
               );
             })}
@@ -1986,6 +2048,11 @@ function Timeline({
                 }}
                 onToggle={() =>
                   toggleCategory(stickyCategory.row.track.id, stickyCategory.row.categoryKey)
+                }
+                onReset={
+                  stickyCategory.row.categoryKey === 'transform'
+                    ? () => { resetTransforms([stickyCategory.row.track.id], useCompositionStore.getState()); }
+                    : undefined
                 }
               />
             ) : null}

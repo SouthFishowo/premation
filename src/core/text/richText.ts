@@ -7,10 +7,19 @@
  * captures it by deep clone, so an array persists and round-trips for free —
  * and the `__` prefix keeps it out of the generic NodeInspector's prop list.
  *
- * Runs index the **code-point array** `[...text]`, the same index space
- * `unitPositions` uses, so a run and an animator selector mean the same thing
- * by "character 5". (Neither is grapheme-cluster aware — a ZWJ emoji still
- * splits. That is a pre-existing limit of the animator path, not a new one.)
+ * Runs index GRAPHEME CLUSTERS — `splitGraphemes(text)` — the same index space
+ * `unitPositions` and `layoutText` use, so a run and an animator selector mean
+ * the same thing by "character 5", and an emoji ZWJ sequence or a decomposed
+ * accent is one character to all of them.
+ *
+ * ── Migration from code-point offsets ────────────────────────────────
+ * Documents written before 2026-09-13 stored CODE-POINT offsets (`[...text]`).
+ * Runs written from here carry `__runsIndex: 'grapheme'` beside them; runs
+ * without that marker are converted at read time (`readRuns`) using the
+ * layer's content — start offsets round down and end offsets round up to a
+ * cluster boundary, so a run that covered part of an emoji keeps the whole of
+ * it. For text with no multi-code-point clusters (all ASCII, most text) the
+ * two spaces are identical and nothing moves.
  *
  * Invariant this module maintains: the stored runs are **disjoint, sorted, and
  * clamped** to the text. Layout tolerates violations (documents written by
@@ -21,8 +30,13 @@ import type { SceneNode } from '@core/types';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { bumpScene } from '@stores/sceneStore';
 import type { RichRun, TextStyle } from './textLayout';
+import { codePointToGraphemeIndex, graphemesAreCodePoints, splitGraphemes } from './graphemes';
 
 export type { RichRun } from './textLayout';
+
+/** Prop that marks `__runs` as grapheme-indexed. Absent = legacy code points. */
+export const RUNS_INDEX_PROP = '__runsIndex';
+export const RUNS_INDEX_GRAPHEME = 'grapheme';
 
 /** The style fields a run may override. Paragraph settings (align, lineHeight,
  *  paragraphSpacing) are deliberately absent — they cannot vary per character. */
@@ -33,6 +47,23 @@ export const RUN_STYLE_KEYS = [
   'fontStyle',
   'letterSpacing',
   'fill',
+  'kerning',
+  'fauxBold',
+  'fauxItalic',
+  // Per-range Character panel styles (2026-09-13). Layout honours scale,
+  // baseline, leading (largest on a line) and tsume; paint the stroke.
+  'strokeColor',
+  'strokeWidth',
+  'lineHeight',
+  'horizontalScale',
+  'verticalScale',
+  'baselineShift',
+  'tsume',
+  'allCaps',
+  'smallCaps',
+  'verticalAlign',
+  // Vertical type: horizontal-in-vertical (verticalLayout.ts).
+  'tateChuYoko',
 ] as const satisfies ReadonlyArray<keyof TextStyle>;
 
 export type RunStyleKey = (typeof RUN_STYLE_KEYS)[number];
@@ -46,14 +77,31 @@ function textComponent(node: SceneNode): CompRef | undefined {
   return node.components.find((c) => c.type === 'Text') as CompRef | undefined;
 }
 
-/** Read a node's stored runs (empty when none). */
+/**
+ * Read a node's stored runs (empty when none), in GRAPHEME indices.
+ *
+ * Legacy code-point runs are converted here — see the file docblock.
+ */
 export function readRuns(node: SceneNode): RichRun[] {
   const t = textComponent(node);
   const raw = t?.props.__runs;
   if (!Array.isArray(raw)) return [];
   // A stored document is untrusted input: drop anything malformed rather than
   // letting a NaN index poison the pen arithmetic downstream.
-  return (raw as unknown[]).filter(isRun);
+  const runs = (raw as unknown[]).filter(isRun);
+  const content = typeof t?.props.content === 'string' ? t.props.content : '';
+  if (t?.props[RUNS_INDEX_PROP] === RUNS_INDEX_GRAPHEME) return runs;
+  return migrateCodePointRuns(runs, content);
+}
+
+/** Convert code-point-indexed runs over `content` to grapheme indices. */
+export function migrateCodePointRuns(runs: ReadonlyArray<RichRun>, content: string): RichRun[] {
+  if (graphemesAreCodePoints(content)) return runs.slice();
+  return runs.map((r) => ({
+    start: codePointToGraphemeIndex(content, r.start, false),
+    end: codePointToGraphemeIndex(content, r.end, true),
+    style: r.style,
+  }));
 }
 
 function isRun(v: unknown): v is RichRun {
@@ -230,15 +278,15 @@ export function styleOverRange(
  * one word right. We can't know the true edit from before/after strings alone,
  * so we take the common prefix and suffix (which is the actual edit for
  * typing, pasting and deleting — every edit the overlay can produce) and
- * translate spans across the changed middle.
+ * translate spans across the changed middle. Compared cluster by cluster.
  */
 export function reindexRuns(
   runs: ReadonlyArray<RichRun>,
   before: string,
   after: string,
 ): RichRun[] {
-  const a = [...before];
-  const b = [...after];
+  const a = splitGraphemes(before);
+  const b = splitGraphemes(after);
   if (a.length === 0) return [];
 
   let pre = 0;
@@ -270,11 +318,13 @@ export function reindexRuns(
   );
 }
 
-/** Persist runs through the graph so the rebuilt plain-view keeps them. */
+/** Persist runs through the graph so the rebuilt plain-view keeps them.
+ *  Always stamps the grapheme index marker. */
 export function writeRuns(nodeId: string, runs: ReadonlyArray<RichRun>): void {
   const node = defaultSceneGraph.getNode(nodeId);
   const t = node ? textComponent(node) : undefined;
   if (!node || !t) return;
+  defaultSceneGraph.writeProp(nodeId, t.id, RUNS_INDEX_PROP, RUNS_INDEX_GRAPHEME);
   defaultSceneGraph.writeProp(nodeId, t.id, '__runs', [...runs]);
   bumpScene();
 }

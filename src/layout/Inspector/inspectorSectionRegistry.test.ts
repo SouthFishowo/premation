@@ -54,6 +54,7 @@ const EMBEDDED: Readonly<Record<string, string>> = {
   // Not scoped to the selected layer at all, so it cannot be a registry entry:
   // this belongs to the applied mograph, not to a node.
   MographParamsSection: 'PropertiesPanel — the inspector extras strip below the accordion',
+  VariableAxesSection: 'CharacterPanel (the Text panel, below Metrics & Scale)',
 };
 
 /**

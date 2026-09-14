@@ -48,10 +48,19 @@ import {
   readAnimatorData,
   updateAnimator,
   updateSelector,
+  axisTagOfParam,
   type TextAnimatorData,
 } from '@core/text/textAnimators';
+import {
+  parseTextPathPropPath,
+  readTextPathConfig,
+  textPathParamValue,
+  updateTextPath,
+} from '@core/text/textPath';
+import { parseAxisPropPath, readFontAxesProp } from '@core/text/fontAxes';
 import { resolvePropertyMeta } from './propertyMeta';
 import { parseMaskPropPath, getNodeMask, updateMaskPath } from '@core/effects/mask';
+import { isGradientGeometryProp, readGradientGeometryProp, writeGradientGeometryProp } from './gradientGeometryProps';
 
 /** `#rrggbb` (or `#rgb`) → the normalized channel a colour track carries. */
 function channelOf(color: string, suffix: string): number | undefined {
@@ -242,6 +251,17 @@ export function readStaticPropertyValue(nodeId: string, prop: string): number | 
     return typeof v === 'number' ? v : undefined;
   }
 
+  // Text ▸ Path Options (switches read as the 0/1 their tracks hold).
+  const tpParam = parseTextPathPropPath(prop);
+  if (tpParam) {
+    const cfg = readTextPathConfig(node);
+    return cfg ? textPathParamValue(cfg, tpParam) : undefined;
+  }
+
+  // A variable-font axis beyond wght/wdth/slnt.
+  const axisTag = parseAxisPropPath(prop);
+  if (axisTag) return readFontAxesProp(node)[axisTag];
+
   const ta = parseAnimatorPath(prop);
   if (ta) {
     const data = readAnimatorData(node);
@@ -251,9 +271,18 @@ export function readStaticPropertyValue(nodeId: string, prop: string): number | 
       const v = sel?.[slot.param];
       return typeof v === 'number' ? v : undefined;
     }
+    // A Font Axis property lives in the animator's `axes` map.
+    const tag = axisTagOfParam(ta.param);
+    if (tag) {
+      const v = data[ta.index]?.axes?.[tag];
+      return typeof v === 'number' ? v : undefined;
+    }
     const v = (data[ta.index] as Record<string, unknown> | undefined)?.[ta.param];
     return typeof v === 'number' ? v : undefined;
   }
+
+  // Gradient geometry lives inside a paint object (a fill, a text stroke).
+  if (isGradientGeometryProp(prop)) return readGradientGeometryProp(node, prop);
 
   // Flat component prop — the ordinary case, and the one the transform,
   // geometry, fill, stroke and audio-level rows all take.
@@ -278,6 +307,9 @@ export function writeStaticPropertyValue(nodeId: string, prop: string, value: nu
   const node = defaultSceneGraph.getNode(nodeId);
   if (!node) return false;
 
+  // Gradient geometry is written back into its paint (a fill, a text stroke).
+  if (isGradientGeometryProp(prop)) return writeGradientGeometryProp(nodeId, node, prop, value);
+
   const effect = parseEffectPath(prop);
   if (effect) return writeEffectValue(nodeId, effect, value);
 
@@ -295,12 +327,31 @@ export function writeStaticPropertyValue(nodeId: string, prop: string, value: nu
     return true;
   }
 
+  const tpParam = parseTextPathPropPath(prop);
+  if (tpParam) {
+    if (!readTextPathConfig(node)) return false;
+    const flag = tpParam === 'reversed' || tpParam === 'perpendicular' || tpParam === 'forceAlignment';
+    updateTextPath(nodeId, { [tpParam]: flag ? value >= 0.5 : value });
+    return true;
+  }
+
+  const axisTag = parseAxisPropPath(prop);
+  if (axisTag) {
+    const text = node.components.find((c) => c.type === 'Text');
+    if (!text) return false;
+    updateNodeComponentProp(defaultSceneGraph, nodeId, text.id, 'fontAxes', { ...readFontAxesProp(node), [axisTag]: value });
+    return true;
+  }
+
   const ta = parseAnimatorPath(prop);
   if (ta) {
     const data = readAnimatorData(node);
-    if (!data[ta.index]) return false;
+    const cur = data[ta.index];
+    if (!cur) return false;
     const slot = animatorSlot(data, ta);
+    const tag = axisTagOfParam(ta.param);
     if (slot) updateSelector(nodeId, ta.index, slot.selector, { [slot.param]: value } as never);
+    else if (tag) updateAnimator(nodeId, ta.index, { axes: { ...(cur.axes ?? {}), [tag]: value } });
     else updateAnimator(nodeId, ta.index, { [ta.param]: value } as Partial<TextAnimatorData>);
     return true;
   }
@@ -355,6 +406,9 @@ export function canWriteStaticPropertyValue(nodeId: string, prop: string): boole
 
   const op = parsePathOpPath(prop);
   if (op) return readPathOps(node).some((o) => o.id === op.opId);
+
+  if (parseTextPathPropPath(prop)) return readTextPathConfig(node) !== null;
+  if (parseAxisPropPath(prop)) return node.components.some((c) => c.type === 'Text');
 
   const ta = parseAnimatorPath(prop);
   if (ta) return readAnimatorData(node)[ta.index] !== undefined;

@@ -284,12 +284,15 @@ A layer that never enters the 3D path keeps the older 2D approximation instead: 
 
 Casts Shadows (Off / On / **Only**), Light Transmission, Accepts Shadows
 (Off / On / **Only**), Accepts Lights, Ambient, Diffuse, Shading model, Specular
-Intensity, Specular Shininess *or* Roughness, Metal.
+Intensity, Specular Shininess *or* Roughness, Metal — and, since 2026-09-14,
+the Advanced-3D axes: **Reflection Intensity / Sharpness / Rolloff** and
+**Transparency / Transparency Rolloff / Index of Refraction**. Every one is
+keyframeable, and every one defaults to an exact identity, so untouched scenes
+render byte-for-byte.
 
 **Shading model** is per layer: *Phong* (the default and the original look) or
 *Physical (PBR)* — Cook-Torrance/GGX, where **Roughness** replaces Shininess and
-Metal means "reflects its own colour, no diffuse". This is the one piece of AE's
-Advanced 3D material model that lives here.
+Metal means "reflects its own colour, no diffuse".
 
 `Only` on either shadow switch keeps the layer fully present in the shadow pass
 but stops it being drawn — that is how shadow-catcher setups are built: a layer
@@ -303,6 +306,34 @@ plastic (the highlight keeps the light's colour), 1 as metal. It rides in the
 spare `shadeParams.w` uniform slot, so it costs no layout change — and it is
 visible only where there IS a highlight, so the inspector says to raise Specular
 when Specular is 0.
+
+**The reflection axes act on environment reflections** — the split-sum IBL term
+the environment light provides — because that is the only reflection system
+here. *Reflection Intensity* (default 100 %) scales the term per material;
+*Reflection Sharpness* (default 0) samples the prefiltered atlas at
+roughness × (1 − sharpness), so 100 % always mirrors the sharpest band;
+*Reflection Rolloff* (default 0) is a Schlick view-angle weight (F0 from the
+material's IOR) that concentrates the reflection at grazing angles. AE's
+fourth axis, **Appears in Reflections, is deliberately not modelled**: it
+governs layer-to-layer reflections, no such pass exists, and this codebase
+deletes controls that change no pixel rather than shipping them with a
+tooltip. If a reflection pass ever ships, the axis ships with it.
+
+**Transparency** is a view-dependent alpha multiplier applied at the shading
+stage, per fragment: `alpha × (1 − t · mix(1, 1 − F(N·V), rolloff))`, with F
+the Schlick Fresnel from the **Index of Refraction** (default 1.52, window
+glass). At *Transparency Rolloff* 0 it is a uniform fade, indistinguishable
+from Opacity; raised, faces square to the camera turn more transparent than
+grazing ones — how glass reads. Like Specular, it renders on the depth-tested
+GPU path with Accepts Lights on and at least one light in the comp (the
+inspector says so when it would otherwise be a silent no-op). There is **no
+refraction**: nothing behind the layer is distorted, the IOR only shapes the
+Fresnel curve — the same scoping honesty as the reflection axes. A transparent
+material blends exactly as a layer with reduced Opacity does inside a depth
+run: draws stay painter-sorted back-to-front and depth-tested, with the
+documented per-pixel compromise for mutually intersecting translucent planes.
+CPU twin: `transparencyAlpha` in `core/scene/lightShading.ts`, pinned to the
+shader text by `lightShaderParity.test.ts`.
 
 ## Imported models
 

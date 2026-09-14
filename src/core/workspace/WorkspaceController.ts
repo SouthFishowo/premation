@@ -30,6 +30,7 @@ const TOOL_MAP: Record<UITool, string> = {
   line: 'line',
   knife: 'knife',
   text: 'text',
+  'vertical-text': 'vertical-text',
   shape: 'rectangle',
   ellipse: 'ellipse',
   polygon: 'polygon',

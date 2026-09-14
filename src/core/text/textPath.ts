@@ -20,6 +20,7 @@ import { bumpScene } from '@stores/sceneStore';
 import { maskSegments, type MaskPath } from '@core/effects/mask';
 import { arcTable, pointAndTangentAtLength, type ArcTable, type Pt } from '@core/scene/trimPath';
 import type { TextLayout, PlacedGlyph } from './textLayout';
+import { resolveAlign } from './textExtras';
 
 export interface TextPath {
   /** Which of the layer's masks to ride. Empty = the first one. */
@@ -31,13 +32,45 @@ export interface TextPath {
   /** Rotate each glyph to the path's heading. Off = upright glyphs that still
    *  follow the curve, which AE calls turning Perpendicular To Path off. */
   perpendicular: boolean;
+  /**
+   * AE's Force Alignment: the first character sits at First Margin, the last
+   * at Last Margin, and the characters between are spread evenly. Optional so
+   * a config written before it round-trips unchanged.
+   */
+  forceAlignment?: boolean;
+  /** Offset of the text's END from the path's end, px (negative pulls it in).
+   *  Drives right alignment and the far end of Force Alignment. Keyframeable. */
+  lastMargin?: number;
 }
 
-export const TEXT_PATH_PARAMS = ['firstMargin'] as const;
+/**
+ * Every Path Options parameter, all keyframeable. The three switches animate
+ * as 0/1 tracks read with a 0.5 threshold, which is how a hold keyframe on a
+ * checkbox behaves.
+ */
+export const TEXT_PATH_PARAMS = ['firstMargin', 'lastMargin', 'reversed', 'perpendicular', 'forceAlignment'] as const;
 export type TextPathParam = (typeof TEXT_PATH_PARAMS)[number];
 
 export function textPathPropPath(param: TextPathParam): string {
   return `textPath.${param}`;
+}
+
+/** The param a `textPath.<param>` path names, or null. */
+export function parseTextPathPropPath(path: string): TextPathParam | null {
+  const m = /^textPath\.([A-Za-z]+)$/.exec(path);
+  const p = m?.[1];
+  return p && (TEXT_PATH_PARAMS as ReadonlyArray<string>).includes(p) ? (p as TextPathParam) : null;
+}
+
+/** A config param as the number its track holds (booleans are 0/1). */
+export function textPathParamValue(cfg: TextPath, param: TextPathParam): number {
+  switch (param) {
+    case 'firstMargin': return cfg.firstMargin;
+    case 'lastMargin': return cfg.lastMargin ?? 0;
+    case 'reversed': return cfg.reversed ? 1 : 0;
+    case 'perpendicular': return cfg.perpendicular ? 1 : 0;
+    case 'forceAlignment': return cfg.forceAlignment ? 1 : 0;
+  }
 }
 
 export function defaultTextPath(): TextPath {
@@ -102,6 +135,17 @@ export interface TextPathGeometry {
   reversed: boolean;
   perpendicular: boolean;
   align?: string;
+  forceAlignment?: boolean;
+  lastMargin?: number;
+  /**
+   * The layout is VERTICAL type (verticalLayout.ts): each column rides the
+   * path — a glyph's offset DOWN its column becomes the arc length, and the
+   * column's x becomes the normal displacement (the first, right-hand column
+   * on the path's left). Glyphs turn with the column frame, which maps the
+   * column's down direction onto the tangent: upright CJK stand across the
+   * path, rotated Latin lies along it, as in AE.
+   */
+  vertical?: boolean;
 }
 
 /**
@@ -119,20 +163,50 @@ export interface TextPathGeometry {
 export function applyTextPath(layout: TextLayout, geo: TextPathGeometry): PlacedGlyph[] {
   const { table, firstMargin, reversed, perpendicular } = geo;
   if (table.total <= 0) return layout.glyphs;
-  const align = geo.align ?? 'left';
+  // The justify variants ride a path by their last-line alignment — a path has
+  // no box width to stretch a line to.
+  const align = resolveAlign(geo.align).line;
+  const lastMargin = geo.lastMargin ?? 0;
 
-  return layout.glyphs.map((g) => {
+  // Force Alignment needs each glyph's rank within its line and the line's
+  // glyph count, to share the slack evenly between characters.
+  const rank = new Array<number>(layout.glyphs.length);
+  const lineCount = new Map<number, number>();
+  if (geo.forceAlignment) {
+    layout.glyphs.forEach((g, i) => {
+      const n = lineCount.get(g.line) ?? 0;
+      rank[i] = n;
+      lineCount.set(g.line, n + 1);
+    });
+  }
+
+  const vertical = !!geo.vertical;
+  return layout.glyphs.map((g, gi) => {
     const line = layout.lines[g.line];
     const lineLeft = line?.left ?? 0;
     const lineWidth = line?.width ?? 0;
+    // Offset within the line: along it for horizontal type, down the column
+    // (whose top `LineBox.y` holds) for vertical.
+    const inLine = vertical ? g.y - (line?.y ?? 0) : g.x - lineLeft;
 
-    // Where this line begins along the path.
-    let base: number;
-    if (align === 'center') base = (table.total - lineWidth) / 2;
-    else if (align === 'right') base = table.total - lineWidth;
-    else base = 0;
-
-    const along = firstMargin + base + (g.x - lineLeft);
+    let along: number;
+    if (geo.forceAlignment) {
+      // From First Margin (pen of the first glyph) to the path end + Last
+      // Margin (advance end of the last glyph); the slack between the two is
+      // added one share per character boundary.
+      const span = table.total + lastMargin - firstMargin;
+      const n = lineCount.get(g.line) ?? 1;
+      const extra = n > 1 ? (span - lineWidth) / (n - 1) : (span - lineWidth) / 2;
+      along = firstMargin + inLine + (n > 1 ? extra * rank[gi]! : extra);
+    } else {
+      // Where this line begins along the path. Last Margin moves right-aligned
+      // text (and half-moves centred text); at 0 this is the original maths.
+      let base: number;
+      if (align === 'center') base = (table.total - lineWidth) / 2 + lastMargin / 2;
+      else if (align === 'right') base = table.total - lineWidth + lastMargin;
+      else base = 0;
+      along = firstMargin + base + inLine;
+    }
     const arc = reversed ? table.total - along : along;
     const { x, y, angle } = pointAndTangentAtLength(table, arc);
 
@@ -141,6 +215,18 @@ export function applyTextPath(layout: TextLayout, geo: TextPathGeometry): Placed
     const heading = reversed ? angle + Math.PI : angle;
     // The glyph's own baseline offset rides the path's normal.
     const normal = heading + Math.PI / 2;
+    if (vertical) {
+      // The column frame's +y (down) maps onto the heading, so its +x maps
+      // onto −normal and every glyph turns by heading − 90° on top of its own
+      // (sideways) angle.
+      const off = -g.x;
+      return {
+        ...g,
+        x: x + Math.cos(normal) * off,
+        y: y + Math.sin(normal) * off,
+        angle: perpendicular ? heading - Math.PI / 2 + (g.angle ?? 0) : g.angle ?? 0,
+      };
+    }
     const off = g.y;
 
     return {
@@ -150,6 +236,27 @@ export function applyTextPath(layout: TextLayout, geo: TextPathGeometry): Placed
       angle: perpendicular ? heading : 0,
     };
   });
+}
+
+/**
+ * The layer-local extent of glyphs placed on a path (`applyTextPath`): each
+ * non-blank glyph counts as the circle circumscribing its advance × font-size
+ * box, so the extent holds however the path turns it. Null when nothing is drawn.
+ */
+export function pathGlyphBounds(glyphs: ReadonlyArray<PlacedGlyph>): { minX: number; minY: number; maxX: number; maxY: number } | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const g of glyphs) {
+    if (g.char.trim() === '') continue;
+    const r = Math.hypot(Math.max(g.advance, g.inkWidth), g.style.fontSize) / 2;
+    minX = Math.min(minX, g.x - r);
+    maxX = Math.max(maxX, g.x + r);
+    minY = Math.min(minY, g.y - r);
+    maxY = Math.max(maxY, g.y + r);
+  }
+  return Number.isFinite(minX) ? { minX, minY, maxX, maxY } : null;
 }
 
 // ── Scene integration ────────────────────────────────────────────────
@@ -173,6 +280,8 @@ export function readTextPathConfig(node: SceneNode): TextPath | null {
     firstMargin: num(t.firstMargin, d.firstMargin),
     reversed: bool(t.reversed, d.reversed),
     perpendicular: bool(t.perpendicular, d.perpendicular),
+    ...(t.forceAlignment === true ? { forceAlignment: true } : {}),
+    ...(typeof t.lastMargin === 'number' && Number.isFinite(t.lastMargin) && t.lastMargin !== 0 ? { lastMargin: t.lastMargin } : {}),
   };
 }
 
@@ -183,9 +292,19 @@ export function resolveTextPath(
 ): TextPath | null {
   const base = readTextPathConfig(node);
   if (!base) return null;
+  const flag = (param: TextPathParam, fb: boolean): boolean => {
+    const v = av?.get(textPathPropPath(param));
+    return v === undefined ? fb : v >= 0.5;
+  };
+  const lastMargin = av?.get(textPathPropPath('lastMargin')) ?? base.lastMargin;
+  const forceAlignment = flag('forceAlignment', base.forceAlignment === true);
   return {
     ...base,
     firstMargin: av?.get(textPathPropPath('firstMargin')) ?? base.firstMargin,
+    reversed: flag('reversed', base.reversed),
+    perpendicular: flag('perpendicular', base.perpendicular),
+    ...(forceAlignment ? { forceAlignment: true } : { forceAlignment: undefined }),
+    ...(lastMargin ? { lastMargin } : { lastMargin: undefined }),
   };
 }
 

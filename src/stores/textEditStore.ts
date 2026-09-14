@@ -8,16 +8,25 @@
  *
  * The selection is what makes per-character styling addressable: the inspector
  * reads it to decide whether an edit means "this layer" or "these characters".
- * Offsets are indices into `[...content]` — code points, the same index space
- * runs and animator selectors use — NOT `string.length`.
+ * Offsets are GRAPHEME indices into `splitGraphemes(content)` — the same index
+ * space runs, animator selectors and layout use (see core/text/graphemes.ts) —
+ * NOT `string.length` and not code points, so a caret can never land inside an
+ * emoji sequence or between a letter and its combining accent.
  */
 
 import { create } from 'zustand';
 
+/**
+ * Mark a surface (the Character panel) with this attribute and focus moving
+ * into it does NOT end on-canvas text editing — the character selection stays
+ * live so the panel can style it. A pointerdown anywhere else still commits.
+ */
+export const TEXT_EDIT_KEEP_ATTR = 'data-text-edit-keep';
+
 export interface TextSelection {
-  /** Inclusive start, in code points. */
+  /** Inclusive start, in grapheme clusters. */
   start: number;
-  /** Exclusive end, in code points. `start === end` is a caret, not a range. */
+  /** Exclusive end, in grapheme clusters. `start === end` is a caret, not a range. */
   end: number;
 }
 

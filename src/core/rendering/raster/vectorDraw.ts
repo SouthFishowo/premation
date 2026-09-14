@@ -195,6 +195,8 @@ function glyphSpread(layer: RenderLayer): number {
   // The glyph's own extent, used to turn a SCALE multiplier into pixels. Height
   // is the honest measure for a font: a glyph is roughly em-tall.
   const em = layer.fontSize ?? 48;
+  const grouped = !!layer.textExtras?.anchorGrouping || !!layer.textExtras?.groupingAlign;
+  const groupReach = Math.max(layer.width ?? 0, layer.height ?? 0) / 2;
   let spread = 0;
   for (const g of glyphs) {
     // Position offsets translate the glyph bodily out of the box.
@@ -202,10 +204,16 @@ function glyphSpread(layer: RenderLayer): number {
     // Scale grows it about its own origin, so half the growth escapes each side.
     const grow = Math.max(g.scale, g.scaleY) - 1;
     if (grow > 0) d += (grow * em) / 2;
-    // Blur bleeds symmetrically; a stroke sits half outside the outline.
-    d += g.blur * 2 + g.strokeWidth / 2;
+    // Blur bleeds symmetrically (the larger axis of a 2-D blur governs the
+    // reach); a stroke sits half outside the outline.
+    d += Math.max(g.blur, g.blurY ?? 0) * 2 + g.strokeWidth / 2;
     // Shear pushes the top and bottom of the glyph sideways.
     if (g.skew) d += Math.abs(Math.tan((g.skew * Math.PI) / 180)) * em * 0.5;
+    // Anchor Point draws the glyph at −anchor about its origin.
+    if (g.anchorX || g.anchorY) d += Math.max(Math.abs(g.anchorX ?? 0), Math.abs(g.anchorY ?? 0));
+    // Under word / line / all Anchor Point Grouping a rotation swings the glyph
+    // about the GROUP centre, which can be up to half the block away.
+    if (grouped && g.rotation) d += Math.abs(Math.sin((g.rotation * Math.PI) / 180)) * groupReach;
     if (d > spread) spread = d;
   }
   return spread;
@@ -368,6 +376,11 @@ export function applyStrokeStyle(ctx: CanvasRenderingContext2D, stroke: Stroke, 
   ctx.lineWidth = stroke.width;
   ctx.lineCap = stroke.cap;
   ctx.lineJoin = stroke.join;
+  // Always assigned, never left to persist (same rule as lineDashOffset below):
+  // `ctx` is shared across layers in a frame, so skipping the write when the
+  // stroke carries no explicit limit would inherit the previous layer's. 4 is
+  // the Canvas2D default this rasterizer has always run with.
+  ctx.miterLimit = stroke.miterLimit ?? 4;
   ctx.setLineDash(stroke.dash.length ? stroke.dash : []);
   // Dash offset is ARC LENGTH along the path, which is exactly what Canvas2D's
   // `lineDashOffset` already means — so this reuses the rasterizer's own dashing

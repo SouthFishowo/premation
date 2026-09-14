@@ -10,7 +10,9 @@
 import type { SceneNode } from '@core/types';
 import { readNodeKind } from '@core/scene/sceneDerive';
 import { SIZE } from '@core/rendering/buildSnapshot';
-import { measureTextNodeSize, measureTextNodeSelectionBox } from '@core/text/measureText';
+import { measureTextNodeLayout, measureTextNodeParagraphBox, measureTextNodeSize, measureTextNodeSelectionBox } from '@core/text/measureText';
+import { hasTextPath, readParagraphBox } from '@core/text/textExtras';
+import { applyTextPath, pathGlyphBounds, readTextPathConfig, textPathGeometry } from '@core/text/textPath';
 import { useCompositionStore } from '@stores/compositionStore';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { defaultAnimation } from '@motion/animation';
@@ -22,6 +24,40 @@ import { Mat, Rect, type Vec2, type Mat2D } from '@motion/workspace';
 function compositionSize(): { width: number; height: number } {
   const c = useCompositionStore.getState();
   return { width: c.width || 1920, height: c.height || 1080 };
+}
+
+/**
+ * Where text on a path really is, layer-local: its glyphs laid out and bent
+ * onto the path (static path options), as a centre + size. Null without text
+ * metrics or a usable path.
+ */
+export function textPathExtent(
+  node: SceneNode,
+  overrideProps?: Record<string, unknown>,
+  layout = measureTextNodeLayout(node, overrideProps),
+): { w: number; h: number; cx: number; cy: number } | null {
+  const cfg = readTextPathConfig(node);
+  const table = cfg ? textPathGeometry(node, cfg) : null;
+  if (!cfg || !table || !layout) return null;
+  let align: string | undefined;
+  let vertical = false;
+  for (const c of node.components) {
+    const p = c.props as Record<string, unknown>;
+    if (typeof p.align === 'string') align = p.align;
+    if (p.orientation === 'vertical' || p.orientation === 'horizontal') vertical = p.orientation === 'vertical';
+  }
+  const b = pathGlyphBounds(applyTextPath(layout, {
+    table,
+    firstMargin: cfg.firstMargin,
+    reversed: cfg.reversed,
+    perpendicular: cfg.perpendicular,
+    align,
+    forceAlignment: cfg.forceAlignment,
+    lastMargin: cfg.lastMargin,
+    ...(vertical ? { vertical: true } : {}),
+  }));
+  if (!b) return null;
+  return { w: Math.max(1, b.maxX - b.minX), h: Math.max(1, b.maxY - b.minY), cx: (b.minX + b.maxX) / 2, cy: (b.minY + b.maxY) / 2 };
 }
 
 /** The workspace's plain rectangle value type. */
@@ -246,7 +282,12 @@ export function readGeometry(
   // selection rectangle IS the authored width, and dragging a handle must
   // reflow the text inside it rather than scale the type. POINT text keeps
   // deriving its box from the glyphs.
-  const authoredBoxWidth = kind === 'text'
+  // Text on a PATH is point text: its box width sizes nothing, and its bounds
+  // are where the glyphs actually ride the curve (null without metrics — the
+  // measured point-text box then stands in).
+  const onPath = kind === 'text' && hasTextPath(node);
+  const pathExtent = onPath ? textPathExtent(node, overrideProps) : null;
+  const authoredBoxWidth = kind === 'text' && !onPath
     ? (() => {
         const fromOverride = overrideProps?.boxWidth;
         if (typeof fromOverride === 'number' && fromOverride > 0) return fromOverride;
@@ -257,9 +298,22 @@ export function readGeometry(
         return undefined;
       })()
     : undefined;
-  const textBox = kind === 'text' ? measureTextNodeSelectionBox(node, overrideProps) : null;
-  const measured = textBox
-    ? { w: authoredBoxWidth ?? textBox.width, h: textBox.height, dy: textBox.offsetY }
+  // A FIXED-height paragraph box is authored in both directions: the box IS the
+  // selection, hit and snap rectangle, centred on the layer origin — so an
+  // empty or overflowing box is grabbed by its frame, as in AE. No measurement.
+  const fixedBox = kind === 'text' ? readParagraphBox(node, overrideProps) : null;
+  const textBox = kind === 'text' && !fixedBox?.fixedHeight ? measureTextNodeSelectionBox(node, overrideProps) : null;
+  // An AUTO-HEIGHT box with an authored height keeps that box's top edge: its
+  // text is drawn `lineOffsetY` below the origin, and so is its selection.
+  const anchoredBox = textBox && fixedBox && !fixedBox.fixedHeight && fixedBox.boxHeight > 0
+    ? measureTextNodeParagraphBox(node, overrideProps)
+    : null;
+  const measured = pathExtent
+    ? { w: pathExtent.w, h: pathExtent.h, dy: pathExtent.cy }
+    : fixedBox?.fixedHeight
+    ? { w: fixedBox.boxWidth, h: fixedBox.boxHeight, dy: 0 }
+    : textBox
+    ? { w: authoredBoxWidth ?? textBox.width, h: textBox.height, dy: textBox.offsetY + (anchoredBox?.lineOffsetY ?? 0) }
     : kind === 'text'
       ? (() => {
           // No metrics from this runtime (jsdom): fall back to the render box,
@@ -298,7 +352,7 @@ export function readGeometry(
   const hasAuthoredDim = typeof width === 'number' && typeof height === 'number' && width > 0 && height > 0;
   let finalW = (kind === 'text' && measured) ? measured.w : (hasAuthoredDim ? width : (pointsBounds ? pointsBounds.w : size.w));
   let finalH = (kind === 'text' && measured) ? measured.h : (hasAuthoredDim ? height : (pointsBounds ? pointsBounds.h : size.h));
-  let offsetX = 0;
+  let offsetX = pathExtent ? pathExtent.cx : 0;
   // Text carries the font box's vertical offset from the draw origin; every
   // other kind is centred on its own position.
   let offsetY = (kind === 'text' && measured) ? measured.dy : 0;

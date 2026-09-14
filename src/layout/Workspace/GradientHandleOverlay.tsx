@@ -54,6 +54,14 @@ import { readGeometry } from '@core/workspace/geometry';
 import { defaultAnimation } from '@motion/animation';
 import { runAnimEdit } from '@core/animation/animationCommands';
 import { compToKeyframeTime } from '@core/timeline/TimelineController';
+import { updateNodeComponentProp } from '@core/inspector/InspectorAPI';
+import { readTextStrokePaint } from '@core/text/textExtras';
+import {
+  applyGradientTracks,
+  FILL_GRADIENT_TRACKS,
+  TEXT_STROKE_GRADIENT_TRACKS,
+  type GradientTrackNames,
+} from '@core/rendering/gradientPaintTracks';
 import { ColorPicker } from '@components/ColorPicker';
 import {
   getNodeFills,
@@ -63,7 +71,7 @@ import {
   type ColorStop,
   type FillPaint,
 } from '@core/paint/fill';
-import { useGradientEditStore } from './gradientEditStore';
+import { useGradientEditStore, type GradientEditTarget } from './gradientEditStore';
 import { layerScreenMapping } from './layerScreen';
 import { beginViewportGesture, endViewportGesture } from '@core/workspace/viewportGesture';
 import {
@@ -91,7 +99,14 @@ const GRIP_R = 5.5;
 /** The gizmo's own colour — the app's accent, so it reads as UI, not artwork. */
 const AXIS_COLOR = '#4c8dff';
 
-type GeomProp = 'fillAngle' | 'fillCenterX' | 'fillCenterY' | 'fillRadius';
+/** Which paint the gizmo edits: the layer's fill, or a text layer's stroke gradient. */
+type PaintChannel = GradientEditTarget;
+
+/** The keyframeable geometry scalars of each channel — the names the renderer samples. */
+const GEOMETRY_TRACKS: Readonly<Record<PaintChannel, GradientTrackNames>> = {
+  fill: FILL_GRADIENT_TRACKS,
+  stroke: TEXT_STROKE_GRADIENT_TRACKS,
+};
 
 function isGradient(p: FillPaint | undefined): p is GradientPaint {
   return !!p && (p.type === 'linear' || p.type === 'radial');
@@ -100,9 +115,15 @@ function isGradient(p: FillPaint | undefined): p is GradientPaint {
 /** Everything one write needs to know about what it is writing to. */
 interface EditTarget {
   nodeId: string;
+  channel: PaintChannel;
+  /** The Text component a stroke write lands on (stroke channel only). */
+  textComponentId: string | null;
   fillIndex: number;
   fills: FillPaint[];
+  /** The STORED paint — what a static write spreads over. */
   paint: GradientPaint;
+  /** The paint as the frame shows it (keyframed geometry applied) — what a grip drags from. */
+  shown: GradientPaint;
   /** Storage order — what a write must preserve. See `moveStopTo`. */
   stops: ColorStop[];
   /** True when the primary fill's stop list is a live `fill.stops` track. */
@@ -113,9 +134,21 @@ interface EditTarget {
   height: number;
 }
 
-/** The paint itself — the fill stack's slot, or the primary-fill shortcut. */
+/** One gesture, one undo entry: the debounce key the whole drag shares. */
+const historyKey = (t: EditTarget): string =>
+  t.channel === 'stroke' ? `gradient:${t.nodeId}:stroke` : `gradient:${t.nodeId}`;
+
+/** The paint itself — the text stroke, the fill stack's slot, or the primary-fill shortcut. */
 function writePaintStatic(t: EditTarget, paint: GradientPaint): void {
-  batchHistory(`gradient:${t.nodeId}`, () => {
+  batchHistory(historyKey(t), () => {
+    if (t.channel === 'stroke') {
+      // A text stroke gradient lives on the Text component, where the stroke
+      // rows write it (`TextStrokeRows`).
+      if (t.textComponentId) {
+        updateNodeComponentProp(defaultSceneGraph, t.nodeId, t.textComponentId, 'strokePaint', paint);
+      }
+      return;
+    }
     if (t.fillIndex === 0) {
       setNodeFill(t.nodeId, paint);
       return;
@@ -165,18 +198,30 @@ function writeGradientStops(t: EditTarget, next: ColorStop[]): void {
  * one drag (the exact bug the linked corner radius had).
  */
 function writeGradientGeometry(t: EditTarget, next: GradientPaint, grip: GradientGripKind): void {
-  const props: Array<{ prop: GeomProp; value: number }> =
+  // The channel's own track names: `fillAngle`… for a fill, `strokeAngle`… for
+  // a text stroke gradient — the names the renderer samples.
+  const names = GEOMETRY_TRACKS[t.channel];
+  const props: Array<{ prop: string; value: number }> =
     next.type === 'linear'
-      ? [{ prop: 'fillAngle', value: next.angle }]
+      ? [{ prop: names.angle, value: next.angle }]
       : grip === 'start'
         ? [
-            { prop: 'fillCenterX', value: next.cx },
-            { prop: 'fillCenterY', value: next.cy },
+            { prop: names.centerX, value: next.cx },
+            { prop: names.centerY, value: next.cy },
           ]
-        : [{ prop: 'fillRadius', value: next.radius }];
+        : [{ prop: names.radius, value: next.radius }];
+  // Only the dragged fields go onto the STORED paint: `next` was derived from
+  // the shown (keyframed) geometry, whose other values must not bake in.
+  const staticNext = (
+    next.type === 'linear'
+      ? { ...t.paint, angle: next.angle }
+      : grip === 'start'
+        ? { ...t.paint, cx: next.cx, cy: next.cy }
+        : { ...t.paint, radius: next.radius }
+  ) as GradientPaint;
 
   const autoKey = usePreferenceStore.getState().timelineAutoKeyframe;
-  batchHistory(`gradient:${t.nodeId}`, () => {
+  batchHistory(historyKey(t), () => {
     let anyStatic = false;
     for (const { prop, value } of props) {
       if (defaultAnimation.isAnimated(t.nodeId, prop) || autoKey) {
@@ -193,7 +238,7 @@ function writeGradientGeometry(t: EditTarget, next: GradientPaint, grip: Gradien
     // Written even when some sibling prop keyframed: the static value is what a
     // later "remove animation" falls back to, and leaving it stale is how a
     // handle drag appears to undo itself when the track is deleted.
-    if (anyStatic) writePaintStatic(t, next);
+    if (anyStatic) writePaintStatic(t, staticNext);
   });
 }
 
@@ -221,13 +266,41 @@ export function GradientHandleOverlay(): JSX.Element | null {
   const fills = nodeId ? getNodeFills(nodeId) : [];
   // A stack that shrank under an armed index must not read past its end.
   const fillIndex = armed ? Math.min(fillIndexRaw, Math.max(0, fills.length - 1)) : 0;
-  const paint = isGradient(fills[fillIndex]) ? (fills[fillIndex] as GradientPaint) : null;
+  const fillPaint = isGradient(fills[fillIndex]) ? (fills[fillIndex] as GradientPaint) : null;
+  // A text layer's STROKE gradient — `strokePaint` on its Text component.
+  const strokePaint: GradientPaint | null = node ? readTextStrokePaint(node) ?? null : null;
+  const textComponentId = node?.components.find((c) => c.type === 'Text')?.id ?? null;
+  const armedTarget = useGradientEditStore((s) => s.target);
+  // The stroke when armed on it (the Fill/Stroke chip, or the stroke rows'
+  // "Edit on canvas"), or when it is the layer's only gradient; else the fill.
+  const channel: PaintChannel =
+    strokePaint && textComponentId && ((armed && armedTarget === 'stroke') || !fillPaint) ? 'stroke' : 'fill';
+  const storedPaint = channel === 'stroke' ? strokePaint : fillPaint;
 
   const layerT = nodeId ? compToKeyframeTime(nodeId, time) : 0;
-  // Stop KEYFRAMES bind to the primary fill only — the same gating the panel
+  // Stop KEYFRAMES bind to the primary FILL only — the same gating the panel
   // applies, because `fill.stops` is one track per node, not per stack slot.
   const stopsAnimated =
-    !!nodeId && fillIndex === 0 && defaultAnimation.isDataAnimated(nodeId, 'fill.stops');
+    !!nodeId && channel === 'fill' && fillIndex === 0 && defaultAnimation.isDataAnimated(nodeId, 'fill.stops');
+
+  /**
+   * The paint as the FRAME draws it: keyframed geometry (`fillAngle`… or
+   * `strokeAngle`…) sampled at the playhead over the stored paint, so the axis
+   * sits where the ramp is. Geometry tracks bind to the primary fill, exactly
+   * as the renderer reads them.
+   */
+  const paint = useMemo<GradientPaint | null>(() => {
+    if (!storedPaint || !nodeId || (channel === 'fill' && fillIndex !== 0)) return storedPaint;
+    const names = GEOMETRY_TRACKS[channel];
+    const sampled = new Map<string, number>();
+    for (const prop of [names.angle, names.centerX, names.centerY, names.radius]) {
+      if (!defaultAnimation.isAnimated(nodeId, prop)) continue;
+      const v = defaultAnimation.sample(nodeId, prop, compToKeyframeTime(nodeId, time, prop));
+      if (v !== undefined) sampled.set(prop, v);
+    }
+    return applyGradientTracks(storedPaint, sampled, names) ?? storedPaint;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- anim rev drives this
+  }, [storedPaint, nodeId, channel, fillIndex, time, sceneTick]);
 
   /**
    * The stop list the gizmo is actually editing — sampled at the playhead when
@@ -281,12 +354,15 @@ export function GradientHandleOverlay(): JSX.Element | null {
 
   // Live values for the pointer listeners, which attach once per armed layer.
   const target: EditTarget | null =
-    nodeId && paint
+    nodeId && paint && storedPaint
       ? {
           nodeId,
+          channel,
+          textComponentId,
           fillIndex,
           fills,
-          paint,
+          paint: storedPaint,
+          shown: paint,
           stops,
           stopsAnimated,
           layerT,
@@ -406,8 +482,10 @@ export function GradientHandleOverlay(): JSX.Element | null {
       if (drag.kind === 'grip') {
         if (!s.mapping) return;
         const l = s.mapping.screenToLocal(p.x, p.y);
+        // From the geometry as SHOWN (keyframes applied): a radius grip measures
+        // from the centre the frame draws, not from the static one.
         const next = paintFromGripDrag(
-          s.target.paint,
+          s.target.shown,
           drag.grip,
           { x: l.x, y: l.y },
           s.target.width,
@@ -521,7 +599,7 @@ export function GradientHandleOverlay(): JSX.Element | null {
         </defs>
         <g
           className={styles.chip}
-          onDoubleClick={() => useGradientEditStore.getState().arm(nodeId, fillIndex)}
+          onDoubleClick={() => useGradientEditStore.getState().arm(nodeId, fillIndex, channel)}
         >
           <title>Double-click to edit this gradient on the canvas</title>
           <circle cx={centre.x} cy={centre.y} r={11} fill="rgba(0,0,0,0.55)" />
@@ -642,7 +720,31 @@ export function GradientHandleOverlay(): JSX.Element | null {
       {/* Which fill of the stack is being edited. Only for a real stack — one
           fill needs no chooser, and a chip that never has an alternative is
           chrome describing a choice that does not exist. */}
-      {fills.length > 1 && (
+      {/* Fill or Stroke — for a text layer whose stroke carries a gradient. At
+          the axis END, clear of the fill-stack chips at its start. */}
+      {strokePaint && textComponentId && (
+        <div
+          className={styles.fillChips}
+          style={{ left: Math.round(view.end.x), top: Math.round(view.end.y) }}
+          role="group"
+          aria-label="Which paint to edit"
+        >
+          {(['fill', 'stroke'] as const).map((c) => (
+            <button
+              key={c}
+              type="button"
+              className={`${styles.fillChip} ${styles.paintChip}${c === channel ? ` ${styles.fillChipOn}` : ''}`}
+              aria-pressed={c === channel}
+              disabled={c === 'fill' && !fillPaint}
+              title={c === 'fill' ? (fillPaint ? 'Edit the fill gradient' : 'The fill is not a gradient') : 'Edit the stroke gradient'}
+              onClick={() => useGradientEditStore.getState().setTarget(c)}
+            >
+              {c === 'fill' ? 'Fill' : 'Stroke'}
+            </button>
+          ))}
+        </div>
+      )}
+      {channel === 'fill' && fills.length > 1 && (
         <div
           className={styles.fillChips}
           style={{ left: Math.round(view.start.x), top: Math.round(view.start.y) }}

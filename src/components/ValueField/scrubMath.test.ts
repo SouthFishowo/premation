@@ -15,6 +15,14 @@ describe('scrubMath', () => {
     it('Shift wins when both are held', () => {
       expect(stepScale({ shiftKey: true, altKey: true })).toBe(10);
     });
+
+    it('Ctrl (and Cmd) is the fine gear too — After Effects binds slow scrub to Ctrl', () => {
+      expect(stepScale({ shiftKey: false, altKey: false, ctrlKey: true })).toBe(0.1);
+      expect(stepScale({ shiftKey: false, altKey: false, metaKey: true })).toBe(0.1);
+      // Shift still wins over the fine gear, whichever key selects it.
+      expect(stepScale({ shiftKey: true, altKey: false, ctrlKey: true })).toBe(10);
+      expect(scrubValue(100, 10, 1, { shiftKey: false, altKey: false, ctrlKey: true })).toBeCloseTo(101);
+    });
   });
 
   describe('scrubValue (1 unit/px default)', () => {

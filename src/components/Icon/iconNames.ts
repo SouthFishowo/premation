@@ -22,7 +22,7 @@ export const ICON_NAMES = [
   'move',
   'panel-left', 'panel-right', 'panel-bottom', 'layout',
   'crosshair', 'theme', 'undo', 'redo',
-  'select-all', 'deselect', 'mouse-pointer', 'pen', 'type', 'square', 'circle',
+  'select-all', 'deselect', 'mouse-pointer', 'pen', 'type', 'type-vertical', 'square', 'circle',
   'mask-square', 'mask-circle', 'mask-pen',
   'pencil', 'line', 'star', 'polygon', 'curvature',
   'copy', 'group', 'ungroup', 'trash',

@@ -27,6 +27,7 @@ import { mayServeCachedFrame, mayFillFromPausedRender, playbackBlitWorthwhile } 
 import { useWorkspaceStore } from '@stores/projectStore';
 import workspaceStyles from './Workspace.module.css';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
+import { paintWireframeQualityLayers } from './wireframeQualityOverlay';
 import { defaultAnimation } from '@motion/animation';
 import { getEventBus } from '@core/events/EventBus';
 import { useGuidesStore, clampOverlayOpacity } from '@stores/guidesStore';
@@ -59,7 +60,11 @@ import {
   setPathTangent,
   isPathTangentContinuous,
   positionSamplerFor,
+  motionPathTimeWindow,
 } from '@core/motion/motionPath';
+import { compToKeyframeTime } from '@core/timeline/TimelineController';
+import { motionPathKeyframeMenuItems, guideContextMenuItems, convertMotionPathVertex } from './viewportPrecisionMenus';
+import { openGuideEditor } from './GuideEditorDialog';
 import { beginViewportGesture, endViewportGesture, gestureAnimEdit } from '@core/workspace/viewportGesture';
 import { parentWorld2DAt } from '@core/scene/layerSpace';
 import { Matrix } from '@motion/scene';
@@ -88,9 +93,11 @@ import {
   describeNavUnavailable,
   findNavTarget,
   orbitNavBy,
+  resolveOrbitPivot,
   resolveViewCameraInput,
   smoothDollyNavBy,
   trackNavBy,
+  unifiedNavModeFor,
   type CameraNavMode,
   type NavTarget,
 } from '@core/workspace/cameraNav';
@@ -140,13 +147,18 @@ interface GuideDrag {
 }
 
 
-/** Topmost unlocked guide whose line passes within GUIDE_GRAB_PX of `p` (screen px). */
-function hitGuideAt(controller: WorkspaceController, p: { x: number; y: number }): Guide | null {
+/**
+ * Topmost unlocked guide whose line passes within GUIDE_GRAB_PX of `p` (screen
+ * px). `includeLocked` also finds locked USER guides — for the right-click menu
+ * and the double-click editor, which must be able to reach a locked guide to
+ * unlock or edit it.
+ */
+function hitGuideAt(controller: WorkspaceController, p: { x: number; y: number }, includeLocked = false): Guide | null {
   // A hidden guide is not grabbable either — otherwise an invisible line
   // still caught drags aimed at the layer behind it.
   if (!useGuidesStore.getState().guidesVisible) return null;
   for (const g of controller.ws.guides.list()) {
-    if (g.locked) continue;
+    if (g.locked && !(includeLocked && g.kind === 'user')) continue;
     const s =
       g.axis === 'x'
         ? controller.ws.worldToScreen({ x: g.position, y: 0 }).x
@@ -200,6 +212,8 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
     mode: PaintMode;
   } | null>(null);
   const creationDragRef = useRef<{ start: { x: number; y: number }; current: { x: number; y: number }; tool: Tool } | null>(null);
+  /** Type tool: the text layer a press landed on, edited on release. */
+  const typeEditRef = useRef<string | null>(null);
   /**
    * A press on open canvas that has not yet earned the "dragging" label.
    *
@@ -470,6 +484,9 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
             ...resolveViewCameraInput(compRef.current.width, compRef.current.height, camera3dModeRef.current),
             draft3d: draft3dRef.current,
             useProxies: useProxiesRef.current,
+            // Viewport-only: Quality = Wireframe layers hide their pixels and
+            // `paintWireframeQualityLayers` strokes their boxes instead.
+            wireframeLayers: true,
             // Alpha view: the comp's own alpha is the picture, so the opaque
             // background plate must not be composited under the layers — with
             // it, every pixel is alpha 1 and the matte reads as solid white.
@@ -1431,17 +1448,31 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
     // in a CUSTOM view, whenever the comp has any 3D layer (custom views need
     // no camera: nav writes the view's stored params, not scene nodes).
     // The write logic itself lives in @core/workspace/cameraNav (shared).
-    let camNav: { target: NavTarget; mode: CameraNavMode; last: { x: number; y: number }; pointerId: number } | null = null;
+    let camNav: {
+      target: NavTarget;
+      mode: CameraNavMode;
+      last: { x: number; y: number };
+      pointerId: number;
+      /** Orbit pivot captured at DRAG START (cursor/scene pivot modes); null
+       *  = the classic POI orbit. Frozen for the gesture so it cannot slide. */
+      pivot: { x: number; y: number; z: number } | null;
+      /** The Unified Camera's right-drag ran a dolly: the context menu that
+       *  right-RELEASE would open must be swallowed once (and only then). */
+      suppressContextMenu: boolean;
+    } | null = null;
     let altHintCursor = false;
+    // Set when a unified right-drag ends: the browser fires contextmenu AFTER
+    // pointerup, so the flag must outlive camNav by exactly one event.
+    let swallowNextContextMenu = false;
 
-    const cameraToolCursor = (mode: CameraNavMode): string =>
+    const cameraToolCursor = (mode: CameraNavMode | 'unified'): string =>
       mode === 'pan' ? 'grab' : mode === 'dolly' ? 'ns-resize' : 'move';
     const restoreCursor = (): void => {
       const tool = useGuidesStore.getState().cameraTool;
       overlay.style.cursor = tool !== 'none' ? cameraToolCursor(tool) : controller.ws.cursor.css;
     };
 
-    const startCameraNav = (e: PointerEvent, mode: CameraNavMode): boolean => {
+    const startCameraNav = (e: PointerEvent, mode: CameraNavMode, opts?: { suppressContextMenu?: boolean }): boolean => {
       const target = findNavTarget();
       if (!target) {
         // Say WHY rather than doing nothing. Inertness here is correct — a
@@ -1451,7 +1482,20 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
         if (why) useUIStore.getState().notify({ level: 'info', message: why, durationMs: 6000 });
         return false;
       }
-      camNav = { target, mode, last: local(e), pointerId: e.pointerId };
+      // Orbit pivot (AE's Orbit Around Cursor / Scene): resolved ONCE, at drag
+      // start, from the pointer's comp position — only for scene cameras;
+      // views keep their promote-to-custom-view orbit (orbitNavBy ignores it).
+      const pivot = mode === 'orbit' && target.kind === 'scene'
+        ? resolveOrbitPivot(
+            controller.ws.screenToWorld(local(e)),
+            compRef.current.width,
+            compRef.current.height,
+          )
+        : null;
+      camNav = {
+        target, mode, last: local(e), pointerId: e.pointerId, pivot,
+        suppressContextMenu: opts?.suppressContextMenu === true,
+      };
       e.preventDefault();
       try {
         overlay.setPointerCapture(e.pointerId);
@@ -1472,7 +1516,7 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
       nav.last = p;
       if (dx === 0 && dy === 0) return;
       if (nav.mode === 'orbit') {
-        orbitNavBy(nav.target, dx, dy);
+        orbitNavBy(nav.target, dx, dy, nav.pivot);
       } else if (nav.mode === 'dolly') {
         // Drag up (dy < 0) = dolly IN, matching Alt+wheel-up. Direct (unsmoothed)
         // writes: a drag is already continuous, easing would add lag.
@@ -1483,6 +1527,9 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
     };
 
     const endCameraNav = (): void => {
+      // The contextmenu event arrives after pointerup — remember the swallow
+      // past camNav's lifetime (see onContextMenu).
+      if (camNav?.suppressContextMenu) swallowNextContextMenu = true;
       camNav = null;
       useUIStore.getState().setDragging(false);
       restoreCursor();
@@ -1540,12 +1587,21 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
       }
       // Alt+middle-drag = camera Track XY — claim before the left-button guard.
       if (e.button === 1 && e.altKey && startCameraNav(e, 'pan')) return;
+      // Unified Camera (AE): while armed, the BUTTON picks the gesture —
+      // left orbits, middle pans (track XY), right dollies (track Z). Claimed
+      // before the left-only guard because its middle/right drags are camera
+      // gestures, not canvas interactions; the right-drag also swallows the
+      // context menu its release would otherwise open (only while armed).
+      if (useGuidesStore.getState().cameraTool === 'unified') {
+        const mode = unifiedNavModeFor(e.button);
+        if (mode && startCameraNav(e, mode, { suppressContextMenu: e.button === 2 })) return;
+      }
       if (e.button !== 0) return; // left-button interactions only
       // C-key camera tool: plain left-drag runs the active orbit/pan/dolly
       // mode (no Alt needed). Claims the press before any canvas interaction.
       {
         const camTool = useGuidesStore.getState().cameraTool;
-        if (camTool !== 'none' && startCameraNav(e, camTool)) return;
+        if (camTool !== 'none' && camTool !== 'unified' && startCameraNav(e, camTool)) return;
       }
       // Ruler guides: pointer-down inside a ruler strip drags out a NEW guide
       // (top strip → horizontal 'y' guide, left strip → vertical 'x' guide).
@@ -1710,6 +1766,13 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
       // move/marquee the layer).
       const hit = hitMotionPathKeyframe(controller, local(e));
       if (hit) {
+        // AE Convert Vertex: Ctrl/Cmd(+Alt)-click a path vertex toggles it
+        // between a corner (Linear) and Auto Bezier — a click, not a drag.
+        if (hit.part === 'point' && (e.ctrlKey || e.metaKey)) {
+          convertMotionPathVertex(hit.nodeId, hit.t);
+          controller.requestRender();
+          return;
+        }
         mpDragRef.current = hit;
         try {
           overlay.setPointerCapture(e.pointerId);
@@ -1747,7 +1810,19 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
         /* synthetic or already-released pointer — capture is best-effort */
       }
       const activeTool = useUIStore.getState().activeTool;
-      const isCreationTool = ['shape', 'ellipse', 'polygon', 'star', 'line', 'mask-rect', 'mask-ellipse'].includes(activeTool);
+      // AE Type tool: a press on an EXISTING text layer edits it rather than
+      // creating another. Resolved on release (see onUp), so the press's own
+      // mousedown cannot blur the editor it would open.
+      if ((activeTool === 'text' || activeTool === 'vertical-text') && !e.shiftKey) {
+        const hit = controller.ws.hitTestScreen(local(e));
+        const hitNode = hit ? defaultSceneGraph.getNode(hit.id) : null;
+        if (hitNode && !hitNode.locked && hitNode.components.some((c) => c.type === 'Text')) {
+          typeEditRef.current = hitNode.id as string;
+          return;
+        }
+      }
+      // 'text': a Type-tool drag draws a paragraph box, previewed like a shape.
+      const isCreationTool = ['shape', 'ellipse', 'polygon', 'star', 'line', 'mask-rect', 'mask-ellipse', 'text', 'vertical-text'].includes(activeTool);
       if (isCreationTool) {
         const p = local(e);
         creationDragRef.current = { start: p, current: p, tool: activeTool };
@@ -1909,6 +1984,14 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
       } catch {
         /* ignore */
       }
+      if (typeEditRef.current) {
+        const id = typeEditRef.current;
+        typeEditRef.current = null;
+        useSelectionStore.getState().set([id]);
+        useTextEditStore.getState().begin(id);
+        controller.requestRender();
+        return;
+      }
       if (roiDragRef.current && roiDragRef.current.pointerId === e.pointerId) {
         roiDragRef.current = null;
         useUIStore.getState().setDragging(false);
@@ -1993,6 +2076,16 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
       controller.ws.feedPointerUp(toPointer(e));
     };
     const onDoubleClick = (e: MouseEvent): void => {
+      // AE 26.5: double-click a guide → its editor (position, unit, pin, colour).
+      {
+        const g = hitGuideAt(controller, local(e as unknown as PointerEvent), true);
+        if (g && g.kind === 'user') {
+          e.preventDefault();
+          e.stopPropagation();
+          openGuideEditor(g.id);
+          return;
+        }
+      }
       const sel = useSelectionStore.getState().ids;
       if (sel.length === 1) {
         const node = defaultSceneGraph.getNode(sel[0]!);
@@ -2040,6 +2133,34 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
     };
     const onContextMenu = (e: MouseEvent): void => {
       e.preventDefault();
+      // The Unified Camera's right-drag was a dolly, not a menu request. The
+      // swallow is one-shot and armed only by that gesture, so the context
+      // menu behaves normally the moment the tool is released.
+      if (swallowNextContextMenu) {
+        swallowNextContextMenu = false;
+        return;
+      }
+      // A right-PRESS while the unified tool is armed that produced no drag
+      // (startCameraNav refused: no camera/3D) still falls through here and
+      // opens the menu — the tool only owns the button when it can act.
+      if (camNav?.suppressContextMenu) return;
+      // A motion-path keyframe first (the most specific target under the
+      // pointer): AE's Keyframe Interpolation ▸ Spatial Interpolation.
+      if (useGuidesStore.getState().motionPathVisible) {
+        const mp = hitMotionPathKeyframe(controller, local(e));
+        if (mp && mp.part === 'point') {
+          openContextMenu(e.clientX, e.clientY, motionPathKeyframeMenuItems(mp.nodeId, mp.t));
+          return;
+        }
+      }
+      // Then a user guide (locked ones too — the menu is how you unlock it).
+      {
+        const g = hitGuideAt(controller, local(e), true);
+        if (g && g.kind === 'user') {
+          openContextMenu(e.clientX, e.clientY, guideContextMenuItems(g.id));
+          return;
+        }
+      }
       const node = controller.ws.hitTestScreen(local(e));
       if (node) {
         // Match click-select behavior: right-clicking an unselected node selects it.
@@ -2055,7 +2176,12 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
       // Alt+wheel = camera dolly along the view axis (toward/away from POI).
       // Default z is -focalLength (comp plane 1:1), so wheel-up (deltaY < 0)
       // pushes z toward 0 = dolly IN.
-      if (e.altKey || useGuidesStore.getState().cameraTool === 'dolly') {
+      // The unified tool wheels a dolly too — AE's Unified Camera does.
+      if (
+        e.altKey
+        || useGuidesStore.getState().cameraTool === 'dolly'
+        || useGuidesStore.getState().cameraTool === 'unified'
+      ) {
         if (findNavTarget()) {
           // Smooth dolly: wheel ticks feed an rAF easer instead of stepping z
           // (or a custom view's distance) directly — see cameraNav.ts.
@@ -2194,6 +2320,10 @@ function paintOverlay(
   if (displayMode !== 'shaded' && controller) {
     paintDisplayMode(ctx, controller, displayMode);
   }
+  // Per-layer Quality = Wireframe: the renderer skipped these layers' pixels.
+  if (controller) {
+    paintWireframeQualityLayers(ctx, controller.sceneNodes(), (p) => controller.ws.worldToScreen(p), themeGuides().TEXT);
+  }
 
   // Wet-stroke preview: the Brush's in-flight samples (screen space), drawn as
   // round-capped ink at brush width so what you drag IS what commits on release.
@@ -2232,6 +2362,8 @@ function paintOverlay(
     ctx.strokeStyle = guideColor();
     ctx.lineWidth = 1;
     for (const g of overlay.guides) {
+      // Per-guide colour (AE 26.5); absent = the theme guide colour.
+      ctx.strokeStyle = g.color ?? guideColor();
       ctx.beginPath();
       if (g.axis === 'x') {
         ctx.moveTo(g.position + 0.5, 0);
@@ -2691,6 +2823,20 @@ function compToPath(nodeId: string, time: number, p: { x: number; y: number }): 
  */
 let mpHover: { nodeId: string; t: number; part: 'point' | 'in' | 'out' } | null = null;
 
+/**
+ * The keyframe-time span of the selected layer's motion path to draw (AE's
+ * motion-path display preference): all, none (null), or a window of
+ * `motionPathWindowSeconds` centred on the playhead on the layer's keyframe axis.
+ */
+function motionPathWindowFor(nodeId: string, compTime: number): { min: number; max: number } | null {
+  const g = useGuidesStore.getState();
+  if (g.motionPathShow === 'all') return { min: -Infinity, max: Infinity };
+  return motionPathTimeWindow(g.motionPathShow, g.motionPathWindowSeconds, compToKeyframeTime(nodeId, compTime, 'x'));
+}
+
+const inMotionPathWindow = (t: number, w: { min: number; max: number }): boolean =>
+  t >= w.min - 1e-9 && t <= w.max + 1e-9;
+
 function hitMotionPathKeyframe(
   controller: WorkspaceController,
   screen: { x: number; y: number },
@@ -2708,6 +2854,9 @@ function hitMotionPathKeyframe(
   const project = is3D ? currentViewProjector(comp.w, comp.h, playheadTime()) : null;
   const baseZ = is3D ? readNode3D(node).z : 0;
   const time = playheadTime();
+  // Only what is DRAWN is grabbable — the display window hides the rest.
+  const win = motionPathWindowFor(nodeId, time);
+  if (!win) return null;
   const near = (p: { x: number; y: number }, t?: number): boolean => {
     // Through the parent chain FIRST, exactly as the painter does — the dots
     // have to be grabbable where they are drawn.
@@ -2720,7 +2869,7 @@ function hitMotionPathKeyframe(
     const s = controller.ws.worldToScreen(world);
     return Math.hypot(s.x - screen.x, s.y - screen.y) <= R;
   };
-  const tangents = motionPathTangents(node);
+  const tangents = motionPathTangents(node).filter((k) => inMotionPathWindow(k.t, win));
   for (const k of tangents) {
     if (k.out && near(k.out, k.t)) return { nodeId, t: k.t, part: 'out' };
     if (k.in && near(k.in, k.t)) return { nodeId, t: k.t, part: 'in' };
@@ -2946,7 +3095,9 @@ function paintMotionPath(
   const nodeId = ids[0]!;
   const node = defaultSceneGraph.getNode(nodeId);
   if (!node || !hasPositionAnimation(nodeId)) return;
-  const samples = motionPathSamples(node);
+  const win = motionPathWindowFor(nodeId, time);
+  if (!win) return;
+  const samples = motionPathSamples(node).filter((s) => inMotionPathWindow(s.t, win));
   if (samples.length < 2) return;
 
   const ctx = canvas.getContext('2d');
@@ -2990,6 +3141,7 @@ function paintMotionPath(
   // control point, with a small square grab dot (AE-style). Drawn under the
   // keyframe dots so the points stay the primary target.
   for (const k of motionPathTangents(node)) {
+    if (!inMotionPathWindow(k.t, win)) continue;
     const p = toS(k);
     for (const [part, h] of [['out', k.out], ['in', k.in]] as const) {
       if (!h) continue;
@@ -3029,6 +3181,7 @@ function paintMotionPath(
     const frameSamples = motionPathFrameSamples(node, fps);
     ctx.fillStyle = 'rgba(160, 205, 255, 0.9)';
     for (const f of frameSamples) {
+      if (!inMotionPathWindow(f.t, win)) continue;
       const s = toS(f);
       ctx.beginPath();
       ctx.arc(s.x, s.y, frameDotRadius, 0, Math.PI * 2);
@@ -3037,6 +3190,7 @@ function paintMotionPath(
 
     // 2. Draw keyframe markers (distinct larger dots with white center & blue border)
     for (const k of motionPathKeyframes(node)) {
+      if (!inMotionPathWindow(k.t, win)) continue;
       const s = toS(k);
       const hovered = mpHover !== null && mpHover.nodeId === nodeId
         && Math.abs(mpHover.t - k.t) < 1e-9 && mpHover.part === 'point';
@@ -3219,6 +3373,9 @@ function paintDisplayMode(
   }
   ctx.restore();
 }
+
+// AE's per-layer Quality = WIREFRAME is painted by `wireframeQualityOverlay.ts`,
+// shared with the 2-up/4-up panes and Presentation Mode (useViewportRenderer).
 
 function paintSafeArea(ctx: CanvasRenderingContext2D, controller: WorkspaceController): void {
   try {

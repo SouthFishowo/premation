@@ -15,7 +15,7 @@
  * rasterizer lays the text out glyph by glyph.
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { compToKeyframeTime } from '@core/timeline/TimelineController';
 
 import { Button } from '@components/Button';
@@ -33,6 +33,7 @@ import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { defaultAnimation } from '@motion/animation';
 import { runAnimEdit } from '@core/animation/animationCommands';
 import { applyTypewriter } from '@core/animation/keyframeAssistants';
+import { toHexColor } from '@core/text/cssColor';
 import {
   hasTextComponent,
   readAnimatorData,
@@ -56,7 +57,27 @@ import {
   type WigglySelectorData,
   type ExpressionSelectorData,
   type TextAnimatorData,
+  type CharacterRange,
+  type TrackingType,
+  OPTIONAL_ANIMATOR_PROPERTIES,
+  ALL_TRANSFORM_OPTIONAL,
+  addAnimatorProperties,
+  removeAnimatorProperty,
+  addAnimatorAxis,
+  animatorAxisPropPath,
 } from '@core/text/textAnimators';
+import {
+  ANCHOR_GROUPINGS,
+  FILL_STROKE_MODES,
+  INTER_CHARACTER_BLEND_MODES,
+  readTextMoreOptions,
+  type AnchorGrouping,
+  type FillStrokeMode,
+} from '@core/text/textMoreOptions';
+import { REGISTERED_AXES, MAX_ANIMATED_AXES, axisLabel, readFontAxesProp } from '@core/text/fontAxes';
+import { loadFamilyAxes } from '@core/text/fontAxesLoader';
+import { runDocumentEdit } from '@core/commands/documentEdit';
+import { bumpScene } from '@stores/sceneStore';
 import { is3DEnabled, isPerChar3D } from '@core/scene/threeD';
 import styles from './TextAnimatorControls.module.css';
 
@@ -503,26 +524,139 @@ function ExpressionSelectorBody({
   );
 }
 
+const CHARACTER_RANGES: { id: CharacterRange; label: string }[] = [
+  { id: 'preserve', label: 'Preserve Case & Digits' },
+  { id: 'full', label: 'Full Unicode' },
+];
+
+const TRACKING_TYPES: { id: TrackingType; label: string }[] = [
+  { id: 'after', label: 'After' },
+  { id: 'before', label: 'Before' },
+  { id: 'beforeAfter', label: 'Before & After' },
+];
+
+/**
+ * The optional properties of one group that this animator has ADDED, each
+ * keyframeable, each removable — AE's Animator ▸ Add ▸ Property rows.
+ */
+function OptionalParamRows({
+  nodeId,
+  index,
+  data,
+  group,
+  show3D,
+}: {
+  nodeId: string;
+  index: number;
+  data: TextAnimatorData;
+  group: 'transform' | 'typography' | 'fill' | 'stroke';
+  show3D: boolean;
+}): JSX.Element | null {
+  const stored = data as unknown as Record<string, unknown>;
+  const rows = OPTIONAL_ANIMATOR_PROPERTIES.filter(
+    (o) => o.group === group && typeof stored[o.param] === 'number' && (o.param !== 'anchorZ' || show3D),
+  );
+  if (rows.length === 0) return null;
+  return (
+    <>
+      {rows.map((o) => (
+        <div key={o.param} style={{ display: 'flex', alignItems: 'center' }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <AnimatorParamRow
+              nodeId={nodeId}
+              index={index}
+              param={o.param}
+              label={o.label}
+              value={stored[o.param] as number}
+              unit={o.unit || undefined}
+              min={o.min}
+              max={o.max}
+              step={o.step}
+            />
+          </div>
+          <button
+            type="button"
+            className={styles.remove}
+            onClick={() => removeAnimatorProperty(nodeId, index, o.param)}
+            aria-label={`Remove ${o.label}`}
+            title="Remove property"
+          >
+            <Icon name="minus" size="sm" />
+          </button>
+        </div>
+      ))}
+    </>
+  );
+}
+
 function AnimatorGroup({
   nodeId,
   index,
   data,
   show3D,
   perChar3D,
+  axisTags,
 }: {
   nodeId: string;
   index: number;
   data: TextAnimatorData;
   show3D: boolean;
   perChar3D: boolean;
+  /** Axis tags the Font Axis menu offers (the layer font's, else registered). */
+  axisTags: ReadonlyArray<string>;
 }): JSX.Element {
   const selectors = data.selectors ?? [];
-  const addItems: DropdownItem[] = KINDS.map((k) => ({
-    type: 'item',
-    id: k.id,
-    label: `${k.label} Selector`,
-    onSelect: () => addSelector(nodeId, index, k.id),
-  }));
+  const stored = data as unknown as Record<string, unknown>;
+  const notify = useUIStore.getState().notify;
+  // AE's Add menu: Property ▸ (incl. All Transform Properties, Font Axis ▸)
+  // and Selector ▸.
+  const propertyItems: DropdownItem[] = [
+    {
+      type: 'item',
+      id: 'allTransform',
+      label: 'All Transform Properties',
+      onSelect: () => addAnimatorProperties(nodeId, index, ALL_TRANSFORM_OPTIONAL),
+    },
+    { type: 'separator' },
+    ...OPTIONAL_ANIMATOR_PROPERTIES.filter((o) => o.param !== 'anchorZ' || show3D).map((o): DropdownItem => ({
+      type: 'item',
+      id: o.param,
+      label: o.label,
+      disabled: stored[o.param] !== undefined,
+      onSelect: () => addAnimatorProperties(nodeId, index, [o.param]),
+    })),
+    { type: 'separator' },
+    {
+      type: 'item',
+      id: 'fontAxis',
+      label: 'Font Axis',
+      submenu: axisTags.map((tag): DropdownItem => ({
+        type: 'item',
+        id: `axis_${tag}`,
+        label: `${axisLabel(tag)} (${tag})`,
+        disabled: !!data.axes && tag in data.axes,
+        onSelect: () => {
+          if (!addAnimatorAxis(nodeId, index, tag)) {
+            notify({ level: 'warning', message: `A text layer's animators can drive at most ${MAX_ANIMATED_AXES} font axes.`, durationMs: 2400 });
+          }
+        },
+      })),
+    },
+  ];
+  const addItems: DropdownItem[] = [
+    { type: 'item', id: 'property', label: 'Property', submenu: propertyItems },
+    {
+      type: 'item',
+      id: 'selector',
+      label: 'Selector',
+      submenu: KINDS.map((k): DropdownItem => ({
+        type: 'item',
+        id: k.id,
+        label: `${k.label} Selector`,
+        onSelect: () => addSelector(nodeId, index, k.id),
+      })),
+    },
+  ];
 
   return (
     <div className={styles.group}>
@@ -538,7 +672,7 @@ function AnimatorGroup({
           <Dropdown
             placement="left-start"
             trigger={
-              <button type="button" className={styles.remove} title="Add selector" aria-label="Add selector">
+              <button type="button" className={styles.remove} title="Add property or selector" aria-label="Add property or selector">
                 <Icon name="plus" size="sm" />
               </button>
             }
@@ -583,6 +717,7 @@ function AnimatorGroup({
         </>
       )}
       <AnimatorParamRow nodeId={nodeId} index={index} param="skew" label="Skew" value={data.skew ?? 0} unit="°" />
+      <OptionalParamRows nodeId={nodeId} index={index} data={data} group="transform" show3D={show3D} />
       {show3D && !perChar3D && (
         <div className={styles.empty} style={{ padding: '4px 0 8px' }}>
           Position Z / Rotation X·Y apply when Per-character 3D is on (Geometry Options).
@@ -591,16 +726,57 @@ function AnimatorGroup({
 
       <div className={styles.subhead}>Typography</div>
       <AnimatorParamRow nodeId={nodeId} index={index} param="tracking" label="Tracking" value={data.tracking} unit="px" />
+      <PickRow
+        label="Tracking Type"
+        value={data.trackingType ?? 'after'}
+        options={TRACKING_TYPES}
+        onSelect={(id) => updateAnimator(nodeId, index, { trackingType: id === 'after' ? undefined : id })}
+      />
       <AnimatorParamRow nodeId={nodeId} index={index} param="lineSpacing" label="Line Spacing" value={data.lineSpacing ?? 0} unit="px" />
       {/* Character Offset walks each glyph through its own alphabet — the
           decode / scramble reveal, which no transform can fake. */}
       <AnimatorParamRow nodeId={nodeId} index={index} param="characterOffset" label="Character Offset" value={data.characterOffset ?? 0} step={1} />
+      <PickRow
+        label="Character Range"
+        value={data.characterRange ?? 'preserve'}
+        options={CHARACTER_RANGES}
+        onSelect={(id) => updateAnimator(nodeId, index, { characterRange: id === 'preserve' ? undefined : id })}
+      />
+      <OptionalParamRows nodeId={nodeId} index={index} data={data} group="typography" show3D={show3D} />
+      {Object.entries(data.axes ?? {}).map(([tag, value]) => (
+        <div key={tag} style={{ display: 'flex', alignItems: 'center' }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <ParamRow
+              nodeId={nodeId}
+              path={animatorAxisPropPath(index, tag)}
+              label={`Font Axis ${tag}`}
+              value={value}
+              onStatic={(v) => updateAnimator(nodeId, index, { axes: { ...(data.axes ?? {}), [tag]: v } })}
+            />
+          </div>
+          <button
+            type="button"
+            className={styles.remove}
+            onClick={() => removeAnimatorProperty(nodeId, index, `axis${tag}`)}
+            aria-label={`Remove Font Axis ${tag}`}
+            title="Remove property"
+          >
+            <Icon name="minus" size="sm" />
+          </button>
+        </div>
+      ))}
 
       <div className={styles.subhead}>Appearance</div>
       <AnimatorParamRow nodeId={nodeId} index={index} param="opacity" label="Opacity" value={data.opacity} unit="%" min={0} max={100} />
       <AnimatorParamRow nodeId={nodeId} index={index} param="fillOpacity" label="Fill Opacity" value={data.fillOpacity ?? 100} unit="%" min={0} max={100} />
-      <AnimatorParamRow nodeId={nodeId} index={index} param="blur" label="Blur" value={data.blur ?? 0} unit="px" min={0} />
+      {/* AE's animator Blur is 2-D. Same X/Y pair as Scale: the Y row shows
+          the X value until it is edited (linked), and writing it stores the
+          animator's own blurY — from then on the axes are unlinked. */}
+      <AnimatorParamRow nodeId={nodeId} index={index} param="blur" label="Blur X" value={data.blur ?? 0} unit="px" min={0} />
+      <AnimatorParamRow nodeId={nodeId} index={index} param="blurY" label="Blur Y" value={data.blurY ?? data.blur ?? 0} unit="px" min={0} />
       <AnimatorParamRow nodeId={nodeId} index={index} param="strokeWidth" label="Stroke Width" value={data.strokeWidth ?? 0} unit="px" min={0} />
+      <OptionalParamRows nodeId={nodeId} index={index} data={data} group="fill" show3D={show3D} />
+      <OptionalParamRows nodeId={nodeId} index={index} data={data} group="stroke" show3D={show3D} />
 
       <ColorRow
         label="Fill colour"
@@ -645,7 +821,7 @@ function ColorRow({
             </button>
           </>
         ) : (
-          <button type="button" className={styles.pick} onClick={() => onSet('var(--color-primary)')}>
+          <button type="button" className={styles.pick} onClick={() => onSet(defaultAnimatorColor())}>
             <span>Add colour</span>
           </button>
         )}
@@ -654,10 +830,89 @@ function ColorRow({
   );
 }
 
+/* eslint-disable design-system/no-hex-color */
+/** Used when the theme's primary token cannot be read (no DOM, unset var). */
+const FALLBACK_ANIMATOR_COLOR = '#ff3b30';
+/* eslint-enable design-system/no-hex-color */
+
+/**
+ * The colour "Add colour" starts from: the theme's primary, RESOLVED to a hex
+ * at click time. It used to store the literal `'var(--color-primary)'`, which
+ * the canvas cannot parse — the animator's colour then painted nothing (or the
+ * previous glyph's colour), and the colour picker had no hex to show.
+ */
+function defaultAnimatorColor(): string {
+  return toHexColor('var(--color-primary)') ?? FALLBACK_ANIMATOR_COLOR;
+}
+
+/**
+ * AE's Text ▸ More Options, per layer: how grouped characters pivot, how fill
+ * and stroke layer across characters, and how glyphs blend over each other.
+ */
+function MoreOptionsGroup({ nodeId }: { nodeId: string }): JSX.Element | null {
+  const node = defaultSceneGraph.getNode(nodeId);
+  const comp = node?.components.find((c) => c.type === 'Text');
+  if (!node || !comp) return null;
+  const o = readTextMoreOptions(node);
+  const write = (label: string, key: string, value: unknown): void =>
+    runDocumentEdit(label, () => {
+      defaultSceneGraph.writeProp(nodeId, comp.id, key, value);
+      bumpScene();
+    });
+  return (
+    <div className={styles.group}>
+      <div className={styles.groupHead}>
+        <span className={styles.groupTitle}>More Options</span>
+      </div>
+      <PickRow<AnchorGrouping>
+        label="Anchor Point Grouping"
+        value={o.anchorGrouping}
+        options={ANCHOR_GROUPINGS.map((g) => ({ id: g.value, label: g.label }))}
+        onSelect={(v) => write('Anchor Point Grouping', 'anchorGrouping', v)}
+      />
+      <ParamRow nodeId={nodeId} path="groupingAlignX" label="Grouping Alignment X" value={o.groupingAlignX} unit="%"
+        onStatic={(v) => write('Grouping Alignment X', 'groupingAlignX', v)} />
+      <ParamRow nodeId={nodeId} path="groupingAlignY" label="Grouping Alignment Y" value={o.groupingAlignY} unit="%"
+        onStatic={(v) => write('Grouping Alignment Y', 'groupingAlignY', v)} />
+      <PickRow<FillStrokeMode>
+        label="Fill & Stroke"
+        value={o.fillStrokeMode}
+        options={FILL_STROKE_MODES.map((m) => ({ id: m.value, label: m.label }))}
+        onSelect={(v) => write('Fill & Stroke', 'fillStrokeMode', v)}
+      />
+      <PickRow
+        label="Inter-Character Blending"
+        value={o.interCharacterBlending}
+        options={INTER_CHARACTER_BLEND_MODES.map((m) => ({ id: m.value, label: m.label }))}
+        onSelect={(v) => write('Inter-Character Blending', 'interCharacterBlending', v)}
+      />
+    </div>
+  );
+}
+
+/** The axis tags the Font Axis menu offers: the font's own `fvar` axes when
+ *  its file can be read, plus the registered ones, plus any the layer sets. */
+function useAxisTags(nodeId: string, family: string): string[] {
+  const [fontTags, setFontTags] = useState<string[]>([]);
+  useEffect(() => {
+    let live = true;
+    void loadFamilyAxes(family).then((r) => { if (live) setFontTags(r.fromFont ? r.axes.map((a) => a.tag) : []); });
+    return () => { live = false; };
+  }, [family]);
+  const node = defaultSceneGraph.getNode(nodeId);
+  const layerTags = node ? Object.keys(readFontAxesProp(node)) : [];
+  return [...new Set([...fontTags, ...REGISTERED_AXES.map((a) => a.tag), ...layerTags])];
+}
+
 export function TextAnimatorControls({ nodeId }: { nodeId: string }): JSX.Element | null {
   useSceneRevision((s) => s.rev);
   const time = useActiveWorkspace()?.time ?? 0;
   const node = defaultSceneGraph.getNode(nodeId);
+  const family = String(
+    (node?.components.find((c) => c.type === 'Text')?.props as Record<string, unknown> | undefined)?.fontFamily ?? 'Inter',
+  );
+  // Before the early return: hooks must run on every render.
+  const axisTags = useAxisTags(nodeId, family);
   if (!node || !hasTextComponent(node)) return null;
 
   const animators = readAnimatorData(node);
@@ -706,16 +961,20 @@ export function TextAnimatorControls({ nodeId }: { nodeId: string }): JSX.Elemen
           selector Offset to stagger them.
         </div>
       ) : (
-        animators.map((a, i) => (
-          <AnimatorGroup
-            key={a.id}
-            nodeId={nodeId}
-            index={i}
-            data={a}
-            show3D={is3DEnabled(node)}
-            perChar3D={isPerChar3D(node)}
-          />
-        ))
+        <>
+          <MoreOptionsGroup nodeId={nodeId} />
+          {animators.map((a, i) => (
+            <AnimatorGroup
+              key={a.id}
+              nodeId={nodeId}
+              index={i}
+              data={a}
+              show3D={is3DEnabled(node)}
+              perChar3D={isPerChar3D(node)}
+              axisTags={axisTags}
+            />
+          ))}
+        </>
       )}
     </div>
   );

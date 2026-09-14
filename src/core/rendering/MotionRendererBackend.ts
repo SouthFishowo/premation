@@ -895,12 +895,18 @@ export class MotionRendererBackend implements RenderBackend {
                 baselineShift: layer.baselineShift,
                 textStroke: layer.textStroke,
                 textStrokeWidth: layer.textStrokeWidth,
+                textExtras: layer.textExtras,
                 runs: layer.runs,
                 // Per-glyph animator output and path placement. buildSnapshot
                 // resolves both; forwarding them is what makes text animators
                 // and text-on-path produce pixels at all.
                 glyphs: layer.glyphs,
                 textPath: layer.textPath,
+                fontAxes: layer.fontAxes,
+                // Only a GRADIENT paint travels: a solid fill is already `color`,
+                // and forwarding it would change every text layer's cache key.
+                fillPaint: layer.fillPaint && layer.fillPaint.type !== 'solid' ? layer.fillPaint : undefined,
+                strokePaint: layer.textStrokePaint,
                 // Canvas2D-only effects (Fill/Stroke/Sharpen/Noise/…) + mask
                 // are baked into the text texture — they have no GPU shader
                 // form. layerToRenderable drops them from the GPU draw so

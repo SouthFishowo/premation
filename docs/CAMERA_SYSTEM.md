@@ -233,13 +233,35 @@ writes. Two input paths drive it and they share every code path below:
 
 - **Modifier nav:** `Alt+drag` orbits, `Shift+Alt+drag` (or `Alt+middle-drag`)
   tracks XY, `Alt+wheel` dollies.
-- **The C-key camera tool:** cycles orbit → pan → dolly, then plain left-drag.
+- **The C-key camera tool:** cycles **unified → orbit → pan → dolly**, then
+  plain drag. The **Unified Camera** (first, like AE) is one armed tool where
+  the mouse button picks the gesture — left orbits, middle tracks XY, right
+  dollies (`unifiedNavModeFor`); while it is armed, a right-drag swallows the
+  context menu its release would open (and only then), and the wheel dollies.
+  Both it and the cycle command (`tool.cameraCycle`) are palette commands;
+  `tool.cameraUnified` arms it directly and is rebindable in Customize….
 
 | Gesture | Writes | Feel |
 |---|---|---|
 | Orbit | `orbitYaw += dx·0.4`, `orbitPitch += dy·0.4` (clamped ±89) | 0.4°/px on every path |
 | Track XY | `x -= dx/scale`, `y -= dy/scale`, and the POI with it | Framing follows the cursor, so the camera moves opposite the drag |
 | Dolly | `z -= delta·2` | Drag up / wheel up = dolly in |
+
+**Orbit pivot modes (AE parity, 2026-09-14).** The camera-tool menu carries a
+radio group — **Orbit Around Cursor / Orbit Around Scene / Orbit Around Camera
+POI** (`guidesStore.cameraOrbitPivot`, session state; default POI = the classic
+behaviour above). Cursor and Scene run `orbitCameraAboutPivot`, a RIGID orbit of
+the whole rig about an arbitrary world point: on a two-node camera the eye AND
+the POI rotate about the pivot (the pivot is never written INTO the POI); on a
+one-node camera the eye rotates and the deltas fold additively into
+`orbitYaw`/`orbitPitch`, with the base position solved back through the new
+angles so the resolved eye lands on the rigid rotation. The cursor pivot is
+resolved ONCE at drag start (`resolveOrbitPivot`): the cursor ray
+(`Project3D.unprojectScreenRay`) is intersected with the plane of the frontmost
+3D layer under the cursor (in-bounds hit nearest along the ray), else the
+ground plane (`y = compHeight + groundLevel`, where the 3D ground grid draws),
+else the POI-distance plane facing the camera. Orthographic and custom views
+ignore the pivot entirely and keep their promote-to-custom-view orbit.
 
 Three design points that are easy to get wrong:
 
@@ -291,12 +313,24 @@ depth buffer — but within a layer it is no longer flat. The preferred path is
 projected quad, rendered by the renderer's own `coc-blur` shader
 (`builtin.ts`), which interpolates the blur radius per pixel across the quad —
 a tilted plane crossing the focal region sharpens continuously through it.
-Polygonal iris bokeh (`irisBlades` / `irisRoundness` / `highlightGain`) is a
-separate `bokeh` gather pass. Strip subdivision (`planDofStrips`, ≤12 strips /
+Polygonal iris bokeh is a separate `bokeh` gather pass, and the iris is the
+full AE set of keyframeable camera options (2026-09-14): `irisBlades` /
+`irisRoundness` / `irisRotation` / `irisAspect` (aspect ratio) plus the
+highlight trio `highlightGain` / `highlightThreshold` / `highlightSaturation`
+and `diffractionFringe` (rim-weighted bokeh edge). Every one of them defaults
+to its render-identical neutral (rotation 0, aspect 1, threshold / saturation /
+fringe 0), is threaded through `bokeh`, `coc-blur` AND the depth-buffer
+`dof-gather` pass in both shader dialects (WGSL + GLSL), and surfaces as a
+stopwatched row in CameraSection / the timeline's Camera Options like the rest.
+Strip subdivision (`planDofStrips`, ≤12 strips /
 5×5 grid) remains the fallback when corners can't be planned, and a plain
-`blur` effect entry the fallback below that. What still does NOT exist is a
-depth-buffer gather across layers: each layer defocuses from its own plane, so
-two interpenetrating layers do not exchange blur at their intersection. See
+`blur` effect entry the fallback below that. The old "no depth-buffer gather
+across layers" gap is closed for the depth-tested path: CompositionPass renders
+a 3D depth group into a single-sample colour+depth pair and runs `dof-gather`
+— per-PIXEL circle of confusion from the real depth buffer, same two CoC
+models as `dofBlurPx`, with the per-layer blurs dropped only for renderables it
+actually gathers (`dofSource`). Layers that fall off the depth path keep the
+per-layer maths above, so those still defocus from their own plane. See
 `docs/EDITOR_REFERENCE.md` §4.
 
 DOF is off entirely in orthographic views (no lens), in custom views (you are
@@ -324,7 +358,8 @@ camera. Time remap retimes the layer's own animation, never the camera's clock.
 | Camera follows its parent chain | Yes | Yes |
 | Zoom ↔ Angle of View as one value | Yes | Yes |
 | Film size is a label, not a lens change | Yes | Yes |
-| Orbit / Track XY / Track Z tools | Yes, C cycles them, and they are visible toolbar buttons in `SceneControls.tsx` | Yes, C cycles them |
+| Unified Camera + Orbit / Track XY / Track Z tools | Yes, C cycles all four (unified first), menu in `SceneControls.tsx`; unified maps left/middle/right to orbit/pan/dolly | Yes, C cycles them |
+| Orbit Around Cursor / Scene / Camera POI | Yes — pivot radio group in the camera-tool menu (§6) | Yes |
 | In-place X / Y / Z rotation (tripod pan, tilt, dutch) | Yes, `orientationX/Y/Z`, offsets onto the base aim | Yes |
 | In-place rotation on a TARGETED camera without losing tracking | Yes, by offset composition (§4.3) | Yes |
 | 1 / 2 / 4 view layouts | Yes | Yes |
@@ -341,9 +376,10 @@ camera. Time remap retimes the layer's own animation, never the camera's clock.
   HDRI. Extrusion exists (`extrusion.ts`) but the primitive is still a layer in
   a space. AE is the same in its classic renderer; it differs in having Cinema
   4D / Advanced 3D renderers this app has no equivalent of.
-- **Depth of field is resolved per layer** (§7): per-pixel CoC gradients across
-  each layer's own quad, but no cross-layer depth-buffer gather. AE's is a real
-  circle-of-confusion over scene depth.
+- **Depth of field is per-pixel on the depth-tested path, per layer elsewhere**
+  (§7): 3D depth groups gather from the real depth buffer (`dof-gather`) like
+  AE's circle-of-confusion over scene depth; layers that fall off the depth
+  path still resolve per-pixel CoC across their own quad only.
 - **Shadows are 2.5D projections**, not cast geometry. Shading itself is
   per-fragment: Lambert plus Blinn-Phong on the depth-tested path (`builtin.ts`,
   `fn shade3d`, driven by a world-position varying), with `quadGain` in

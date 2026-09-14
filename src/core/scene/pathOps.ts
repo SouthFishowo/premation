@@ -16,6 +16,7 @@
  * a scrub back to the same frame all produce the same shape.
  */
 
+import polygonClipping from 'polygon-clipping';
 import { trimSegments, trimPolyline, type Pt } from './trimPath';
 import { rectOutline } from '@core/geometry/extrudeMesh';
 import type { SceneNode } from '@core/types';
@@ -26,6 +27,9 @@ import { repeaterCopies, defaultRepeater, type Repeater, type RepeaterComposite 
 export type PathOpType =
   | 'none' | 'zigzag' | 'roundCorners' | 'pucker' | 'twist' | 'offset' | 'roughen' | 'trim' | 'repeater'
   | 'wiggleTransform';
+
+/** Offset Paths' corner treatment — the same three joins a stroke has. */
+export type OffsetLineJoin = 'miter' | 'round' | 'bevel';
 
 /**
  * One continuous run of geometry flowing through the chain.
@@ -131,6 +135,22 @@ export interface PathOp {
    * refusing to start.
    */
   correlation?: number;
+  /**
+   * Offset Paths only — how the gap at an outer corner is filled: AE's Line
+   * Join. `miter` (the default, AE's too) extends the two offset edges to
+   * their intersection, falling back to a bevel past `miterLimit`; `round`
+   * sweeps an arc; `bevel` cuts straight across. Discrete (not keyframeable) —
+   * interpolating a join style has no meaning between the stops.
+   */
+  lineJoin?: OffsetLineJoin;
+  /**
+   * Offset Paths only — AE's Miter Limit: an outer miter longer than
+   * `miterLimit × |amount|` is cut to a bevel. Keyframeable, like AE's.
+   * Absent means 4 (the Canvas2D convention), which on ordinary corners is
+   * indistinguishable from the unbounded miter the old naive offset produced.
+   */
+  miterLimit?: number;
+
   /** Trim only — start of the visible range, percent 0..100. */
   start?: number;
   /** Trim only — end of the visible range, percent 0..100. */
@@ -205,6 +225,10 @@ export const PATHOP_PARAMS = [
   // Animating a seed just scrubs through unrelated noise fields.
   'amount', 'detail', 'wigglesPerSecond', 'correlation',
   'wiggleRotation', 'wiggleScale',
+  // Offset Paths' miter cap — animatable in AE, so animatable here. The JOIN
+  // is deliberately absent: it is discrete, like `composite` and
+  // `trimMultiple`, and interpolating a corner style has no meaning.
+  'miterLimit',
   'start', 'end', 'offset',
   'copies', 'offsetX', 'offsetY', 'offsetRotation', 'offsetScale', 'offsetOpacity',
   'anchorX', 'anchorY',
@@ -297,6 +321,14 @@ export function pathOpParamSpecs(type: PathOpType): ReadonlyArray<PathOpParamSpe
       { param: 'wiggleScale', label: 'Scale', unit: '%', min: 0 },
       { param: 'anchorX', label: 'Anchor X', unit: 'px', signed: true },
       { param: 'anchorY', label: 'Anchor Y', unit: 'px', signed: true },
+    ];
+  }
+  if (type === 'offset') {
+    // AE's Offset Paths rows: Amount and Miter Limit (both animatable there,
+    // both here). Line Join is a discrete picker on the card, not a row.
+    return [
+      { param: 'amount', label: 'Amount', unit: 'px', signed: true },
+      { param: 'miterLimit', label: 'Miter Limit', min: 1, step: 0.1 },
     ];
   }
   const { amount, detail } = paramLabels(type);
@@ -457,14 +489,27 @@ const DEG = Math.PI / 180;
 // ── Pure geometry (tested) ───────────────────────────────────────────
 
 /**
+ * Longest chord a flattened corner arc may span, in layer px — the same budget
+ * `flattenOutline(…, ADAPTIVE)` gives the rest of the chain's input, so a
+ * rounded corner is exactly as smooth as the drawn curve beside it. Restated
+ * here rather than imported because `mergePaths` (where ADAPTIVE lives)
+ * imports THIS module.
+ */
+const CORNER_ARC_MAX_CHORD_PX = 2.5;
+
+/**
  * A shape's outline as a closed polyline in local space (centred at 0,0).
  * `subdivide` inserts extra points along rect edges (0 = plain corners) so
  * pucker/twist deform smoothly rather than just moving the four corners.
  *
  * `cornerRadii` (uniform, or per-corner TL→TR→BR→BL) rounds a rect's corners
- * INTO the polyline. The chain's output is drawn verbatim as a path, so a
- * rounded rect whose seed came out sharp stayed sharp for good — the radii
- * fields have no meaning once the primitive is gone.
+ * INTO the polyline as flattened quarter arcs. This is how a rounded rect
+ * keeps its corners under the operator chain: the chain converts the
+ * primitive to an explicit path, and the rasterizer's `cornerRadii` honouring
+ * lives in the rect branch it no longer takes — so without this, adding ANY
+ * operator squared the corners off as a side effect. Absent or all-zero radii
+ * emit the four sharp corners byte-identically to before the parameter
+ * existed.
  *
  * `cornerAxisScale` is `RenderLayer.cornerRadiusScale`: the |scaleX|,|scaleY|
  * the compositor will draw this geometry at. The radii are authored in
@@ -499,8 +544,12 @@ export function shapeOutline(
     const ky = cornerAxisScale && cornerAxisScale[1] > 1e-6 ? cornerAxisScale[1] : 1;
     // Reuse the extrusion pipeline's exact rounded-rect polygon (per-corner
     // radii + clamping) rather than flattening a rounded rect a third way.
-    // 12 segments per 90° arc matches the ellipse default's 48 per circle.
-    const ring = rectOutline(w * kx, h * ky, rr, 12)[0]!;
+    // Arc density is adaptive on the largest radius so a corner arc's chords
+    // stay within the chain's own ~2.5px budget (never below 12 segments per
+    // 90°, matching the ellipse default's 48 per circle).
+    const maxR = Math.max(rr[0], rr[1], rr[2], rr[3]);
+    const arcSteps = Math.max(12, Math.min(96, Math.ceil((maxR * Math.PI * 0.5) / CORNER_ARC_MAX_CHORD_PX)));
+    const ring = rectOutline(w * kx, h * ky, rr, arcSteps)[0]!;
     const pts: Pt[] = [];
     for (const p of ring.points) {
       const q = { x: p.x / kx, y: p.y / ky };
@@ -671,32 +720,361 @@ export function twist(pts: readonly Pt[], angleDeg: number): Pt[] {
 }
 
 /**
- * Offset Paths — move every point along its averaged-edge normal. Sign flips
- * expand vs contract (which is which depends on the outline's winding). Naive
- * normal offset with no self-intersection cleanup — AE's is fancier, but this
- * covers the classic "grow/shrink the shape" use. Pure.
+ * Offset Paths — true polygon/polyline offsetting with corner joins.
+ *
+ * Replaces the naive averaged-normal offset (every point slid along its vertex
+ * normal, no joins, no cleanup), which had two visible failures AE's operator
+ * does not: an outer corner was pulled to a fixed bisector point regardless of
+ * its angle — a sharp spike offset outward stayed blunt — and a concave corner
+ * offset far enough crossed itself and painted a bow-tie.
+ *
+ * Model, per edge rather than per vertex: every EDGE is translated along its
+ * own left normal by `amount`, and each vertex between two edges is closed
+ * with join geometry —
+ *
+ *   • outer corner (the offset edges diverge): `miter` extends both edges to
+ *     their intersection, cut to a bevel when the miter length exceeds
+ *     `miterLimit × |amount|` (exactly Canvas2D's rule, and AE's); `round`
+ *     sweeps a flattened arc of radius |amount| about the vertex; `bevel`
+ *     connects the two edge ends directly.
+ *   • inner corner (the offset edges cross): the intersection of the two
+ *     offset lines, falling back to both endpoints — the crossed loop that
+ *     fallback can leave is exactly what the cleanup below removes.
+ *
+ * Self-intersection removal (closed runs): a convex ring cannot self-intersect
+ * going outward, and going inward it can only COLLAPSE — detected by its
+ * signed area flipping against the source's, in which case the run vanishes
+ * (AE: a shape offset past its own inradius disappears). A non-convex ring is
+ * cleaned by union-with-itself through the same Martinez machinery Merge Paths
+ * uses: the crossed loops at pinched corners wind the opposite way and fall
+ * out of the union.
+ *
+ * Sign flips expand vs contract exactly as before (which is which depends on
+ * the outline's winding). Pure.
  */
-export function offsetPath(pts: readonly Pt[], closed: boolean, amount: number): Pt[] {
-  const n = pts.length;
-  if (n < 2 || amount === 0) return [...pts];
-  const normalOf = (a: Pt, b: Pt): Pt => {
+export function offsetPath(
+  pts: readonly Pt[],
+  closed: boolean,
+  amount: number,
+  join: OffsetLineJoin = 'miter',
+  miterLimit = 4,
+): Pt[] {
+  const runs = offsetPathRuns(pts, closed, amount, join, miterLimit);
+  if (runs.length === 0) return [];
+  if (runs.length === 1) return runs[0]!;
+  // Single-outline contract (applyPathOp's shape): keep the largest ring.
+  let best = runs[0]!;
+  let bestArea = Math.abs(signedArea(best));
+  for (let i = 1; i < runs.length; i++) {
+    const a = Math.abs(signedArea(runs[i]!));
+    if (a > bestArea) {
+      best = runs[i]!;
+      bestArea = a;
+    }
+  }
+  return best;
+}
+
+/**
+ * The full offset result as a LIST of outlines — a concave shape offset inward
+ * legitimately splits into islands, and the chain's currency (multiple runs)
+ * can carry them. `applyPathOpChain` routes Offset Paths through this; the
+ * single-ring `offsetPath` above remains for callers wanting one outline.
+ */
+export function offsetPathRuns(
+  pts: readonly Pt[],
+  closed: boolean,
+  amount: number,
+  join: OffsetLineJoin = 'miter',
+  miterLimit = 4,
+): Pt[][] {
+  if (pts.length < 2 || amount === 0) return [[...pts]];
+  const src = dedupePoints(pts, closed);
+  if (src.length < 2) return [[...pts]];
+  const ring = offsetWithJoins(src, closed, amount, join, Math.max(1, miterLimit));
+  if (!closed || ring.length < 3) return ring.length > 1 ? [ring] : [];
+  return cleanClosedOffset(ring, src);
+}
+
+/** Consecutive-duplicate removal (and the closing duplicate of a closed run),
+ *  so zero-length edges cannot produce NaN normals or phantom joins. */
+function dedupePoints(pts: readonly Pt[], closed: boolean): Pt[] {
+  const out: Pt[] = [];
+  for (const p of pts) {
+    const last = out[out.length - 1];
+    if (last && Math.abs(last.x - p.x) < 1e-9 && Math.abs(last.y - p.y) < 1e-9) continue;
+    out.push({ x: p.x, y: p.y });
+  }
+  if (closed && out.length > 1) {
+    const a = out[0]!;
+    const b = out[out.length - 1]!;
+    if (Math.abs(a.x - b.x) < 1e-9 && Math.abs(a.y - b.y) < 1e-9) out.pop();
+  }
+  return out;
+}
+
+function signedArea(ring: readonly Pt[]): number {
+  let a = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const p = ring[i]!;
+    const q = ring[(i + 1) % ring.length]!;
+    a += p.x * q.y - q.x * p.y;
+  }
+  return a / 2;
+}
+
+/** Intersection of two lines given as point + direction, or null when
+ *  (near-)parallel. */
+function lineIntersect(p1: Pt, d1: Pt, p2: Pt, d2: Pt): Pt | null {
+  const denom = d1.x * d2.y - d1.y * d2.x;
+  if (Math.abs(denom) < 1e-12) return null;
+  const t = ((p2.x - p1.x) * d2.y - (p2.y - p1.y) * d2.x) / denom;
+  return { x: p1.x + d1.x * t, y: p1.y + d1.y * t };
+}
+
+/** Longest chord a flattened ROUND join arc may span — the corner-arc budget. */
+const JOIN_ARC_MAX_CHORD_PX = 2.5;
+
+/** Edge-offset with join geometry at every interior vertex. No cleanup. */
+function offsetWithJoins(
+  src: readonly Pt[],
+  closed: boolean,
+  amount: number,
+  join: OffsetLineJoin,
+  miterLimit: number,
+): Pt[] {
+  const n = src.length;
+  const edgeCount = closed ? n : n - 1;
+  const dirs: Pt[] = [];
+  const norms: Pt[] = [];
+  for (let i = 0; i < edgeCount; i++) {
+    const a = src[i]!;
+    const b = src[(i + 1) % n]!;
     const dx = b.x - a.x;
     const dy = b.y - a.y;
     const len = Math.hypot(dx, dy) || 1;
-    return { x: -dy / len, y: dx / len };
+    dirs.push({ x: dx / len, y: dy / len });
+    norms.push({ x: -dy / len, y: dx / len });
+  }
+  const out: Pt[] = [];
+  const joinAt = (v: Pt, e0: number, e1: number): void => {
+    const n0 = norms[e0]!;
+    const n1 = norms[e1]!;
+    const d0 = dirs[e0]!;
+    const d1 = dirs[e1]!;
+    const p1: Pt = { x: v.x + n0.x * amount, y: v.y + n0.y * amount };
+    const p2: Pt = { x: v.x + n1.x * amount, y: v.y + n1.y * amount };
+    const cross = d0.x * d1.y - d0.y * d1.x;
+    if (Math.abs(cross) < 1e-12) {
+      // Collinear continuation (p1 == p2) or an exact 180° spike — either way
+      // both candidate points say everything there is to say.
+      out.push(p1);
+      if (Math.hypot(p2.x - p1.x, p2.y - p1.y) > 1e-9) out.push(p2);
+      return;
+    }
+    // The offset edges DIVERGE (a gap to fill with a join) when the path turns
+    // away from the offset side; they CROSS (inner corner) when it turns into
+    // it. Left-normal offset ⇒ the side is the sign of `amount`.
+    const gap = cross * amount < 0;
+    if (!gap) {
+      // Inner corner: the natural vertex is where the two offset lines meet.
+      // The fallback leaves both ends; the crossed loop that creates is what
+      // the closed-run cleanup removes.
+      const ix = lineIntersect(p1, d0, p2, d1);
+      if (ix) out.push(ix);
+      else out.push(p1, p2);
+      return;
+    }
+    if (join === 'miter') {
+      const ix = lineIntersect(p1, d0, p2, d1);
+      // Canvas2D's rule verbatim: miter length (vertex → apex) over the offset
+      // distance, cut to a bevel past the limit.
+      if (ix && Math.hypot(ix.x - v.x, ix.y - v.y) <= miterLimit * Math.abs(amount)) {
+        out.push(ix);
+        return;
+      }
+      out.push(p1, p2); // bevel fallback
+      return;
+    }
+    if (join === 'round') {
+      const r = Math.abs(amount);
+      const a1 = Math.atan2(p1.y - v.y, p1.x - v.x);
+      const a2 = Math.atan2(p2.y - v.y, p2.x - v.x);
+      // Shortest sweep — an outer join's gap is always under 180°.
+      let delta = a2 - a1;
+      while (delta > Math.PI) delta -= Math.PI * 2;
+      while (delta < -Math.PI) delta += Math.PI * 2;
+      const steps = Math.max(2, Math.min(64, Math.ceil((Math.abs(delta) * r) / JOIN_ARC_MAX_CHORD_PX)));
+      for (let s = 0; s <= steps; s++) {
+        const a = a1 + (delta * s) / steps;
+        out.push({ x: v.x + Math.cos(a) * r, y: v.y + Math.sin(a) * r });
+      }
+      return;
+    }
+    out.push(p1, p2); // bevel
   };
-  return pts.map((p, i) => {
-    const hasPrev = closed || i > 0;
-    const hasNext = closed || i < n - 1;
-    const np = hasPrev ? normalOf(pts[(i - 1 + n) % n]!, p) : null;
-    const nn = hasNext ? normalOf(p, pts[(i + 1) % n]!) : null;
-    let nx = (np?.x ?? 0) + (nn?.x ?? 0);
-    let ny = (np?.y ?? 0) + (nn?.y ?? 0);
-    const len = Math.hypot(nx, ny) || 1;
-    nx /= len;
-    ny /= len;
-    return { x: p.x + nx * amount, y: p.y + ny * amount };
+  if (closed) {
+    for (let i = 0; i < n; i++) joinAt(src[i]!, (i - 1 + edgeCount) % edgeCount, i);
+  } else {
+    out.push({ x: src[0]!.x + norms[0]!.x * amount, y: src[0]!.y + norms[0]!.y * amount });
+    for (let i = 1; i < n - 1; i++) joinAt(src[i]!, i - 1, i);
+    const lastN = norms[edgeCount - 1]!;
+    out.push({ x: src[n - 1]!.x + lastN.x * amount, y: src[n - 1]!.y + lastN.y * amount });
+  }
+  return out;
+}
+
+/**
+ * Closed-run cleanup. Convex sources need none going outward and can only
+ * collapse going inward (area sign flip ⇒ gone). Non-convex ones go through a
+ * union-with-self, which resolves the crossed loops a pinched inner corner
+ * leaves — the loops wind the other way, so the nonzero union drops them —
+ * and splits a shape offset past a waist into its real islands.
+ */
+function cleanClosedOffset(ring: Pt[], src: readonly Pt[]): Pt[][] {
+  const n = src.length;
+  let sawPos = false;
+  let sawNeg = false;
+  for (let i = 0; i < n; i++) {
+    const a = src[i]!;
+    const b = src[(i + 1) % n]!;
+    const c = src[(i + 2) % n]!;
+    const cr = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+    if (cr > 1e-9) sawPos = true;
+    else if (cr < -1e-9) sawNeg = true;
+  }
+  if (!(sawPos && sawNeg)) {
+    // Convex. Collapsed ⇒ nothing survives (AE: a shape offset past its own
+    // inradius disappears). The tell is an EDGE REVERSING against its source
+    // — an area-sign test alone misses the square shrunk past centre, whose
+    // ring inverts through BOTH axes and comes back positively wound.
+    const a1 = signedArea(ring);
+    if (Math.abs(a1) < 1e-6) return [];
+    if (ring.length === n) {
+      for (let i = 0; i < n; i++) {
+        const sa = src[i]!;
+        const sb = src[(i + 1) % n]!;
+        const ra = ring[i]!;
+        const rb = ring[(i + 1) % n]!;
+        if ((sb.x - sa.x) * (rb.x - ra.x) + (sb.y - sa.y) * (rb.y - ra.y) < 0) return [];
+      }
+    } else if (signedArea(src) * a1 < 0) {
+      return [];
+    }
+    return [ring];
+  }
+  // Split the ring at its own crossings and keep only the loops wound like
+  // the SOURCE. This is the honest version of "offset then clean": the loops
+  // a pinched corner or a vanished limb leave behind are traversed the other
+  // way round, so winding is exactly the property that separates real area
+  // from inverted residue. (polygon-clipping's union cannot be handed the
+  // crossed ring directly — it resolves self-intersections even-odd, which
+  // KEEPS the flipped loop as an island.)
+  const want = signedArea(src) >= 0 ? 1 : -1;
+  const kept = splitRingAtSelfIntersections(ring).filter((l) => {
+    const a = signedArea(l);
+    return Math.abs(a) > 1e-6 && (a >= 0 ? 1 : -1) === want;
   });
+  if (kept.length <= 1) return kept;
+  try {
+    // Several surviving loops can overlap (two limbs offset outward into each
+    // other); each is simple now, so the clipper's input contract holds.
+    const polys = kept.map((l) => {
+      const r: Array<[number, number]> = l.map((p) => [p.x, p.y]);
+      r.push([l[0]!.x, l[0]!.y]);
+      return [r];
+    });
+    const result = polygonClipping.union(polys[0]!, ...polys.slice(1));
+    const out: Pt[][] = [];
+    for (const poly of result) {
+      for (const r of poly) {
+        const pts: Pt[] = r.map((pair) => ({ x: pair[0]!, y: pair[1]! }));
+        // polygon-clipping closes its rings explicitly; the chain's runs do not.
+        const first = pts[0];
+        const last = pts[pts.length - 1];
+        if (first && last && Math.abs(first.x - last.x) < 1e-9 && Math.abs(first.y - last.y) < 1e-9) pts.pop();
+        if (pts.length >= 3 && Math.abs(signedArea(pts)) > 1e-6) out.push(pts);
+      }
+    }
+    return out.length > 0 ? out : kept;
+  } catch {
+    // Degenerate geometry the clipper refuses: hand back the kept loops
+    // rather than losing the shape.
+    return kept;
+  }
+}
+
+/**
+ * Split a (possibly self-crossing) ring into SIMPLE loops at its own
+ * intersection points: every proper segment crossing is inserted into the
+ * point sequence, then a stack walk pops a loop each time a point repeats.
+ * Pure; O(n²) pair scan with a bbox reject, which offset rings (hundreds of
+ * points) absorb comfortably.
+ */
+function splitRingAtSelfIntersections(ring: readonly Pt[]): Pt[][] {
+  const n = ring.length;
+  const inserts: Array<Array<{ t: number; x: number; y: number }>> = Array.from({ length: n }, () => []);
+  let any = false;
+  for (let i = 0; i < n; i++) {
+    const a = ring[i]!;
+    const b = ring[(i + 1) % n]!;
+    for (let j = i + 2; j < n; j++) {
+      if (i === 0 && j === n - 1) continue; // adjacent around the wrap
+      const c = ring[j]!;
+      const d = ring[(j + 1) % n]!;
+      if (
+        Math.max(a.x, b.x) < Math.min(c.x, d.x) || Math.max(c.x, d.x) < Math.min(a.x, b.x)
+        || Math.max(a.y, b.y) < Math.min(c.y, d.y) || Math.max(c.y, d.y) < Math.min(a.y, b.y)
+      ) continue;
+      const hit = properSegIntersect(a, b, c, d);
+      if (!hit) continue;
+      inserts[i]!.push({ t: hit.t, x: hit.x, y: hit.y });
+      inserts[j]!.push({ t: hit.u, x: hit.x, y: hit.y });
+      any = true;
+    }
+  }
+  if (!any) return [[...ring]];
+  const seq: Pt[] = [];
+  for (let i = 0; i < n; i++) {
+    seq.push(ring[i]!);
+    const ins = inserts[i]!;
+    ins.sort((p, q) => p.t - q.t);
+    for (const e of ins) seq.push({ x: e.x, y: e.y });
+  }
+  const loops: Pt[][] = [];
+  const stack: Pt[] = [];
+  const index = new Map<string, number>();
+  const key = (p: Pt): string => `${Math.round(p.x * 1e6)}:${Math.round(p.y * 1e6)}`;
+  for (const p of seq) {
+    const k = key(p);
+    const at = index.get(k);
+    if (at !== undefined) {
+      const loop = stack.splice(at);
+      for (const q of loop) index.delete(key(q));
+      if (loop.length >= 3) loops.push(loop);
+    }
+    index.set(k, stack.length);
+    stack.push(p);
+  }
+  if (stack.length >= 3) loops.push(stack);
+  return loops;
+}
+
+/** Proper (interior) crossing of segments ab × cd, with both parameters. */
+function properSegIntersect(
+  a: Pt, b: Pt, c: Pt, d: Pt,
+): { x: number; y: number; t: number; u: number } | null {
+  const rx = b.x - a.x;
+  const ry = b.y - a.y;
+  const sx = d.x - c.x;
+  const sy = d.y - c.y;
+  const denom = rx * sy - ry * sx;
+  if (Math.abs(denom) < 1e-12) return null;
+  const t = ((c.x - a.x) * sy - (c.y - a.y) * sx) / denom;
+  const u = ((c.x - a.x) * ry - (c.y - a.y) * rx) / denom;
+  const e = 1e-9;
+  if (t <= e || t >= 1 - e || u <= e || u >= 1 - e) return null;
+  return { x: a.x + rx * t, y: a.y + ry * t, t, u };
 }
 
 /**
@@ -866,7 +1244,7 @@ export function applyPathOp(pts: readonly Pt[], closed: boolean, op: PathOp, tim
     case 'twist':
       return twist(pts, op.amount);
     case 'offset':
-      return offsetPath(pts, closed, op.amount);
+      return offsetPath(pts, closed, op.amount, op.lineJoin ?? 'miter', op.miterLimit ?? 4);
     case 'roughen':
       return roughen(
         pts, closed, op.amount, op.detail,
@@ -936,6 +1314,11 @@ function coercePathOp(raw: unknown): PathOp | null {
     // makes a malformed stored entry inert rather than jittery.
     wiggleRotation: Math.max(0, num(o.wiggleRotation, 0)),
     wiggleScale: Math.max(0, num(o.wiggleScale, 0)),
+    // Offset Paths' joins. Miter/4 are the defaults AE uses, and on ordinary
+    // corners they are indistinguishable from the pre-join naive offset, so a
+    // stored op without the fields renders as it did.
+    lineJoin: o.lineJoin === 'round' || o.lineJoin === 'bevel' ? o.lineJoin : 'miter',
+    miterLimit: Math.max(1, num(o.miterLimit, 4)),
     start: num(o.start, 0),
     end: num(o.end, 100),
     offset: num(o.offset, 0),
@@ -978,6 +1361,10 @@ function resolveOne(op: PathOp, av: Map<string, number> | undefined): PathOp {
     // double back on itself rather than mean anything.
     wiggleRotation: Math.max(0, v('wiggleRotation', op.wiggleRotation ?? 0)),
     wiggleScale: Math.max(0, v('wiggleScale', op.wiggleScale ?? 0)),
+    // Discrete — never sampled. The miter cap IS sampled (AE animates it) and
+    // floored at 1, below which a miter join cannot exist.
+    lineJoin: op.lineJoin === 'round' || op.lineJoin === 'bevel' ? op.lineJoin : 'miter',
+    miterLimit: Math.max(1, v('miterLimit', op.miterLimit ?? 4)),
     // Trim's three, sampled the same way. NOT clamped: `offset` wraps by
     // design, and start/end past 0..100 is how a draw-on overshoots and
     // settles — `trimSegments` already normalizes the window.
@@ -1281,6 +1668,18 @@ export function applyPathOpChain(
     }
     if (op.type === 'wiggleTransform') {
       out = applyWiggleTransform(out, op, timeSec);
+      continue;
+    }
+    if (op.type === 'offset') {
+      // Chain-level rather than per-run-in-place because an offset can change
+      // the RUN COUNT: a concave shape offset past a waist splits into
+      // islands, and a convex one offset past its inradius vanishes. Paint
+      // (`opacity`/`strokeScale`) rides onto every piece of its source run.
+      out = out.flatMap((r) =>
+        offsetPathRuns(r.pts, r.closed, op.amount, op.lineJoin ?? 'miter', op.miterLimit ?? 4)
+          .filter((pts) => pts.length > 1)
+          .map((pts) => ({ ...r, pts })),
+      );
       continue;
     }
     // Spread, so a per-run `opacity`/`strokeScale` set by an upstream repeater

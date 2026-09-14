@@ -93,8 +93,16 @@ function transformComponent(node: SceneNode): { id: string; props: Record<string
  * parent in 3D), a scene device (camera/light — they DRIVE 3D rather than
  * being 3D), non-visual (audio), or drawn outside the 3D projection path
  * (particle, adjustment). Solids are kind 'shape' and eligible — see canBe3D.
+ *
+ * `svg` is here for the reason `image` is: a statically-imported SVG is
+ * rasterized to a texture and rides the image path end to end (buildSnapshot's
+ * `kind === 'svg' ? 'image'` mapping), so 3D placement and extrusion — which
+ * traces its silhouette from that same rasterized texture — already work the
+ * moment the switch is allowed to light up. It was missing from this list
+ * only, the same list-omission class `geometry.ts`'s `isDrawableKind` note
+ * documents (svg was unclickable on canvas for the identical reason).
  */
-const THREE_D_CAPABLE_KINDS = new Set(['shape', 'text', 'image', 'video', 'null']);
+const THREE_D_CAPABLE_KINDS = new Set(['shape', 'text', 'image', 'video', 'null', 'svg']);
 
 /**
  * True when this node can meaningfully take the 3D switch: content kind and

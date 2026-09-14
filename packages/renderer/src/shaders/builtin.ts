@@ -1016,10 +1016,18 @@ void main() {
  * Polygonal bokeh gather for DOF iris.
  *
  * params = (texelX, texelY, radiusPx, blades)
- * params2 = (roundness 0..1, highlightGain, 0, 0)
+ * params2 = (roundness 0..1, highlightGain, irisRotation rad, irisAspect)
+ * params3 = (highlightThreshold 0..1, highlightSaturation, fringe 0..1, 0)
  *
  * One pass (not separable): an n-gon disk whose edges soften toward a circle
- * with roundness. Bright taps get extra weight for specular bloom.
+ * with roundness. Bright taps get extra weight for specular bloom. The AE
+ * iris extras are exact identities at their neutral values (rotation 0,
+ * aspect 1, threshold/saturation/fringe 0) — cos(0)=1, sin(0)=0, ·1 and +0
+ * are IEEE-exact — so existing scenes render byte-identically. Rotation and
+ * aspect transform the TAP DIRECTION in the iris frame (stretch, then spin,
+ * matching the camera-lens-blur effect's iris); threshold gates the gain ramp
+ * (lumT replaces lum, and lumT == lum at threshold 0); fringe adds
+ * rim-weighted taps like edge diffraction.
  */
 const BOKEH: ShaderSource = {
   name: 'bokeh',
@@ -1029,6 +1037,7 @@ struct Object {
   uvRect : vec4<f32>,
   params : vec4<f32>,
   params2 : vec4<f32>,
+  params3 : vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> obj : Object;
 @group(0) @binding(1) var tex : texture_2d<f32>;
@@ -1049,6 +1058,15 @@ ${SRGB_TRANSFER_WGSL}
   let blades = max(3.0, min(11.0, floor(obj.params.w + 0.5)));
   let roundness = clamp(obj.params2.x, 0.0, 1.0);
   let gain = max(0.0, obj.params2.y);
+  // AE iris extras — neutral values are exact identities (see header note).
+  let rot = obj.params2.z;
+  let aspect = select(1.0, obj.params2.w, obj.params2.w > 0.0);
+  let thr = clamp(obj.params3.x, 0.0, 0.999);
+  let sat = max(0.0, obj.params3.y);
+  let fringe = max(0.0, obj.params3.z);
+  let cr = cos(rot);
+  let sr = sin(rot);
+  let ax = sqrt(aspect);
   let texel = obj.params.xy;
   var acc = vec4<f32>(0.0);
   var wsum = 0.0;
@@ -1057,13 +1075,18 @@ ${SRGB_TRANSFER_WGSL}
   for (var ring = 1; ring <= 5; ring = ring + 1) {
     let fr = f32(ring) / 5.0;
     let r = radius * fr;
+    // Fringe: rim-weight the OUTER rings (fr → 1), like edge diffraction.
+    let ringW = 1.0 + fringe * 3.0 * fr * fr * fr * fr;
     for (var b = 0; b < 11; b = b + 1) {
       if (f32(b) >= blades) { break; }
       let a0 = 6.2831853 * f32(b) / blades;
       // Soften polygon corners toward a circle.
       let polyR = r / max(0.2, cos(3.14159265 / blades));
       let rr = mix(polyR, r, roundness);
-      let off = vec2<f32>(cos(a0), sin(a0)) * rr * texel;
+      // Stretch in the iris frame, then spin the whole shape.
+      let d0 = vec2<f32>(cos(a0) * ax, sin(a0) / ax);
+      let dir = vec2<f32>(d0.x * cr - d0.y * sr, d0.x * sr + d0.y * cr);
+      let off = dir * rr * texel;
       let t = textureSampleLevel(tex, smp, uv + off, 0.0);
       var lin = t;
       if (t.a > 0.0001) {
@@ -1071,12 +1094,17 @@ ${SRGB_TRANSFER_WGSL}
         lin = vec4<f32>(storageToWorking(straight) * t.a, t.a);
       }
       let lum = dot(lin.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-      let w = 1.0 + gain * lum * lum;
+      let lumT = max(0.0, lum - thr) / (1.0 - thr);
+      if (sat > 0.0) {
+        let grey = vec3<f32>(lum);
+        lin = vec4<f32>(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+      }
+      let w = (1.0 + gain * lumT * lumT) * ringW;
       acc = acc + lin * w;
       wsum = wsum + w;
     }
   }
-  // Centre sample.
+  // Centre sample (the iris centre — no ring weight).
   {
     var lin = c0;
     if (c0.a > 0.0001) {
@@ -1084,7 +1112,12 @@ ${SRGB_TRANSFER_WGSL}
       lin = vec4<f32>(storageToWorking(straight) * c0.a, c0.a);
     }
     let lum = dot(lin.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let w = 1.0 + gain * lum * lum;
+    let lumT = max(0.0, lum - thr) / (1.0 - thr);
+    if (sat > 0.0) {
+      let grey = vec3<f32>(lum);
+      lin = vec4<f32>(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+    }
+    let w = 1.0 + gain * lumT * lumT;
     acc = acc + lin * w;
     wsum = wsum + w;
   }
@@ -1099,7 +1132,7 @@ ${SRGB_TRANSFER_WGSL}
   glsl: {
     vertex: /* glsl */ `#version 300 es
 layout(location = 0) in vec2 pos;
-layout(std140) uniform Object { mat3 mvp; vec4 uvRect; vec4 params; vec4 params2; };
+layout(std140) uniform Object { mat3 mvp; vec4 uvRect; vec4 params; vec4 params2; vec4 params3; };
 out vec2 vUv;
 void main() {
   vec3 p = mvp * vec3(pos, 1.0);
@@ -1109,7 +1142,7 @@ void main() {
 `,
     fragment: /* glsl */ `#version 300 es
 precision highp float;
-layout(std140) uniform Object { mat3 mvp; vec4 uvRect; vec4 params; vec4 params2; };
+layout(std140) uniform Object { mat3 mvp; vec4 uvRect; vec4 params; vec4 params2; vec4 params3; };
 uniform sampler2D uTex;
 in vec2 vUv;
 out vec4 frag;
@@ -1121,18 +1154,30 @@ void main() {
   float blades = max(3.0, min(11.0, floor(params.w + 0.5)));
   float roundness = clamp(params2.x, 0.0, 1.0);
   float gain = max(0.0, params2.y);
+  // AE iris extras — neutral values are exact identities (see the WGSL twin).
+  float rot = params2.z;
+  float aspect = (params2.w > 0.0) ? params2.w : 1.0;
+  float thr = clamp(params3.x, 0.0, 0.999);
+  float sat = max(0.0, params3.y);
+  float fringe = max(0.0, params3.z);
+  float cr = cos(rot);
+  float sr = sin(rot);
+  float ax = sqrt(aspect);
   vec2 texel = params.xy;
   vec4 acc = vec4(0.0);
   float wsum = 0.0;
   for (int ring = 1; ring <= 5; ring++) {
     float fr = float(ring) / 5.0;
     float r = radius * fr;
+    float ringW = 1.0 + fringe * 3.0 * fr * fr * fr * fr;
     for (int b = 0; b < 11; b++) {
       if (float(b) >= blades) break;
       float a0 = 6.2831853 * float(b) / blades;
       float polyR = r / max(0.2, cos(3.14159265 / blades));
       float rr = mix(polyR, r, roundness);
-      vec2 off = vec2(cos(a0), sin(a0)) * rr * texel;
+      vec2 d0 = vec2(cos(a0) * ax, sin(a0) / ax);
+      vec2 dir = vec2(d0.x * cr - d0.y * sr, d0.x * sr + d0.y * cr);
+      vec2 off = dir * rr * texel;
       vec4 t = texture(uTex, vUv + off);
       vec4 lin = t;
       if (t.a > 0.0001) {
@@ -1140,7 +1185,12 @@ void main() {
         lin = vec4(storageToWorking(straight) * t.a, t.a);
       }
       float lum = dot(lin.rgb, vec3(0.2126, 0.7152, 0.0722));
-      float w = 1.0 + gain * lum * lum;
+      float lumT = max(0.0, lum - thr) / (1.0 - thr);
+      if (sat > 0.0) {
+        vec3 grey = vec3(lum);
+        lin = vec4(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+      }
+      float w = (1.0 + gain * lumT * lumT) * ringW;
       acc += lin * w;
       wsum += w;
     }
@@ -1152,7 +1202,12 @@ void main() {
       lin = vec4(storageToWorking(straight) * c0.a, c0.a);
     }
     float lum = dot(lin.rgb, vec3(0.2126, 0.7152, 0.0722));
-    float w = 1.0 + gain * lum * lum;
+    float lumT = max(0.0, lum - thr) / (1.0 - thr);
+    if (sat > 0.0) {
+      vec3 grey = vec3(lum);
+      lin = vec4(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+    }
+    float w = 1.0 + gain * lumT * lumT;
     acc += lin * w;
     wsum += w;
   }
@@ -1168,7 +1223,11 @@ void main() {
   },
 };
 
-/** Planar per-pixel CoC: bilinear corner radii + iris/rosette gather. */
+/** Planar per-pixel CoC: bilinear corner radii + iris/rosette gather.
+ *  params = (texelX, texelY, blades, irisRotation rad);
+ *  params2 = (roundness, highlightGain, irisAspect, highlightThreshold 0..1);
+ *  irisP = (highlightSaturation, fringe 0..1, 0, 0). Neutral extras are exact
+ *  identities — see the bokeh shader's header note. */
 const COC_BLUR: ShaderSource = {
   name: 'coc-blur',
   wgsl: /* wgsl */ `
@@ -1179,6 +1238,7 @@ struct Object {
   params2 : vec4<f32>,
   corners : vec4<f32>,
   fxBox : vec4<f32>,
+  irisP : vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> obj : Object;
 @group(0) @binding(1) var tex : texture_2d<f32>;
@@ -1206,6 +1266,15 @@ fn cocRadius(uv : vec2<f32>) -> f32 {
   let blades = obj.params.z;
   let roundness = clamp(obj.params2.x, 0.0, 1.0);
   let gain = max(0.0, obj.params2.y);
+  // AE iris extras — neutral values are exact identities (see bokeh's note).
+  let rot = obj.params.w;
+  let aspect = select(1.0, obj.params2.z, obj.params2.z > 0.0);
+  let thr = clamp(obj.params2.w, 0.0, 0.999);
+  let sat = max(0.0, obj.irisP.x);
+  let fringe = max(0.0, obj.irisP.y);
+  let cr = cos(rot);
+  let sr = sin(rot);
+  let ax = sqrt(aspect);
   let texel = obj.params.xy;
   var acc = vec4<f32>(0.0);
   var wsum = 0.0;
@@ -1214,12 +1283,15 @@ fn cocRadius(uv : vec2<f32>) -> f32 {
     for (var ring = 1; ring <= 5; ring = ring + 1) {
       let fr = f32(ring) / 5.0;
       let r = radius * fr;
+      let ringW = 1.0 + fringe * 3.0 * fr * fr * fr * fr;
       for (var b = 0; b < 11; b = b + 1) {
         if (f32(b) >= n) { break; }
         let a0 = 6.2831853 * f32(b) / n;
         let polyR = r / max(0.2, cos(3.14159265 / n));
         let rr = mix(polyR, r, roundness);
-        let off = vec2<f32>(cos(a0), sin(a0)) * rr * texel;
+        let d0 = vec2<f32>(cos(a0) * ax, sin(a0) / ax);
+        let dir = vec2<f32>(d0.x * cr - d0.y * sr, d0.x * sr + d0.y * cr);
+        let off = dir * rr * texel;
         let t = textureSampleLevel(tex, smp, uv + off, 0.0);
         var lin = t;
         if (t.a > 0.0001) {
@@ -1227,7 +1299,12 @@ fn cocRadius(uv : vec2<f32>) -> f32 {
           lin = vec4<f32>(storageToWorking(straight) * t.a, t.a);
         }
         let lum = dot(lin.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-        let w = 1.0 + gain * lum * lum;
+        let lumT = max(0.0, lum - thr) / (1.0 - thr);
+        if (sat > 0.0) {
+          let grey = vec3<f32>(lum);
+          lin = vec4<f32>(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+        }
+        let w = (1.0 + gain * lumT * lumT) * ringW;
         acc = acc + lin * w;
         wsum = wsum + w;
       }
@@ -1257,7 +1334,12 @@ fn cocRadius(uv : vec2<f32>) -> f32 {
       lin = vec4<f32>(storageToWorking(straight) * c0.a, c0.a);
     }
     let lum = dot(lin.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let w = 1.0 + gain * lum * lum;
+    let lumT = max(0.0, lum - thr) / (1.0 - thr);
+    if (sat > 0.0) {
+      let grey = vec3<f32>(lum);
+      lin = vec4<f32>(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+    }
+    let w = 1.0 + gain * lumT * lumT;
     acc = acc + lin * w;
     wsum = wsum + w;
   }
@@ -1272,7 +1354,7 @@ fn cocRadius(uv : vec2<f32>) -> f32 {
   glsl: {
     vertex: /* glsl */ `#version 300 es
 layout(location = 0) in vec2 pos;
-layout(std140) uniform Object { mat3 mvp; vec4 uvRect; vec4 params; vec4 params2; vec4 corners; vec4 fxBox; };
+layout(std140) uniform Object { mat3 mvp; vec4 uvRect; vec4 params; vec4 params2; vec4 corners; vec4 fxBox; vec4 irisP; };
 out vec2 vUv;
 void main() {
   vec3 p = mvp * vec3(pos, 1.0);
@@ -1282,7 +1364,7 @@ void main() {
 `,
     fragment: /* glsl */ `#version 300 es
 precision highp float;
-layout(std140) uniform Object { mat3 mvp; vec4 uvRect; vec4 params; vec4 params2; vec4 corners; vec4 fxBox; };
+layout(std140) uniform Object { mat3 mvp; vec4 uvRect; vec4 params; vec4 params2; vec4 corners; vec4 fxBox; vec4 irisP; };
 uniform sampler2D uTex;
 in vec2 vUv;
 out vec4 frag;
@@ -1300,6 +1382,15 @@ void main() {
   float blades = params.z;
   float roundness = clamp(params2.x, 0.0, 1.0);
   float gain = max(0.0, params2.y);
+  // AE iris extras — neutral values are exact identities (see bokeh's note).
+  float rot = params.w;
+  float aspect = (params2.z > 0.0) ? params2.z : 1.0;
+  float thr = clamp(params2.w, 0.0, 0.999);
+  float sat = max(0.0, irisP.x);
+  float fringe = max(0.0, irisP.y);
+  float cr = cos(rot);
+  float sr = sin(rot);
+  float ax = sqrt(aspect);
   vec2 texel = params.xy;
   vec4 acc = vec4(0.0);
   float wsum = 0.0;
@@ -1308,12 +1399,15 @@ void main() {
     for (int ring = 1; ring <= 5; ring++) {
       float fr = float(ring) / 5.0;
       float r = radius * fr;
+      float ringW = 1.0 + fringe * 3.0 * fr * fr * fr * fr;
       for (int b = 0; b < 11; b++) {
         if (float(b) >= n) break;
         float a0 = 6.2831853 * float(b) / n;
         float polyR = r / max(0.2, cos(3.14159265 / n));
         float rr = mix(polyR, r, roundness);
-        vec2 off = vec2(cos(a0), sin(a0)) * rr * texel;
+        vec2 d0 = vec2(cos(a0) * ax, sin(a0) / ax);
+        vec2 dir = vec2(d0.x * cr - d0.y * sr, d0.x * sr + d0.y * cr);
+        vec2 off = dir * rr * texel;
         vec4 t = texture(uTex, vUv + off);
         vec4 lin = t;
         if (t.a > 0.0001) {
@@ -1321,7 +1415,12 @@ void main() {
           lin = vec4(storageToWorking(straight) * t.a, t.a);
         }
         float lum = dot(lin.rgb, vec3(0.2126, 0.7152, 0.0722));
-        float w = 1.0 + gain * lum * lum;
+        float lumT = max(0.0, lum - thr) / (1.0 - thr);
+        if (sat > 0.0) {
+          vec3 grey = vec3(lum);
+          lin = vec4(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+        }
+        float w = (1.0 + gain * lumT * lumT) * ringW;
         acc += lin * w;
         wsum += w;
       }
@@ -1350,7 +1449,12 @@ void main() {
       lin = vec4(storageToWorking(straight) * c0.a, c0.a);
     }
     float lum = dot(lin.rgb, vec3(0.2126, 0.7152, 0.0722));
-    float w = 1.0 + gain * lum * lum;
+    float lumT = max(0.0, lum - thr) / (1.0 - thr);
+    if (sat > 0.0) {
+      vec3 grey = vec3(lum);
+      lin = vec4(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+    }
+    float w = 1.0 + gain * lumT * lumT;
     acc += lin * w;
     wsum += w;
   }
@@ -1380,7 +1484,12 @@ void main() {
  * params  = (texelX, texelY, blades, roundness)
  * params2 = (highlightGain, maxRadiusPx = strength cap, depthA, depthB)
  * dofP    = (focus, aperture, strength, focalLength)
- * dofP2   = (fStop or 0 = legacy ramp, 0, 0, 0)
+ * dofP2   = (fStop or 0 = legacy ramp, irisRotation rad, irisAspect, highlightThreshold 0..1)
+ * dofP3   = (highlightSaturation, fringe 0..1, 0, 0)
+ *
+ * The AE iris extras are exact identities at their neutral values (rotation
+ * 0, aspect 1, threshold/saturation/fringe 0) — see the bokeh shader's note —
+ * so existing scenes gather byte-identically.
  *
  * depthA/depthB are the projection's z row (proj[10], proj[14]): the stored
  * depth inverts to camera z as z = depthB / (ndc − depthA). The two dialects
@@ -1397,6 +1506,7 @@ struct Object {
   params2 : vec4<f32>,
   dofP : vec4<f32>,
   dofP2 : vec4<f32>,
+  dofP3 : vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> obj : Object;
 @group(0) @binding(1) var tex : texture_2d<f32>;
@@ -1450,6 +1560,15 @@ fn cocAt(z : f32) -> f32 {
   let blades = obj.params.z;
   let roundness = clamp(obj.params.w, 0.0, 1.0);
   let gain = max(0.0, obj.params2.x);
+  // AE iris extras — neutral values are exact identities (see bokeh's note).
+  let rot = obj.dofP2.y;
+  let aspect = select(1.0, obj.dofP2.z, obj.dofP2.z > 0.0);
+  let thr = clamp(obj.dofP2.w, 0.0, 0.999);
+  let sat = max(0.0, obj.dofP3.x);
+  let fringe = max(0.0, obj.dofP3.y);
+  let cr = cos(rot);
+  let sr = sin(rot);
+  let ax = sqrt(aspect);
   var acc = vec4<f32>(0.0);
   var wsum = 0.0;
   // Centre sample, weight 1 — wsum can never be empty.
@@ -1460,7 +1579,12 @@ fn cocAt(z : f32) -> f32 {
       lin = vec4<f32>(storageToWorking(straight) * c0.a, c0.a);
     }
     let lum = dot(lin.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let w = 1.0 + gain * lum * lum;
+    let lumT = max(0.0, lum - thr) / (1.0 - thr);
+    if (sat > 0.0) {
+      let grey = vec3<f32>(lum);
+      lin = vec4<f32>(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+    }
+    let w = 1.0 + gain * lumT * lumT;
     acc = acc + lin * w;
     wsum = wsum + w;
   }
@@ -1472,13 +1596,17 @@ fn cocAt(z : f32) -> f32 {
   if (blades >= 3.0) {
     let n = max(3.0, min(11.0, floor(blades + 0.5)));
     for (var ring = 1; ring <= 5; ring = ring + 1) {
-      let r = maxR * f32(ring) / 5.0;
+      let fr = f32(ring) / 5.0;
+      let r = maxR * fr;
+      let ringW = 1.0 + fringe * 3.0 * fr * fr * fr * fr;
       for (var b = 0; b < 11; b = b + 1) {
         if (f32(b) >= n) { break; }
         let a0 = 6.2831853 * (f32(b) + 0.5 * f32(ring % 2)) / n;
         let polyR = r / max(0.2, cos(3.14159265 / n));
         let rd = mix(polyR, r, roundness);
-        let tc = texelAt(clamp(uv + vec2<f32>(cos(a0), sin(a0)) * rd * texel, vec2<f32>(0.0), vec2<f32>(1.0)));
+        let d0 = vec2<f32>(cos(a0) * ax, sin(a0) / ax);
+        let dir = vec2<f32>(d0.x * cr - d0.y * sr, d0.x * sr + d0.y * cr);
+        let tc = texelAt(clamp(uv + dir * rd * texel, vec2<f32>(0.0), vec2<f32>(1.0)));
         let zT = viewZAtTexel(tc);
         var reach = cocAt(zT);
         if (zT > zC + 1.0) { reach = min(reach, max(cocC, 1.0)); }
@@ -1491,7 +1619,12 @@ fn cocAt(z : f32) -> f32 {
             lin = vec4<f32>(storageToWorking(straight) * t.a, t.a);
           }
           let lum = dot(lin.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-          let w = w0 * (1.0 + gain * lum * lum);
+          let lumT = max(0.0, lum - thr) / (1.0 - thr);
+          if (sat > 0.0) {
+            let grey = vec3<f32>(lum);
+            lin = vec4<f32>(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+          }
+          let w = w0 * (1.0 + gain * lumT * lumT) * ringW;
           acc = acc + lin * w;
           wsum = wsum + w;
         }
@@ -1503,13 +1636,17 @@ fn cocAt(z : f32) -> f32 {
     // ghosts. A 32-tap spiral was visibly stepped at CoC ≈ the cap: one
     // direction per radius undersamples the disk's rim.
     for (var ring = 1; ring <= 5; ring = ring + 1) {
-      let rd = maxR * f32(ring) / 5.0;
+      let fr = f32(ring) / 5.0;
+      let rd = maxR * fr;
+      let ringW = 1.0 + fringe * 3.0 * fr * fr * fr * fr;
       let cnt = 4 * ring;
       let base = 2.3999632 * f32(ring);
       for (var b = 0; b < 20; b = b + 1) {
         if (b >= cnt) { break; }
         let a = base + 6.2831853 * f32(b) / f32(cnt);
-        let tc = texelAt(clamp(uv + vec2<f32>(cos(a), sin(a)) * rd * texel, vec2<f32>(0.0), vec2<f32>(1.0)));
+        let d0 = vec2<f32>(cos(a) * ax, sin(a) / ax);
+        let dir = vec2<f32>(d0.x * cr - d0.y * sr, d0.x * sr + d0.y * cr);
+        let tc = texelAt(clamp(uv + dir * rd * texel, vec2<f32>(0.0), vec2<f32>(1.0)));
         let zT = viewZAtTexel(tc);
         var reach = cocAt(zT);
         if (zT > zC + 1.0) { reach = min(reach, max(cocC, 1.0)); }
@@ -1522,7 +1659,12 @@ fn cocAt(z : f32) -> f32 {
             lin = vec4<f32>(storageToWorking(straight) * t.a, t.a);
           }
           let lum = dot(lin.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-          let w = w0 * (1.0 + gain * lum * lum);
+          let lumT = max(0.0, lum - thr) / (1.0 - thr);
+          if (sat > 0.0) {
+            let grey = vec3<f32>(lum);
+            lin = vec4<f32>(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+          }
+          let w = w0 * (1.0 + gain * lumT * lumT) * ringW;
           acc = acc + lin * w;
           wsum = wsum + w;
         }
@@ -1540,7 +1682,7 @@ fn cocAt(z : f32) -> f32 {
   glsl: {
     vertex: /* glsl */ `#version 300 es
 layout(location = 0) in vec2 pos;
-layout(std140) uniform Object { mat3 mvp; vec4 uvRect; vec4 params; vec4 params2; vec4 dofP; vec4 dofP2; };
+layout(std140) uniform Object { mat3 mvp; vec4 uvRect; vec4 params; vec4 params2; vec4 dofP; vec4 dofP2; vec4 dofP3; };
 out vec2 vUv;
 void main() {
   vec3 p = mvp * vec3(pos, 1.0);
@@ -1550,7 +1692,7 @@ void main() {
 `,
     fragment: /* glsl */ `#version 300 es
 precision highp float;
-layout(std140) uniform Object { mat3 mvp; vec4 uvRect; vec4 params; vec4 params2; vec4 dofP; vec4 dofP2; };
+layout(std140) uniform Object { mat3 mvp; vec4 uvRect; vec4 params; vec4 params2; vec4 dofP; vec4 dofP2; vec4 dofP3; };
 uniform sampler2D uTex;
 uniform highp sampler2D uDepthTex;
 in vec2 vUv;
@@ -1590,6 +1732,15 @@ void main() {
   float blades = params.z;
   float roundness = clamp(params.w, 0.0, 1.0);
   float gain = max(0.0, params2.x);
+  // AE iris extras — neutral values are exact identities (see the WGSL twin).
+  float rot = dofP2.y;
+  float aspect = (dofP2.z > 0.0) ? dofP2.z : 1.0;
+  float thr = clamp(dofP2.w, 0.0, 0.999);
+  float sat = max(0.0, dofP3.x);
+  float fringe = max(0.0, dofP3.y);
+  float cr = cos(rot);
+  float sr = sin(rot);
+  float ax = sqrt(aspect);
   vec4 acc = vec4(0.0);
   float wsum = 0.0;
   {
@@ -1599,20 +1750,29 @@ void main() {
       lin = vec4(storageToWorking(straight) * c0.a, c0.a);
     }
     float lum = dot(lin.rgb, vec3(0.2126, 0.7152, 0.0722));
-    float w = 1.0 + gain * lum * lum;
+    float lumT = max(0.0, lum - thr) / (1.0 - thr);
+    if (sat > 0.0) {
+      vec3 grey = vec3(lum);
+      lin = vec4(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+    }
+    float w = 1.0 + gain * lumT * lumT;
     acc += lin * w;
     wsum += w;
   }
   if (blades >= 3.0) {
     float n = max(3.0, min(11.0, floor(blades + 0.5)));
     for (int ring = 1; ring <= 5; ring++) {
-      float r = maxR * float(ring) / 5.0;
+      float fr = float(ring) / 5.0;
+      float r = maxR * fr;
+      float ringW = 1.0 + fringe * 3.0 * fr * fr * fr * fr;
       for (int b = 0; b < 11; b++) {
         if (float(b) >= n) break;
         float a0 = 6.2831853 * (float(b) + 0.5 * float(ring % 2)) / n;
         float polyR = r / max(0.2, cos(3.14159265 / n));
         float rd = mix(polyR, r, roundness);
-        ivec2 tc = texelAt(clamp(vUv + vec2(cos(a0), sin(a0)) * rd * texel, vec2(0.0), vec2(1.0)));
+        vec2 d0 = vec2(cos(a0) * ax, sin(a0) / ax);
+        vec2 dir = vec2(d0.x * cr - d0.y * sr, d0.x * sr + d0.y * cr);
+        ivec2 tc = texelAt(clamp(vUv + dir * rd * texel, vec2(0.0), vec2(1.0)));
         float zT = viewZAtTexel(tc);
         float reach = cocAt(zT);
         if (zT > zC + 1.0) { reach = min(reach, max(cocC, 1.0)); }
@@ -1625,7 +1785,12 @@ void main() {
             lin = vec4(storageToWorking(straight) * t.a, t.a);
           }
           float lum = dot(lin.rgb, vec3(0.2126, 0.7152, 0.0722));
-          float w = w0 * (1.0 + gain * lum * lum);
+          float lumT = max(0.0, lum - thr) / (1.0 - thr);
+          if (sat > 0.0) {
+            vec3 grey = vec3(lum);
+            lin = vec4(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+          }
+          float w = w0 * (1.0 + gain * lumT * lumT) * ringW;
           acc += lin * w;
           wsum += w;
         }
@@ -1634,13 +1799,17 @@ void main() {
   } else {
     // Concentric-ring disk — see the WGSL twin for why the spiral stepped.
     for (int ring = 1; ring <= 5; ring++) {
-      float rd = maxR * float(ring) / 5.0;
+      float fr = float(ring) / 5.0;
+      float rd = maxR * fr;
+      float ringW = 1.0 + fringe * 3.0 * fr * fr * fr * fr;
       int cnt = 4 * ring;
       float base = 2.3999632 * float(ring);
       for (int b = 0; b < 20; b++) {
         if (b >= cnt) break;
         float a = base + 6.2831853 * float(b) / float(cnt);
-        ivec2 tc = texelAt(clamp(vUv + vec2(cos(a), sin(a)) * rd * texel, vec2(0.0), vec2(1.0)));
+        vec2 d0 = vec2(cos(a) * ax, sin(a) / ax);
+        vec2 dir = vec2(d0.x * cr - d0.y * sr, d0.x * sr + d0.y * cr);
+        ivec2 tc = texelAt(clamp(vUv + dir * rd * texel, vec2(0.0), vec2(1.0)));
         float zT = viewZAtTexel(tc);
         float reach = cocAt(zT);
         if (zT > zC + 1.0) { reach = min(reach, max(cocC, 1.0)); }
@@ -1653,7 +1822,12 @@ void main() {
             lin = vec4(storageToWorking(straight) * t.a, t.a);
           }
           float lum = dot(lin.rgb, vec3(0.2126, 0.7152, 0.0722));
-          float w = w0 * (1.0 + gain * lum * lum);
+          float lumT = max(0.0, lum - thr) / (1.0 - thr);
+          if (sat > 0.0) {
+            vec3 grey = vec3(lum);
+            lin = vec4(grey + (lin.rgb - grey) * (1.0 + sat * lumT), lin.a);
+          }
+          float w = w0 * (1.0 + gain * lumT * lumT) * ringW;
           acc += lin * w;
           wsum += w;
         }
@@ -4351,6 +4525,8 @@ struct Object {
   shadeParams : vec4<f32>,
   lights : array<vec4<f32>, 32>,
   envParams : vec4<f32>,
+  reflParams : vec4<f32>,
+  alphaParams : vec4<f32>,
   aoMatrix : mat4x4<f32>,
   aoParams : vec4<f32>,
   shadowMatrix : mat4x4<f32>,
@@ -4539,6 +4715,37 @@ fn aoFactor(world : vec3<f32>) -> f32 {
   return clamp(1.0 - (1.0 - occ) * obj.aoParams.x, 0.0, 1.0);
 }
 
+/*
+  Advanced-3D Transparency: the view-dependent alpha multiplier every lit-3d
+  entry point folds into its output alpha (before premultiplying).
+
+  alphaParams: x = Transparency 0..1 — zero for every scene that has not
+  touched the control, which is the whole gate: the early return is a literal
+  1.0, each entry point multiplies its alpha by it, and a * 1.0 is a in IEEE,
+  so those frames render byte-identically. y = Transparency Rolloff 0..1 —
+  Fresnel-weights the transmission (Schlick against reflParams.w, the
+  IOR-derived F0 shared with Reflection Rolloff): facing the camera transmits
+  most, grazing angles stay opaque, which is how glass reads. Two-sided |N·V|
+  on purpose — a layer has no inside. CPU twin: transparencyAlpha in
+  core/scene/lightShading.ts; the two must stay identical term for term.
+  (No backticks in here: this shader source is itself a JS template literal.)
+
+  The normal is the quad plane's (+Z column of the model matrix), spelled with
+  its own variable name so the withVertexNormal substitution leaves it alone —
+  only quad materials receive a transparency today, and a quad's plane normal
+  IS its per-fragment normal.
+*/
+fn shadeAlpha3d(world : vec3<f32>) -> f32 {
+  let t = obj.alphaParams.x;
+  if (t <= 0.0) { return 1.0; }
+  let pn = normalize(obj.model[2].xyz);
+  let vw = normalize(obj.eyeLit.xyz - world);
+  let ndv = clamp(abs(dot(pn, vw)), 0.0, 1.0);
+  let f0 = obj.reflParams.w;
+  let fres = f0 + (1.0 - f0) * pow(1.0 - ndv, 5.0);
+  return 1.0 - t * mix(1.0, 1.0 - fres, obj.alphaParams.y);
+}
+
 fn shade3d(world : vec3<f32>, baseRgb : vec3<f32>) -> vec3<f32> {
   if (obj.eyeLit.w < 0.5) { return baseRgb; }
   /*
@@ -4716,20 +4923,35 @@ fn shade3d(world : vec3<f32>, baseRgb : vec3<f32>) -> vec3<f32> {
     // reflection is the one that would actually be seen from here.
     let Ne = select(N, -N, twoSided > 0.5 && dot(N, Ve) < 0.0);
     let R = reflect(-Ve, Ne);
+    /*
+      The Advanced-3D reflection axes (reflParams), every default an exact
+      IEEE identity so pre-axis scenes keep their bytes:
+        x  Reflection Intensity 0..1 — scales the term; default 1, and y*1.0
+           is y.
+        y  Reflection Sharpness 0..1 — the atlas is sampled at
+           roughness*(1.0 - y); default 0, and rough*1.0 re-clamps to rough.
+        z  Reflection Rolloff 0..1 — mix(1, Schlick F(N·V), z) concentrates
+           the term at grazing angles; default 0, and mix(1.0, f, 0.0) is 1.0.
+        w  the IOR-derived Schlick F0 both rolloffs share (packed once in
+           packShade3D so the dialects cannot disagree).
+    */
+    let ndve = max(dot(Ne, Ve), 1e-4);
+    let fresR = obj.reflParams.w + (1.0 - obj.reflParams.w) * pow(clamp(1.0 - ndve, 0.0, 1.0), 5.0);
+    let envK = obj.envParams.y * obj.reflParams.x * mix(1.0, fresR, obj.reflParams.z);
     if (pbr) {
       // Split sum: prefiltered radiance x the analytic env BRDF. A metal takes
       // the scenery through its own F0 — which IS the base colour, so it
       // reflects tinted; a dielectric keeps a Fresnel-weighted sheen over a
       // diffuse that the light loop already computed.
-      let ab = envBRDF(max(dot(Ne, Ve), 1e-4), rough);
-      spec = spec + envSpecular(R, rough) * (F0 * ab.x + vec3<f32>(ab.y)) * obj.envParams.y;
+      let ab = envBRDF(ndve, rough);
+      spec = spec + envSpecular(R, clamp(rough * (1.0 - obj.reflParams.y), 0.02, 1.0)) * (F0 * ab.x + vec3<f32>(ab.y)) * envK;
     } else {
       // Phong: a plain reflection, which the tail below scales by Specular
       // Intensity and tints by Metal — so the sliders that already exist mean
       // "how mirrored", and nothing new appears in the UI. Shininess becomes a
       // roughness by the usual Phong-to-GGX identity, so a tight highlight
       // reflects a sharp room and a broad one a soft.
-      spec = spec + envSpecular(R, clamp(sqrt(2.0 / (max(obj.shadeParams.z, 1.0) + 2.0)), 0.02, 1.0)) * obj.envParams.y;
+      spec = spec + envSpecular(R, clamp(sqrt(2.0 / (max(obj.shadeParams.z, 1.0) + 2.0)) * (1.0 - obj.reflParams.y), 0.02, 1.0)) * envK;
     }
   }
   if (pbr) {
@@ -4744,7 +4966,7 @@ fn shade3d(world : vec3<f32>, baseRgb : vec3<f32>) -> vec3<f32> {
 `;
 
 // GLSL twins of the above (UBO tail + light model), same layout contract.
-const GLSL_TEX3D_UBO = `layout(std140) uniform Object { mat4 mvp; vec4 uvRect; vec4 tint; vec4 cr0; vec4 cr1; vec4 cr2; vec4 srcSpace; mat4 model; vec4 eyeLit; vec4 shadeParams; vec4 lights[32]; vec4 envParams; mat4 aoMatrix; vec4 aoParams; mat4 shadowMatrix; vec4 shadowAxis; vec4 shadowOrigin; vec4 shadowParams; mat4 shadow2Matrix; vec4 shadow2Axis; vec4 shadow2Origin; vec4 shadow2Params; };`;
+const GLSL_TEX3D_UBO = `layout(std140) uniform Object { mat4 mvp; vec4 uvRect; vec4 tint; vec4 cr0; vec4 cr1; vec4 cr2; vec4 srcSpace; mat4 model; vec4 eyeLit; vec4 shadeParams; vec4 lights[32]; vec4 envParams; vec4 reflParams; vec4 alphaParams; mat4 aoMatrix; vec4 aoParams; mat4 shadowMatrix; vec4 shadowAxis; vec4 shadowOrigin; vec4 shadowParams; mat4 shadow2Matrix; vec4 shadow2Axis; vec4 shadow2Origin; vec4 shadow2Params; };`;
 
 const GLSL_SHADE3D_FN = /* glsl */ `
 
@@ -4829,6 +5051,20 @@ float aoFactor(vec3 world) {
   if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
   float occ = textureLod(uSsaoTex, uv, 0.0).r;
   return clamp(1.0 - (1.0 - occ) * aoParams.x, 0.0, 1.0);
+}
+
+// Advanced-3D Transparency — see the WGSL twin for the full note; the two
+// must stay identical term for term. CPU twin: transparencyAlpha in
+// core/scene/lightShading.ts.
+float shadeAlpha3d(vec3 world) {
+  float t = alphaParams.x;
+  if (t <= 0.0) return 1.0;
+  vec3 pn = normalize(model[2].xyz);
+  vec3 vw = normalize(eyeLit.xyz - world);
+  float ndv = clamp(abs(dot(pn, vw)), 0.0, 1.0);
+  float f0 = reflParams.w;
+  float fres = f0 + (1.0 - f0) * pow(1.0 - ndv, 5.0);
+  return 1.0 - t * mix(1.0, 1.0 - fres, alphaParams.y);
 }
 
 vec3 shade3d(vec3 world, vec3 baseRgb) {
@@ -4958,16 +5194,20 @@ vec3 shade3d(vec3 world, vec3 baseRgb) {
     diff = floor(diff * bands + vec3(0.5)) / bands;
     spec = floor(spec * bands + vec3(0.5)) / bands;
   }
-  // Image-based reflections — see the WGSL twin for the full note.
+  // Image-based reflections — see the WGSL twin for the full note, including
+  // the reflParams axes (Intensity / Sharpness / Rolloff + IOR F0).
   if (envParams.x > 0.5 && !toonFlag) {
     vec3 Ve = normalize(eyeLit.xyz - world);
     vec3 Ne = (twoSided > 0.5 && dot(N, Ve) < 0.0) ? -N : N;
     vec3 R = reflect(-Ve, Ne);
+    float ndve = max(dot(Ne, Ve), 1e-4);
+    float fresR = reflParams.w + (1.0 - reflParams.w) * pow(clamp(1.0 - ndve, 0.0, 1.0), 5.0);
+    float envK = envParams.y * reflParams.x * mix(1.0, fresR, reflParams.z);
     if (pbr) {
-      vec2 ab = envBRDF(max(dot(Ne, Ve), 1e-4), rough);
-      spec += envSpecular(R, rough) * (F0 * ab.x + vec3(ab.y)) * envParams.y;
+      vec2 ab = envBRDF(ndve, rough);
+      spec += envSpecular(R, clamp(rough * (1.0 - reflParams.y), 0.02, 1.0)) * (F0 * ab.x + vec3(ab.y)) * envK;
     } else {
-      spec += envSpecular(R, clamp(sqrt(2.0 / (max(shadeParams.z, 1.0) + 2.0)), 0.02, 1.0)) * envParams.y;
+      spec += envSpecular(R, clamp(sqrt(2.0 / (max(shadeParams.z, 1.0) + 2.0)) * (1.0 - reflParams.y), 0.02, 1.0)) * envK;
     }
   }
   if (pbr) {
@@ -5003,6 +5243,8 @@ struct Object {
   shadeParams : vec4<f32>,
   lights : array<vec4<f32>, 32>,
   envParams : vec4<f32>,
+  reflParams : vec4<f32>,
+  alphaParams : vec4<f32>,
   aoMatrix : mat4x4<f32>,
   aoParams : vec4<f32>,
   shadowMatrix : mat4x4<f32>,
@@ -5074,7 +5316,7 @@ fn shapeAlpha(local : vec2<f32>) -> f32 {
 
 @fragment
 fn fs(@location(0) local : vec2<f32>, @location(1) world : vec3<f32>) -> @location(0) vec4<f32> {
-  let a = obj.color.a * shapeAlpha(local);
+  let a = obj.color.a * shapeAlpha(local) * shadeAlpha3d(world);
   let rgb = shade3d(world, obj.color.rgb);
   return vec4<f32>(rgb * a, a);
 }
@@ -5082,7 +5324,7 @@ fn fs(@location(0) local : vec2<f32>, @location(1) world : vec3<f32>) -> @locati
   glsl: {
     vertex: /* glsl */ `#version 300 es
 layout(location = 0) in vec2 pos;
-layout(std140) uniform Object { mat4 mvp; vec4 color; vec4 shape; mat4 model; vec4 eyeLit; vec4 shadeParams; vec4 lights[32]; vec4 envParams; mat4 aoMatrix; vec4 aoParams; mat4 shadowMatrix; vec4 shadowAxis; vec4 shadowOrigin; vec4 shadowParams; mat4 shadow2Matrix; vec4 shadow2Axis; vec4 shadow2Origin; vec4 shadow2Params; };
+layout(std140) uniform Object { mat4 mvp; vec4 color; vec4 shape; mat4 model; vec4 eyeLit; vec4 shadeParams; vec4 lights[32]; vec4 envParams; vec4 reflParams; vec4 alphaParams; mat4 aoMatrix; vec4 aoParams; mat4 shadowMatrix; vec4 shadowAxis; vec4 shadowOrigin; vec4 shadowParams; mat4 shadow2Matrix; vec4 shadow2Axis; vec4 shadow2Origin; vec4 shadow2Params; };
 out vec2 vLocal;
 out vec3 vWorld;
 void main() {
@@ -5093,7 +5335,7 @@ void main() {
 `,
     fragment: /* glsl */ `#version 300 es
 precision highp float;
-layout(std140) uniform Object { mat4 mvp; vec4 color; vec4 shape; mat4 model; vec4 eyeLit; vec4 shadeParams; vec4 lights[32]; vec4 envParams; mat4 aoMatrix; vec4 aoParams; mat4 shadowMatrix; vec4 shadowAxis; vec4 shadowOrigin; vec4 shadowParams; mat4 shadow2Matrix; vec4 shadow2Axis; vec4 shadow2Origin; vec4 shadow2Params; };
+layout(std140) uniform Object { mat4 mvp; vec4 color; vec4 shape; mat4 model; vec4 eyeLit; vec4 shadeParams; vec4 lights[32]; vec4 envParams; vec4 reflParams; vec4 alphaParams; mat4 aoMatrix; vec4 aoParams; mat4 shadowMatrix; vec4 shadowAxis; vec4 shadowOrigin; vec4 shadowParams; mat4 shadow2Matrix; vec4 shadow2Axis; vec4 shadow2Origin; vec4 shadow2Params; };
 in vec2 vLocal;
 in vec3 vWorld;
 out vec4 frag;
@@ -5120,7 +5362,7 @@ float shapeAlpha(vec2 local) {
   return 1.0;
 }
 void main() {
-  float a = color.a * shapeAlpha(vLocal);
+  float a = color.a * shapeAlpha(vLocal) * shadeAlpha3d(vWorld);
   vec3 rgb = shade3d(vWorld, color.rgb);
   frag = vec4(rgb * a, a);
 }
@@ -5688,7 +5930,10 @@ fn vs(@location(0) pos : vec2<f32>) -> VOut {
 ${WGSL_SHADE3D_FN}
 @fragment
 fn fs(@location(0) uv : vec2<f32>, @location(1) world : vec3<f32>) -> @location(0) vec4<f32> {
-  let c = textureSample(tex, smp, uv) * obj.tint;
+  var c = textureSample(tex, smp, uv) * obj.tint;
+  // Advanced-3D Transparency folds into the SOURCE alpha, so every later use
+  // (premultiply, matte, the -linear rewrites) sees one consistent coverage.
+  c.a = c.a * shadeAlpha3d(world);
   let v = vec4<f32>(c.rgb, 1.0);
   let graded = vec3<f32>(dot(obj.cr0, v), dot(obj.cr1, v), dot(obj.cr2, v));
   let lit = shade3d(world, graded);
@@ -5717,6 +5962,7 @@ out vec4 frag;
 ${GLSL_SHADE3D_FN}
 void main() {
   vec4 c = texture(uTex, vUv) * tint;
+  c.a *= shadeAlpha3d(vWorld);
   vec4 v = vec4(c.rgb, 1.0);
   vec3 graded = vec3(dot(cr0, v), dot(cr1, v), dot(cr2, v));
   vec3 lit = shade3d(vWorld, graded);
@@ -5816,7 +6062,7 @@ ${WGSL_MESH3D_VS}
 ${WGSL_SHADE3D_N_FN}
 @fragment
 fn fs(@location(0) uv : vec2<f32>, @location(1) world : vec3<f32>, @location(2) nrm : vec3<f32>) -> @location(0) vec4<f32> {
-  let a = obj.tint.a;
+  let a = obj.tint.a * shadeAlpha3d(world);
   let rgb = shade3dN(world, nrm, obj.tint.rgb);
   return vec4<f32>(rgb * a, a);
 }
@@ -5832,7 +6078,7 @@ in vec3 vNrm;
 out vec4 frag;
 ${GLSL_SHADE3D_N_FN}
 void main() {
-  float a = tint.a;
+  float a = tint.a * shadeAlpha3d(vWorld);
   vec3 rgb = shade3dN(vWorld, vNrm, tint.rgb);
   frag = vec4(rgb * a, a);
 }
@@ -5852,7 +6098,10 @@ ${WGSL_MESH3D_VS}
 ${WGSL_SHADE3D_N_FN}
 @fragment
 fn fs(@location(0) uv : vec2<f32>, @location(1) world : vec3<f32>, @location(2) nrm : vec3<f32>) -> @location(0) vec4<f32> {
-  let c = textureSample(tex, smp, uv) * obj.tint;
+  var c = textureSample(tex, smp, uv) * obj.tint;
+  // Advanced-3D Transparency folds into the SOURCE alpha, so every later use
+  // (premultiply, matte, the -linear rewrites) sees one consistent coverage.
+  c.a = c.a * shadeAlpha3d(world);
   let v = vec4<f32>(c.rgb, 1.0);
   let graded = vec3<f32>(dot(obj.cr0, v), dot(obj.cr1, v), dot(obj.cr2, v));
   let lit = shade3dN(world, nrm, graded);
@@ -5872,6 +6121,7 @@ out vec4 frag;
 ${GLSL_SHADE3D_N_FN}
 void main() {
   vec4 c = texture(uTex, vUv) * tint;
+  c.a *= shadeAlpha3d(vWorld);
   vec4 v = vec4(c.rgb, 1.0);
   vec3 graded = vec3(dot(cr0, v), dot(cr1, v), dot(cr2, v));
   vec3 lit = shade3dN(vWorld, vNrm, graded);
@@ -6032,7 +6282,10 @@ ${WGSL_SHADE3D_NMR_FN}
 ${WGSL_TANGENT_FRAME_FN}
 @fragment
 fn fs(@location(0) uv : vec2<f32>, @location(1) world : vec3<f32>, @location(2) nrm : vec3<f32>) -> @location(0) vec4<f32> {
-  let c = textureSample(tex, smp, uv) * obj.tint;
+  var c = textureSample(tex, smp, uv) * obj.tint;
+  // Advanced-3D Transparency folds into the SOURCE alpha, so every later use
+  // (premultiply, matte, the -linear rewrites) sees one consistent coverage.
+  c.a = c.a * shadeAlpha3d(world);
   let v = vec4<f32>(c.rgb, 1.0);
   let graded = vec3<f32>(dot(obj.cr0, v), dot(obj.cr1, v), dot(obj.cr2, v));
   let nSample = textureSample(normalTex, smp, uv).xyz;
@@ -6073,6 +6326,7 @@ ${GLSL_SHADE3D_NMR_FN}
 ${GLSL_TANGENT_FRAME_FN}
 void main() {
   vec4 c = texture(uTex, vUv) * tint;
+  c.a *= shadeAlpha3d(vWorld);
   vec4 v = vec4(c.rgb, 1.0);
   vec3 graded = vec3(dot(cr0, v), dot(cr1, v), dot(cr2, v));
   vec3 nSample = texture(uNormalTex, vUv).xyz;
@@ -6121,7 +6375,10 @@ fn vs(@location(0) pos : vec2<f32>) -> VOut {
 ${WGSL_SHADE3D_FN}
 @fragment
 fn fs(@location(0) uv : vec2<f32>, @location(1) world : vec3<f32>) -> @location(0) vec4<f32> {
-  let c = textureSample(tex, smp, uv) * obj.tint;
+  var c = textureSample(tex, smp, uv) * obj.tint;
+  // Advanced-3D Transparency folds into the SOURCE alpha, so every later use
+  // (premultiply, matte, the -linear rewrites) sees one consistent coverage.
+  c.a = c.a * shadeAlpha3d(world);
   let v = vec4<f32>(c.rgb, 1.0);
   let graded = vec3<f32>(dot(obj.cr0, v), dot(obj.cr1, v), dot(obj.cr2, v));
   let maskAlpha = textureSample(maskTex, smp, uv).a;
@@ -6153,6 +6410,7 @@ out vec4 frag;
 ${GLSL_SHADE3D_FN}
 void main() {
   vec4 c = texture(uTex, vUv) * tint;
+  c.a *= shadeAlpha3d(vWorld);
   vec4 v = vec4(c.rgb, 1.0);
   vec3 graded = vec3(dot(cr0, v), dot(cr1, v), dot(cr2, v));
   float maskAlpha = texture(uMaskTex, vUv).a;

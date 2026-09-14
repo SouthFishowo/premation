@@ -1,0 +1,51 @@
+/* Paragraph text box chrome (AE): dashed outline, eight reflow handles, overflow "+". */
+
+.root {
+  position: absolute;
+  width: 0;
+  height: 0;
+  transform-origin: 0 0;
+  /* Above the in-place editor (z 20) so the half of each handle that overlaps
+     the text is still a handle, not a caret placement. */
+  z-index: 21;
+  pointer-events: none;
+}
+
+.outline {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px dashed var(--color-accent);
+  pointer-events: none;
+}
+
+.outline[data-overflow] {
+  border-color: var(--color-danger);
+}
+
+.handle {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  box-sizing: border-box;
+  transform: translate(-50%, -50%);
+  background: var(--color-overlay-handle);
+  border: 1px solid var(--color-accent);
+  box-shadow: 0 0 0 1px var(--color-overlay-handle-halo);
+  pointer-events: auto;
+  touch-action: none;
+}
+
+/* AE's overflow marker: the bottom-right handle becomes a red square with a +. */
+.handle[data-overflow] {
+  width: 12px;
+  height: 12px;
+  background: var(--color-danger);
+  border-color: var(--color-danger);
+}
+
+.overflowGlyph {
+  display: block;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}

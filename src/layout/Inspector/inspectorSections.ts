@@ -63,6 +63,7 @@ import { ModelSection } from './ModelSection';
 import { ModifierStackSection, hasModifierStackSection } from './ModifierStackSection';
 import { ParticleSection } from './ParticleSection';
 import { PathOpsSection } from './PathOpsSection';
+import { PolystarSection, hasPolystarSection } from './PolystarSection';
 import { PrimitiveSection, hasPrimitiveSection } from './PrimitiveSection';
 import { ShapeEffects } from './ShapeEffects';
 import { SvgSection } from './SvgSection';
@@ -352,6 +353,20 @@ export const INSPECTOR_SECTIONS: readonly InspectorSectionDef[] = [
     appliesTo: isDrawable,
     Component: AppearanceSection,
     actions: AppearancePresetAction,
+  },
+  {
+    // Parametric Polygon / Star (AE's Polystar Path group): type, points,
+    // rotation, radii and roundness — all keyframeable, recomputed per frame
+    // before the path-operator chain. Present only on a layer that IS a
+    // polystar, so every other shape's inspector is unchanged.
+    id: 'polystar',
+    title: 'Polystar',
+    icon: 'shape',
+    category: 'layer',
+    defaultOpen: true,
+    keywords: 'polystar polygon star points radius roundness',
+    appliesTo: hasPolystarSection,
+    Component: PolystarSection,
   },
   {
     id: 'pathOps',

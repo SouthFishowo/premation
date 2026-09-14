@@ -28,7 +28,13 @@
  */
 
 import { readSource } from '@/__testHelpers__/readSource';
-import { shadeLayer } from './lightShading';
+import {
+  shadeLayer,
+  schlickF0FromIor,
+  schlickFresnel,
+  transparencyAlpha,
+  reflectionRolloffWeight,
+} from './lightShading';
 
 
 const SHADING = 'core/scene/lightShading.ts';
@@ -239,13 +245,93 @@ describe('one-sided shading: CPU and GPU agree on what the flag means', () => {
 
   it('only a closed 3D BODY asks for it', () => {
     // Slices and the front face must not: their normals are +Z, so clamping
-    // would black them out under a front light. Three sites, each a solid
+    // would black them out under a front light. Four sites, each a solid
     // whose vertex normals all point out of the volume: the extruded MESH,
-    // the quad-synthesis fallback's walls + back cap, and an imported glTF
+    // the quad-synthesis fallback's walls + back cap, an imported glTF
     // model mesh (its single-sided materials; doubleSided ones route through
-    // the 'front' range role, which the renderer lights two-sided).
+    // the 'front' range role, which the renderer lights two-sided), and the
+    // per-glyph extruded text body mesh.
     const build = readSource('core/rendering/buildSnapshot.ts');
-    expect((build.match(/oneSided: true/g) ?? []).length).toBe(3);
+    expect((build.match(/oneSided: true/g) ?? []).length).toBe(4);
     expect((build.match(/sceneLights, undefined, true\)/g) ?? []).length).toBe(1);
+  });
+});
+
+/**
+ * Advanced-3D material axes: the CPU functions here and the shader/packer text
+ * must implement ONE formula. Same shape as the eyeLit.w block above — the
+ * encoding is written in places that cannot see each other, so both are pinned.
+ */
+describe('advanced-3D axes: CPU twin ⇄ shader ⇄ packer agree', () => {
+  const shaders = readSource('../packages/renderer/src/shaders/builtin.ts');
+  const uniforms = readSource('../packages/renderer/src/pipeline/uniforms.ts');
+
+  it('shadeAlpha3d exists once per dialect and both use the one Schlick shape', () => {
+    // One copy per dialect in the shared shade text — every lit-3d shader
+    // interpolates it, exactly like shade3d itself.
+    expect((shaders.match(/fn shadeAlpha3d\(world : vec3<f32>\) -> f32 \{/g) ?? []).length).toBe(1);
+    expect((shaders.match(/float shadeAlpha3d\(vec3 world\) \{/g) ?? []).length).toBe(1);
+    // The transparency mix — identical text in both dialects, and the same
+    // arithmetic `transparencyAlpha` implements below.
+    expect((shaders.match(/1\.0 - t \* mix\(1\.0, 1\.0 - fres, (obj\.)?alphaParams\.y\)/g) ?? []).length).toBe(2);
+    // The reflection rolloff weight, both dialects.
+    expect((shaders.match(/mix\(1\.0, fresR, (obj\.)?reflParams\.z\)/g) ?? []).length).toBe(2);
+    // Sharpness remaps the atlas roughness in all four sample sites (2 models
+    // × 2 dialects).
+    expect((shaders.match(/\(1\.0 - (obj\.)?reflParams\.y\)/g) ?? []).length).toBe(4);
+  });
+
+  it('every entry-point alpha is multiplied by shadeAlpha3d in both dialects', () => {
+    // 6 surfaces × 2 dialects: solid3d, mesh3d-solid (direct multiply) and
+    // textured3d / mesh3d-textured / mesh3d-pbr / masked-textured3d (folded
+    // into the source alpha). The -linear and -lut variants derive from these.
+    expect((shaders.match(/\* shadeAlpha3d\(world\)/g) ?? []).length).toBe(6);
+    expect((shaders.match(/\* shadeAlpha3d\(vWorld\)|\*= shadeAlpha3d\(vWorld\)/g) ?? []).length).toBe(6);
+  });
+
+  it('the packer writes the identity defaults and the shared F0', () => {
+    // A present shade with untouched axes must pack 1 / 0 / 0 / F0(1.52) —
+    // each an exact IEEE identity in the shader.
+    expect(uniforms).toMatch(/out\[reflAt \+ 0\] = clamp01\(shade\.reflectionIntensity \?\? 1\);/);
+    expect(uniforms).toMatch(/out\[reflAt \+ 3\] = f0FromIor\(shade\.ior \?\? 1\.52\);/);
+    expect(uniforms).toMatch(/out\[reflAt \+ 4\] = clamp01\(shade\.transparency \?\? 0\);/);
+    // One F0 formula on both sides of the package boundary. The packer cannot
+    // import lightShading.ts, so the formula text itself is the contract.
+    const formula = /const r = \(ior - 1\) \/ \(ior \+ 1\);\s*\n\s*return r \* r;/;
+    expect(uniforms).toMatch(formula);
+    expect(readSource('core/scene/lightShading.ts')).toMatch(formula);
+  });
+
+  it('transparencyAlpha: defaults are exact identities', () => {
+    const n = [0, 0, 1] as const;
+    const at = { x: 0, y: 0, z: 0 };
+    const eye = [0, 0, -500] as const;
+    expect(transparencyAlpha(n, at, eye, {})).toBe(1);
+    expect(transparencyAlpha(n, at, eye, { transparency: 0, transparencyRolloff: 100, ior: 4 })).toBe(1);
+  });
+
+  it('transparencyAlpha: rolloff 0 is uniform, higher rolloff is view-dependent', () => {
+    const at = { x: 0, y: 0, z: 0 };
+    const eye = [0, 0, -500] as const;
+    // Facing the camera vs near-grazing.
+    const facing = [0, 0, 1] as const;
+    const grazing = [Math.sqrt(1 - 0.01), 0, 0.1] as const;
+    const t0 = { transparency: 60, transparencyRolloff: 0 };
+    expect(transparencyAlpha(facing, at, eye, t0)).toBeCloseTo(0.4, 10);
+    expect(transparencyAlpha(grazing, at, eye, t0)).toBeCloseTo(0.4, 10);
+    // With rolloff, facing transmits MORE (lower alpha) than grazing.
+    const t1 = { transparency: 60, transparencyRolloff: 100 };
+    const aFacing = transparencyAlpha(facing, at, eye, t1);
+    const aGrazing = transparencyAlpha(grazing, at, eye, t1);
+    expect(aFacing).toBeLessThan(aGrazing);
+    // Facing at rolloff 100: alpha = 1 − t·(1 − F0), F0 from the default 1.52.
+    expect(aFacing).toBeCloseTo(1 - 0.6 * (1 - schlickF0FromIor(1.52)), 10);
+  });
+
+  it('reflectionRolloffWeight: 0 is the exact identity, 1 is pure Schlick', () => {
+    expect(reflectionRolloffWeight(0.3, 1.52, 0)).toBe(1);
+    expect(reflectionRolloffWeight(0.3, 1.52, 1)).toBeCloseTo(schlickFresnel(0.3, schlickF0FromIor(1.52)), 12);
+    // Grazing angles reflect more than facing ones at full rolloff.
+    expect(reflectionRolloffWeight(0.05, 1.52, 1)).toBeGreaterThan(reflectionRolloffWeight(0.95, 1.52, 1));
   });
 });

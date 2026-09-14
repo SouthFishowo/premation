@@ -23,13 +23,18 @@
 
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { readNodeKind } from '@core/scene/sceneDerive';
-import { readMeasuredTextStyle, measureTextBoxes, measureTextSize } from '@core/text/measureText';
+import { readMeasuredTextStyle, measureParagraphBox, measureTextBoxes, measureTextSize } from '@core/text/measureText';
+import { textExtrasForNode } from '@core/text/textExtras';
 import { paintTextInBox, type TextPaintSpec } from '@core/rendering/raster/textPaint';
 import { useSelectionStore } from '@stores/selectionStore';
 import { bumpScene } from '@stores/sceneStore';
 import { SCENE_KIND_PROP } from '@core/scene/seedDefaultScene';
 import { traceBitmap, smoothContour, type TracedContour } from '@core/geometry/traceBitmap';
 import { loadLocalFace, outlineRuns } from '@core/text/fontOutlines';
+import { axisValuesOf, fontVariationString, resolveFontAxes, type VariationBase } from '@core/text/fontAxes';
+import { variantFamily } from '@core/text/fontFaceVariants';
+import { defaultAnimation } from '@motion/animation';
+import { getRemappedTime, getTimelineController } from '@core/timeline/TimelineController';
 import type { SceneNode } from '@core/types';
 
 /** Oversampling factor for the trace. 4× is where staircase artefacts stop
@@ -112,6 +117,11 @@ export function textPaintSpecFromNode(node: SceneNode): TextPaintSpec | null {
     textStroke,
     textStrokeWidth,
     strokeOverFill,
+    // An auto-height box's top-anchor offset, exactly as buildSnapshot passes it.
+    textExtras: textExtrasForNode(node, style.softBreakLines, {
+      fitScale: style.fitScale,
+      boxOffsetY: style.boxAnchorHeight ? measureParagraphBox(style)?.lineOffsetY : undefined,
+    }),
   };
 }
 
@@ -138,21 +148,55 @@ export function canCreateShapesFromText(nodeId: string): boolean {
   return !!node && readNodeKind(node) === 'text' && !!readMeasuredTextStyle(node)?.content.trim();
 }
 
+/**
+ * The variation a text node DRAWS with at `compTime`: keyframed weight, width,
+ * slant and `text.axis.<tag>` tracks over the static props, read the way
+ * buildSnapshot reads them (weight continuous, clamped to 1–1000). Without a
+ * time, the static props.
+ */
+export function drawnVariationOf(
+  node: SceneNode,
+  style: { fontWeight: string; fontWidth?: number; fontSlant?: number },
+  compTime?: number,
+): VariationBase & { fontWeight: string } {
+  const av = compTime === undefined ? undefined : defaultAnimation.evaluateNode(node.id, getRemappedTime(node.id, compTime));
+  const num = (k: string): number | undefined => {
+    const v = av?.get(k);
+    return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+  };
+  const w = num('fontWeight');
+  const fontWidth = num('fontWidth') ?? style.fontWidth;
+  const fontSlant = num('fontSlant') ?? style.fontSlant;
+  const fontAxes = resolveFontAxes(node, av);
+  return {
+    fontWeight: w !== undefined ? String(Math.max(1, Math.min(1000, w))) : style.fontWeight,
+    ...(fontWidth !== undefined ? { fontWidth } : {}),
+    ...(fontSlant !== undefined ? { fontSlant } : {}),
+    ...(fontAxes ? { fontAxes } : {}),
+  };
+}
+
 /** The font's own outlines, or null when the face cannot be read. */
-async function fontRuns(node: SceneNode): Promise<{ runs: Array<{ points: BPt[]; open: false }>; w: number; h: number } | null> {
+async function fontRuns(node: SceneNode, compTime?: number): Promise<{ runs: Array<{ points: BPt[]; open: false }>; w: number; h: number } | null> {
   if (typeof document === 'undefined') return null;
   const style = readMeasuredTextStyle(node);
   if (!style || !style.content.trim()) return null;
-  const face = await loadLocalFace(style.fontFamily, Number(style.fontWeight) || 400, style.fontStyle === 'italic');
+  const drawn = drawnVariationOf(node, style, compTime);
+  const face = await loadLocalFace(style.fontFamily, Number(drawn.fontWeight) || 400, style.fontStyle === 'italic');
   if (!face) return null;
   const boxes = measureTextBoxes(style);
   if (!boxes) return null;
   const g = document.createElement('canvas').getContext('2d');
   if (!g) return null;
   const fontStyle = style.fontStyle === 'italic' ? 'italic ' : '';
-  g.font = `${fontStyle}${style.fontWeight} ${style.fontSize}px "${style.fontFamily}", Inter, system-ui, sans-serif`;
+  // Pens are measured with the face the painter draws: axes beyond weight
+  // reach the canvas only through an alias FontFace (fontFaceVariants.ts).
+  const variation = drawn.fontWidth !== undefined || drawn.fontSlant !== undefined || drawn.fontAxes ? fontVariationString(drawn) : undefined;
+  const alias = variation ? variantFamily({ fontFamily: style.fontFamily, fontWeight: drawn.fontWeight, fontStyle: style.fontStyle }, variation, undefined) : null;
+  g.font = `${fontStyle}${drawn.fontWeight} ${style.fontSize}px "${alias ?? style.fontFamily}", Inter, system-ui, sans-serif`;
   g.textBaseline = 'middle';
-  const runs = outlineRuns(style, boxes, face, g);
+  // A variable face is outlined at that same instance (openType.ts `instance`).
+  const runs = outlineRuns(style, boxes, face, g, axisValuesOf(drawn));
   if (runs.length === 0) return null;
   // The LAYER box, so the shape layer's box is the text layer's box.
   const size = measureTextSize(style);
@@ -197,6 +241,44 @@ export function traceTextRuns(node: SceneNode): Array<{ points: BPt[]; open: fal
 export type ShapesFromTextSource = 'outlines' | 'traced';
 
 /**
+ * A text node's glyph outlines in LAYER space, from the font when that is
+ * faithful and from a trace otherwise — the choice Create Shapes and Create
+ * Masks from Text share, so both make the same geometry from the same layer.
+ *
+ * `compTime` samples keyframed font axes (weight, width, slant, any
+ * `text.axis.<tag>`): a variable face is outlined at the instance drawn then.
+ */
+export async function outlineTextNode(node: SceneNode, compTime?: number): Promise<{
+  runs: Array<{ points: BPt[]; open: false }>;
+  w: number;
+  h: number;
+  source: ShapesFromTextSource;
+} | null> {
+  if (readNodeKind(node) !== 'text') return null;
+  const spec = textPaintSpecFromNode(node);
+  // `outlineRuns` lays out plain centred lines: no case transform, small
+  // caps, scale, baseline shift, stroke, or left/right alignment. When the
+  // author set any of those, prefer the trace — which is painted by the
+  // layer's own rasteriser and so has them all — over a misleading outline.
+  // (Variation axes are NOT a reason: a variable face's outlines are instanced
+  // at the layer's axes, and a static face ignores them exactly as it draws.)
+  const wantsPaintedLayout = spec != null && (
+    !!spec.textTransform || !!spec.fontVariant || !!spec.verticalAlign
+    || spec.verticalScale !== undefined || spec.horizontalScale !== undefined || spec.baselineShift !== undefined
+    || (spec.textStrokeWidth ?? 0) > 0
+    || spec.textExtras !== undefined
+    || (spec.align !== undefined && spec.align !== 'center' && spec.text.includes('\n'))
+  );
+  let source: ShapesFromTextSource = 'outlines';
+  let built = wantsPaintedLayout ? null : await fontRuns(node, compTime);
+  if (!built) {
+    source = 'traced';
+    built = tracedRuns(node);
+  }
+  return built ? { ...built, source } : null;
+}
+
+/**
  * Create the shape layer beside the text layer and hide the original.
  * Resolves to the new layer's id and which source produced it, or null when
  * the text could not be outlined at all.
@@ -204,30 +286,9 @@ export type ShapesFromTextSource = 'outlines' | 'traced';
 export async function createShapesFromText(nodeId: string): Promise<{ id: string; source: ShapesFromTextSource } | null> {
   const node = defaultSceneGraph.getNode(nodeId);
   if (!node || readNodeKind(node) !== 'text') return null;
-  const style = readMeasuredTextStyle(node);
-  const spec = textPaintSpecFromNode(node);
-  // Installed-face outlines do not apply `wdth`/`slnt`, and `outlineRuns`
-  // lays out plain centred lines: no case transform, small caps, scale,
-  // baseline shift, stroke, or left/right alignment. When the author set any
-  // of those, prefer the trace — which is painted by the layer's own
-  // rasteriser and so has them all — over a misleading default outline.
-  const wantsVariations = style != null
-    && ((style.fontWidth !== undefined && Number.isFinite(style.fontWidth))
-      || (style.fontSlant !== undefined && Number.isFinite(style.fontSlant)));
-  const wantsPaintedLayout = spec != null && (
-    !!spec.textTransform || !!spec.fontVariant || !!spec.verticalAlign
-    || spec.verticalScale !== undefined || spec.horizontalScale !== undefined || spec.baselineShift !== undefined
-    || (spec.textStrokeWidth ?? 0) > 0
-    || (spec.align !== undefined && spec.align !== 'center' && spec.text.includes('\n'))
-  );
-  let source: ShapesFromTextSource = 'outlines';
-  let built = wantsVariations || wantsPaintedLayout ? null : await fontRuns(node);
-  if (!built) {
-    source = 'traced';
-    built = tracedRuns(node);
-  }
+  const built = await outlineTextNode(node, getTimelineController().currentSeconds);
   if (!built) return null;
-  const { runs } = built;
+  const { runs, source } = built;
 
   const t = node.components.find((c) => c.type === 'Transform')?.props as Record<string, unknown> | undefined;
   const styleComp = node.components.find((c) => c.type === 'Style' || c.type === 'Text')?.props as Record<string, unknown> | undefined;

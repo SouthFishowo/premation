@@ -23,6 +23,7 @@ export type CursorType =
   | 'grab'
   | 'grabbing'
   | 'text'
+  | 'vertical-text'
   | 'pen'
   | 'pencil'
   | 'brush'
@@ -141,6 +142,7 @@ export const CURSOR_CSS: Record<CursorType, string> = {
   grab: HAND_CURSOR_CSS,
   grabbing: 'grabbing',
   text: 'text',
+  'vertical-text': 'vertical-text',
   pen: PEN_CURSOR_CSS,
   pencil: PENCIL_CURSOR_CSS,
   brush: BRUSH_CURSOR_CSS,

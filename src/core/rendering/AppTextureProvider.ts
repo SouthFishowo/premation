@@ -68,6 +68,8 @@ import {
   OFFLINE_BARS_H,
   mediaUnavailableDetail,
 } from '@core/media/offlinePlaceholder';
+import { fontVariationString } from '@core/text/fontAxes';
+import { fontVariantEpoch, onFontVariantsChanged } from '@core/text/fontFaceVariants';
 
 interface PathEntry {
   kind: 'path';
@@ -430,6 +432,10 @@ export interface TextSpec {
   /** The layer's own text stroke — colour and width in px. */
   textStroke?: string;
   textStrokeWidth?: number;
+  /** AE paragraph/character extras — indents, space before/after, soft-wrap
+   *  lines for justification, faux bold/italic, stroke join/order, none
+   *  swatches, kerning mode. See `@core/text/textExtras`. Absent = defaults. */
+  textExtras?: import('@core/text/textExtras').TextExtras;
   /** Per-character style overrides. Free on the GPU path: the runs are baked
    *  into the texture, so the shader never learns text had more than one font. */
   runs?: ReadonlyArray<RichRun>;
@@ -452,7 +458,19 @@ export interface TextSpec {
     firstMargin: number;
     reversed: boolean;
     perpendicular: boolean;
+    /** Path Options Force Alignment / Last Margin — present only when set. */
+    forceAlignment?: boolean;
+    lastMargin?: number;
   };
+  /** Variable-font axes beyond wght/wdth/slnt, by tag (`@core/text/fontAxes`).
+   *  Absent when the layer sets none. */
+  fontAxes?: Readonly<Record<string, number>>;
+  /** A LINEAR or RADIAL fill across the whole text block (the shape layer's
+   *  gradient model). Absent for a solid fill, which `color` already carries. */
+  fillPaint?: import('@core/paint/fill').FillPaint;
+  /** A LINEAR or RADIAL gradient on the layer's text STROKE, across the whole
+   *  block like `fillPaint`. Absent for a solid stroke (`textStroke`). */
+  strokePaint?: import('@core/paint/fill').FillPaint;
   /** A Canvas2D-only effect stack (Fill/Stroke/Sharpen/Noise/…) baked into the
    *  text texture — those effects have no GPU shader form. Undefined when the
    *  layer has none (the common case). */
@@ -470,20 +488,34 @@ export function textCssFont(spec: Pick<TextSpec, 'fontSize' | 'fontFamily' | 'fo
   return `${style}${weight} ${spec.fontSize}px "${family}", Inter, system-ui, sans-serif`;
 }
 
-/** CSS font-variation-settings for variable axes (wght/wdth/slnt). */
+/** CSS font-variation-settings for variable axes (wght/wdth/slnt, then any
+ *  other `fontAxes` tag). Canvas has no property to take it — see
+ *  `@core/text/fontFaceVariants`, which applies it through a FontFace alias. */
 export function textFontVariationSettings(
-  spec: Pick<TextSpec, 'fontWeight' | 'fontWidth' | 'fontSlant'>,
+  spec: Pick<TextSpec, 'fontWeight' | 'fontWidth' | 'fontSlant'> & { fontAxes?: Readonly<Record<string, number>> },
+  offsets?: Readonly<Record<string, number>>,
 ): string | undefined {
-  const parts: string[] = [];
-  const w = spec.fontWeight !== undefined ? Number(spec.fontWeight) : NaN;
-  if (Number.isFinite(w)) parts.push(`'wght' ${w}`);
-  if (spec.fontWidth !== undefined && Number.isFinite(spec.fontWidth)) {
-    parts.push(`'wdth' ${spec.fontWidth}`);
-  }
-  if (spec.fontSlant !== undefined && Number.isFinite(spec.fontSlant)) {
-    parts.push(`'slnt' ${spec.fontSlant}`);
-  }
-  return parts.length ? parts.join(', ') : undefined;
+  return fontVariationString(spec, offsets);
+}
+
+/**
+ * True when drawing this spec needs an alias FontFace (an axis beyond weight,
+ * or a non-default OpenType feature). Only then does the raster key carry the
+ * font-variant epoch — a plain layer's key is untouched.
+ */
+export function textNeedsFontVariants(
+  spec: Pick<TextSpec, 'fontWidth' | 'fontSlant' | 'fontAxes' | 'textExtras' | 'glyphs'>,
+): boolean {
+  const x = spec.textExtras;
+  return (
+    spec.fontWidth !== undefined ||
+    spec.fontSlant !== undefined ||
+    (!!spec.fontAxes && Object.keys(spec.fontAxes).length > 0) ||
+    !!(x && (x.ligatures === false || x.discretionaryLigatures || x.contextualAlternates === false || (x.stylisticSets && x.stylisticSets.length > 0))) ||
+    // Vertical type draws upright glyphs with a 'vert' alias face.
+    x?.orientation === 'vertical' ||
+    !!spec.glyphs?.some((g) => g.axes && Object.keys(g.axes).length > 0)
+  );
 }
 
 interface TextEntry {
@@ -685,6 +717,8 @@ export class AppTextureProvider implements TextureProvider {
   private readonly fieldsWork: HTMLCanvasElement = document.createElement('canvas');
   /** Fired when an async decode finishes and a texture becomes ready. */
   onChange: (() => void) | null = null;
+  /** Re-rasterizes text when an axis / feature alias face finishes loading. */
+  private fontVariantSub: (() => void) | null = null;
 
   private exactMediaTiming = false;
   /** Timeline is playing — setVideoPlayback keeps `<video>` running instead of per-frame seeks. */
@@ -1071,13 +1105,21 @@ export class AppTextureProvider implements TextureProvider {
       `|${spec.align ?? ''}|${spec.letterSpacing ?? 0}|${spec.lineHeight ?? ''}` +
       `|${spec.paragraphSpacing ?? 0}|${spec.strokeOverFill ? 'sof' : ''}` +
       `|${spec.textTransform ?? ''}|${spec.fontVariant ?? ''}|${spec.verticalAlign ?? ''}|${spec.verticalScale ?? ''}|${spec.horizontalScale ?? ''}|${spec.baselineShift ?? ''}|${spec.textStroke ?? ''}|${spec.textStrokeWidth ?? ''}` +
+      `${spec.textExtras ? `|x${JSON.stringify(spec.textExtras)}` : ''}` +
       `|${spec.runs && spec.runs.length ? JSON.stringify(spec.runs) : ''}${fxSig}${fillSig}` +
       // Animator output and path placement change the baked pixels, so they
       // belong in the cache key — otherwise frame 1 of a sweep is reused for
       // every frame of it.
       `${spec.glyphs && spec.glyphs.length ? `|g${JSON.stringify(spec.glyphs)}` : ''}` +
       `${spec.textPath ? `|tp${JSON.stringify(spec.textPath)}` : ''}` +
+      `${spec.fontAxes ? `|ax${JSON.stringify(spec.fontAxes)}` : ''}` +
+      `${spec.fillPaint ? `|fp${JSON.stringify(spec.fillPaint)}` : ''}` +
+      `${spec.strokePaint ? `|sp${JSON.stringify(spec.strokePaint)}` : ''}` +
+      // An alias face that finishes loading changes the pixels without changing
+      // the spec — the epoch is what turns the key over when it does.
+      `${textNeedsFontVariants(spec) ? `|fv${fontVariantEpoch()}` : ''}` +
       `|t${tier}`;
+    if (!this.fontVariantSub) this.fontVariantSub = onFontVariantsChanged(() => this.onChange?.());
 
     // Non-zero only when a CPU-baked chain would bleed outside the text box
     // (see rasterPadding) — otherwise this stays 0 exactly as before.

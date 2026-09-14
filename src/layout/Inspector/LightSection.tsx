@@ -22,6 +22,9 @@
  */
 
 import { useEffect, useMemo } from 'react';
+import { MAX_LIGHTS3D } from '@motion/renderer';
+import { flattenComposition, readNodeKind } from '@core/scene/sceneDerive';
+import { activeCompRootId } from '@core/scene/activeComp';
 import { ColorPicker } from '@components/ColorPicker';
 import { Checkbox } from '@components/Checkbox';
 import { Button } from '@components/Button';
@@ -204,9 +207,33 @@ export function LightSection({ nodeId }: { nodeId: string }): JSX.Element | null
     });
   };
 
+  // The GPU uploads at most MAX_LIGHTS3D lights per draw (uniforms.ts caps the
+  // packed array); extra scene lights are silently truncated by layer order.
+  // Silent is the problem — say so where lights are edited. Counted from the
+  // live graph (enabled light layers in the active comp), the same population
+  // buildSnapshot collects into `sceneLights`; already re-rendered by the
+  // scene-revision subscription above, so this adds no new per-frame work.
+  // (An environment light expands into an ambient + up-to-six-parallel rig, so
+  // the true uploaded count can be higher still — the count here is the floor.)
+  const lightLayerCount = flattenComposition(defaultSceneGraph, activeCompRootId())
+    .filter((n) => readNodeKind(n) === 'light' && n.visible !== false).length;
+
   return (
     <div className={styles.section}>
       <div className={styles.inlineRows}>
+        {lightLayerCount > MAX_LIGHTS3D && (
+          <p
+            style={{
+              margin: '0 0 6px',
+              fontSize: 'var(--font-size-micro)',
+              color: 'var(--color-warning, #f5b84b)',
+              lineHeight: 1.5,
+            }}
+          >
+            {lightLayerCount} lights in this comp — only the first {MAX_LIGHTS3D} in
+            layer order light the 3D scene; the rest are ignored by shading.
+          </p>
+        )}
         <div className={styles.popoverRow}>
           <span className={styles.popoverLabel}>Preset</span>
           <select

@@ -423,6 +423,43 @@
   grid-column: span 2;
 }
 
+/* A dropdown living inside a metric cell (kerning mode, line join, order). */
+.metricSelect {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-text-primary);
+  font-family: inherit;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  outline: none;
+  cursor: pointer;
+  padding: 0;
+}
+
+/* A ValueField sharing a metric cell with a dropdown. */
+.metricValue {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The small "Auto" switch beside the leading value. */
+.metricToggle {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-family: inherit;
+  font-size: var(--font-size-micro);
+  padding: 0;
+  cursor: pointer;
+}
+
+.metricToggle[data-active="true"] {
+  color: var(--color-primary);
+}
+
 /* ── Path & Box Options ── */
 .controlRow {
   display: flex;

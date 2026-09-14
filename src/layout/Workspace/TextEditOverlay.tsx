@@ -3,8 +3,18 @@
  *
  * A `contentEditable` div overlaid on the canvas at the text layer's position,
  * styled to match what the renderer draws (font, size, colour, alignment,
- * rotation, zoom). Enter inserts a newline (After Effects); commit with
- * Ctrl/Cmd+Enter or by clicking outside. Escape cancels.
+ * rotation, zoom). Enter inserts a newline (After Effects).
+ *
+ * Committing, as in AE:
+ *   • Ctrl/Cmd+Enter, or ENTER ON THE NUMERIC KEYPAD — AE's "exit text edit";
+ *   • Escape — AE keeps your edits when you leave text editing with Esc;
+ *   • clicking anywhere outside the box (and outside the Character panel).
+ * Discarding is the separate, explicit Shift+Escape.
+ *
+ * Focus moving INTO an element marked `data-text-edit-keep` (the Character
+ * panel) does not end the edit: the character selection stays live, so a
+ * size, colour or kerning change applies to the selected characters or the
+ * caret — the whole point of editing them from the panel.
  *
  * This replaces `window.prompt`, which Electron's Chromium refuses — so text
  * editing was silently dead in the desktop build the app actually ships as.
@@ -12,20 +22,43 @@
  * the layer as you pan/zoom.
  */
 
-import { useEffect, useLayoutEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { getWorkspaceController } from '@core/workspace/WorkspaceController';
 import { readGeometry } from '@core/workspace/geometry';
-import { useTextEditStore } from '@stores/textEditStore';
+import { useTextEditStore, TEXT_EDIT_KEEP_ATTR } from '@stores/textEditStore';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { updateNodeComponentProp } from '@core/inspector/InspectorAPI';
-import { readRuns, reindexRuns } from '@core/text/richText';
+import { readRuns, reindexRuns, RUNS_INDEX_PROP, RUNS_INDEX_GRAPHEME } from '@core/text/richText';
+import { utf16ToGraphemeIndex } from '@core/text/graphemes';
+import { readParagraphDirection, resolveAlignForDirection } from '@core/text/textExtras';
 import { defaultAnimation } from '@motion/animation';
 import { runAnimEdit } from '@core/animation/animationCommands';
 import { getTime as getPlayheadTime } from '@stores/playbackClockStore';
 import { getRemappedTime } from '@core/timeline/TimelineController';
+import { installTextCommands } from '@layout/Inspector/textCommands';
+import {
+  installParagraphTextCommands,
+  TEXT_CONVERT_TO_PARAGRAPH_COMMAND,
+  TEXT_CONVERT_TO_POINT_COMMAND,
+} from '@layout/Inspector/paragraphTextCommands';
+import { measureTextNodeParagraphBox } from '@core/text/measureText';
+import { openContextMenu } from '@stores/contextMenuStore';
+import { TextBoxHandles } from './TextBoxHandles';
 
 const num = (v: unknown, fb: number): number => (typeof v === 'number' ? v : fb);
 const strp = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
+
+/**
+ * Inside a surface that belongs to the inspector — the Character panel, or a
+ * popover it opened. Popovers (font picker, colour picker) PORTAL to <body>,
+ * outside the panel, so they carry the attribute themselves; the node may
+ * also be a text node inside one, which has no `closest` of its own.
+ */
+export function insideKeepZone(el: EventTarget | null): boolean {
+  let node = el as (Node & { closest?: (s: string) => Element | null }) | null;
+  if (node && typeof node.closest !== 'function') node = (node as Node).parentElement;
+  return !!node && typeof node.closest === 'function' && node.closest(`[${TEXT_EDIT_KEEP_ATTR}]`) !== null;
+}
 
 /**
  * Count the characters before (`node`, `offset`) within `root`.
@@ -36,7 +69,7 @@ const strp = (v: unknown): string | undefined => (typeof v === 'string' ? v : un
  * walks the tree the way `innerText` reads it: text nodes contribute their
  * text, a `<br>` contributes one newline.
  *
- * Returns UTF-16 units; the caller converts to code points.
+ * Returns UTF-16 units; the caller converts to grapheme clusters.
  */
 function charOffsetOf(root: Node, node: Node, offset: number): number {
   let count = 0;
@@ -78,11 +111,6 @@ function charOffsetOf(root: Node, node: Node, offset: number): number {
   return count;
 }
 
-/** UTF-16 offset -> code-point index, the index space runs are stored in. */
-function toCodePointIndex(text: string, utf16Offset: number): number {
-  return [...text.slice(0, utf16Offset)].length;
-}
-
 /** Merge every component's props, the way buildSnapshot reads a text layer. */
 function mergedProps(nodeId: string): Record<string, unknown> {
   const node = defaultSceneGraph.getNode(nodeId);
@@ -98,6 +126,17 @@ export function TextEditOverlay(): JSX.Element | null {
   const setSelection = useTextEditStore((s) => s.setSelection);
   const boxRef = useRef<HTMLDivElement | null>(null);
   const committedRef = useRef(false);
+  const commitRef = useRef<() => void>(() => {});
+  /** The text as TYPED (null until the first keystroke): the preview's box
+   *  alignment and overflow follow it, not the last committed content. */
+  const [draft, setDraft] = useState<string | null>(null);
+
+  // The text commands (Swap Fill and Stroke, Shift+X) live with the text
+  // feature; this component is always mounted with the workspace.
+  useEffect(() => {
+    installTextCommands();
+    installParagraphTextCommands();
+  }, []);
 
   // Keep the overlay glued to the layer while the camera moves.
   useEffect(() => {
@@ -137,6 +176,7 @@ export function TextEditOverlay(): JSX.Element | null {
   }, [nodeId]);
   useLayoutEffect(() => {
     committedRef.current = false;
+    setDraft(null);
     const box = boxRef.current;
     if (!nodeId || !box) return;
     box.textContent = strp(mergedProps(nodeId).content) ?? '';
@@ -160,8 +200,8 @@ export function TextEditOverlay(): JSX.Element | null {
       const range = sel.getRangeAt(0);
       if (!box.contains(range.commonAncestorContainer)) return;
       const text = box.innerText ?? '';
-      const a = toCodePointIndex(text, charOffsetOf(box, range.startContainer, range.startOffset));
-      const b = toCodePointIndex(text, charOffsetOf(box, range.endContainer, range.endOffset));
+      const a = utf16ToGraphemeIndex(text, charOffsetOf(box, range.startContainer, range.startOffset));
+      const b = utf16ToGraphemeIndex(text, charOffsetOf(box, range.endContainer, range.endOffset));
       setSelection({ start: Math.min(a, b), end: Math.max(a, b) });
     };
     document.addEventListener('selectionchange', onSelectionChange);
@@ -169,19 +209,66 @@ export function TextEditOverlay(): JSX.Element | null {
     return () => document.removeEventListener('selectionchange', onSelectionChange);
   }, [nodeId, setSelection]);
 
-  if (!nodeId) return null;
+  // A click outside the box commits — including after focus has moved into
+  // the Character panel, where the box's own blur deliberately did not.
+  useEffect(() => {
+    if (!nodeId) return;
+    const onPointerDown = (e: PointerEvent): void => {
+      const box = boxRef.current;
+      const target = e.target as Node | null;
+      if (box && target && box.contains(target)) return;
+      if (insideKeepZone(e.target)) return;
+      commitRef.current();
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    return () => document.removeEventListener('pointerdown', onPointerDown, true);
+  }, [nodeId]);
+
+  // The paragraph box (outline, reflow handles, overflow) also shows for the
+  // Type tool on a selected paragraph layer, so it renders without an edit.
+  if (!nodeId) return <TextBoxHandles />;
 
   const p = mergedProps(nodeId);
-  const size = num(p.fontSize, 48);
+  const editedNode = defaultSceneGraph.getNode(nodeId);
+  const box = editedNode ? measureTextNodeParagraphBox(editedNode, draft !== null ? { content: draft } : undefined) : null;
+  // Fit Text to Box previews at the scale the canvas draws at.
+  const fit = box?.fitScale ?? 1;
+  const size = num(p.fontSize, 48) * fit;
   const family = strp(p.fontFamily) ?? 'Inter';
   const weight = strp(p.fontWeight) ?? (typeof p.fontWeight === 'number' ? String(p.fontWeight) : '600');
-  const italic = p.fontStyle === 'italic';
-  const align = (strp(p.align) ?? 'left') as 'left' | 'center' | 'right' | 'justify';
+  const italic = p.fontStyle === 'italic' || p.fauxItalic === true;
+  // Vertical type edits in a vertical-rl box (the caret walks down columns
+  // flowing right to left); a right-to-left paragraph edits with dir="rtl", so
+  // the caret, selection and bidi order follow the text. The stored alignment
+  // reads from the START edge in RTL, exactly as the painter mirrors it.
+  const vertical = p.orientation === 'vertical';
+  const dirProp = readParagraphDirection(p.direction);
+  const rtl = !vertical && dirProp === 'rtl';
+  // 'auto': the browser resolves EACH paragraph's direction from its first
+  // strong character (dir="auto" + unicode-bidi: plaintext — UAX #9 P2/P3, as
+  // the painter does), and 'start' / 'end' alignment follow each paragraph.
+  const auto = !vertical && dirProp === 'auto';
+  const aligned = resolveAlignForDirection(strp(p.align), rtl ? 'rtl' : 'ltr');
+  const cssAlign = (l: 'left' | 'center' | 'right'): 'left' | 'center' | 'right' | 'start' | 'end' =>
+    auto && l !== 'center' ? (l === 'left' ? 'start' : 'end') : l;
   const color = strp(p.color) ?? strp(p.fill) ?? '#ffffff';
   const lineHeight = num(p.lineHeight, 1.2);
-  const letterSpacing = num(p.letterSpacing, 0);
+  const letterSpacing = num(p.letterSpacing, 0) * fit;
   const boxWidth = num(p.boxWidth, 0);
   const paragraph = boxWidth > 0;
+  // A FIXED box previews the way the painter draws it: the line block sits
+  // where `placeLinesInBox` puts it — its top at the box centre minus half the
+  // block, plus the alignment offset (0 for top, and for any text that
+  // overflows, which yields to top) — and nothing shows past the box.
+  const fixedBox = !!box && box.fixedHeight;
+  const boxPadTop = box && fixedBox
+    ? Math.max(0, box.boxHeight / 2 - box.contentHeight / 2 + box.lineOffsetY)
+    : 0;
+
+  const cancel = (): void => {
+    committedRef.current = true; // discard edits
+    end();
+  };
 
   const commit = (): void => {
     if (committedRef.current) return;
@@ -201,6 +288,9 @@ export function TextEditOverlay(): JSX.Element | null {
           defaultAnimation.setDataKeyframe(node.id, 'text.source', 'text', layerT, next);
         });
       }
+      // This branch used to return without closing the editor, leaving the
+      // overlay up (and the layer's glyphs hidden) after a keyframed commit.
+      end();
       return;
     }
     if (node && textComp && next !== prev) {
@@ -210,9 +300,12 @@ export function TextEditOverlay(): JSX.Element | null {
       updateNodeComponentProp(defaultSceneGraph, node.id, textComp.id, 'content', next);
       // Runs address characters by index, so an edit that shifts characters
       // must shift the runs with them — otherwise typing a word at the front
-      // slides the layer's whole styling one word to the right.
+      // slides the layer's whole styling one word to the right. `readRuns`
+      // hands back grapheme indices (migrating a legacy code-point document),
+      // so the rewrite is stamped grapheme-indexed.
       const runs = readRuns(node);
       if (runs.length > 0) {
+        updateNodeComponentProp(defaultSceneGraph, node.id, textComp.id, RUNS_INDEX_PROP, RUNS_INDEX_GRAPHEME);
         updateNodeComponentProp(
           defaultSceneGraph,
           node.id,
@@ -224,31 +317,58 @@ export function TextEditOverlay(): JSX.Element | null {
     }
     end();
   };
+  commitRef.current = commit;
 
   return (
+    <>
+    <TextBoxHandles overflow={box ? box.overflow : undefined} />
     <div
       ref={boxRef}
       role="textbox"
       aria-label="Edit text"
+      dir={auto ? 'auto' : rtl ? 'rtl' : 'ltr'}
+      data-overflow={box?.overflow || undefined}
       contentEditable
       suppressContentEditableWarning
       spellCheck={false}
+      onInput={(e) => setDraft(e.currentTarget.innerText ?? '')}
+      // Clipped at the box: the caret may scroll the lines inside it (never
+      // sideways), but nothing spills past its edges.
+      onScroll={fixedBox ? (e) => { if (e.currentTarget.scrollLeft !== 0) e.currentTarget.scrollLeft = 0; } : undefined}
       onPointerDown={(e) => e.stopPropagation()}
       onDoubleClick={(e) => e.stopPropagation()}
+      onContextMenu={(e) => {
+        // AE: right-click in the text while editing offers the conversions.
+        // Choosing one clicks outside the editor, which commits first.
+        e.preventDefault();
+        e.stopPropagation();
+        openContextMenu(e.clientX, e.clientY, [
+          paragraph
+            ? { id: 'text-convert-point', commandId: TEXT_CONVERT_TO_POINT_COMMAND }
+            : { id: 'text-convert-paragraph', commandId: TEXT_CONVERT_TO_PARAGRAPH_COMMAND },
+        ]);
+      }}
       onKeyDown={(e) => {
         e.stopPropagation();
-        // AE: Enter inserts a line. Commit with Ctrl/Cmd+Enter or by clicking
-        // outside (blur). Escape cancels.
-        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        // AE: Enter inserts a line; keypad Enter and Ctrl/Cmd+Enter commit.
+        // Escape commits too (AE keeps the edits); Shift+Escape discards.
+        const numpadEnter = e.key === 'Enter' && e.code === 'NumpadEnter';
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey || numpadEnter)) {
           e.preventDefault();
           commit();
         } else if (e.key === 'Escape') {
           e.preventDefault();
-          committedRef.current = true; // cancel: discard edits
-          end();
+          if (e.shiftKey) cancel();
+          else commit();
         }
       }}
-      onBlur={commit}
+      onBlur={(e) => {
+        // Moving into the Character panel keeps the edit (and its selection)
+        // alive; the document pointerdown listener commits on a real outside
+        // click.
+        if (insideKeepZone(e.relatedTarget)) return;
+        commit();
+      }}
       style={{
         position: 'absolute',
         // transform-origin at the layer's anchor so rotate/scale pivot there.
@@ -260,22 +380,36 @@ export function TextEditOverlay(): JSX.Element | null {
         minWidth: '1ch',
         minHeight: '1em',
         padding: 0,
+        paddingTop: boxPadTop,
         margin: 0,
-        outline: '1px solid var(--color-primary, #4c8dff)',
+        ...(fixedBox ? { overflow: 'hidden' as const } : {}),
+        // Paragraph text: TextBoxHandles draws AE's dashed box instead.
+        outline: paragraph ? 'none' : '1px solid var(--color-primary, #4c8dff)',
         background: 'transparent',
         caretColor: color,
         color,
-        textAlign: align === 'justify' ? 'left' : align,
+        // Justified paragraph text previews justified, with its last line
+        // aligned per the variant — the browser's own text-align-last.
+        textAlign: paragraph && aligned.justify ? 'justify' : cssAlign(aligned.line),
+        textAlignLast: aligned.justifyLast ? 'justify' : cssAlign(aligned.line),
+        ...(auto ? { unicodeBidi: 'plaintext' as const } : {}),
+        // Japanese line breaking (kinsoku) close to the painter's lineBreak.ts,
+        // so a CJK paragraph previews wrapped where it will be drawn.
+        ...(paragraph ? { lineBreak: 'strict' as const } : {}),
         fontFamily: `"${family}", Inter, system-ui, sans-serif`,
         fontSize: `${size}px`,
         fontWeight: weight,
         fontStyle: italic ? 'italic' : 'normal',
         lineHeight,
         letterSpacing: `${letterSpacing}px`,
-        cursor: 'text',
+        ...(vertical
+          ? { writingMode: 'vertical-rl' as const, textOrientation: p.verticalRomanAlignment === true ? 'upright' as const : 'mixed' as const }
+          : {}),
+        cursor: vertical ? 'vertical-text' : 'text',
         zIndex: 20,
       }}
     />
+    </>
   );
 }
 

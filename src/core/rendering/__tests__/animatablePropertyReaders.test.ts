@@ -100,6 +100,13 @@ const EXPLAINED: Record<string, string> = {
   acceptsLights: 'readNodeMaterial(node, a)',
   castsShadows: 'readNodeMaterial(node, a)',
   acceptsShadows: 'readNodeMaterial(node, a)',
+  // The Advanced-3D axes ride the same set read.
+  reflectionIntensity: 'readNodeMaterial(node, a)',
+  reflectionSharpness: 'readNodeMaterial(node, a)',
+  reflectionRolloff: 'readNodeMaterial(node, a)',
+  transparency: 'readNodeMaterial(node, a)',
+  transparencyRolloff: 'readNodeMaterial(node, a)',
+  ior: 'readNodeMaterial(node, a)',
   // Camera DOF is sampled as a SET: buildSnapshot hands its sampler to
   // `readSceneDof` (camera3d.ts), which quotes each prop name there — the same
   // shape as Material Options above. `highlightGain` is absent from this list

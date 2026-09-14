@@ -156,6 +156,10 @@ function chordKeyFromEvent(e: KeyboardEvent): string {
   // Same for the backtick key: Shift+` reports `~` on a US layout, and other
   // layouts put other characters there. Bound as `{ key: '`', shift: true }`.
   if (code === 'Backquote' && e.key !== '`') return '`';
+  // And the equals key: Shift+= reports `+` (US) and macOS Option+Shift+=
+  // reports `±`, so AE's Add Expression chord `{ key: '=', alt, shift }` could
+  // never match. Nothing binds `+` or `±`, so this reaches no other chord.
+  if (code === 'Equal' && e.key !== '=') return '=';
   /**
    * The NUMPAD is a separate keyboard as far as After Effects is concerned, and
    * its audio shortcuts depend on it: Numpad `.` is "preview only audio", while
@@ -166,6 +170,10 @@ function chordKeyFromEvent(e: KeyboardEvent): string {
    * Only the keys AE actually binds are mapped. Numpad digits and Enter are
    * deliberately left alone — they are widely used as plain digits and Enter,
    * and renaming them would silently break every existing binding.
+   *
+   * Numpad + / - are AE's rotate (and, with Alt, scale) nudges. They are named
+   * `Numpad+` / `Numpad-` so the main keyboard's + and - — zoom, typed into
+   * fields — stay the chords they always were.
    */
   if (NUMPAD_KEYS[code]) return NUMPAD_KEYS[code]!;
   return e.key;
@@ -174,6 +182,8 @@ function chordKeyFromEvent(e: KeyboardEvent): string {
 const NUMPAD_KEYS: Readonly<Record<string, string>> = {
   NumpadDecimal: 'Numpad.',
   NumpadMultiply: 'Numpad*',
+  NumpadAdd: 'Numpad+',
+  NumpadSubtract: 'Numpad-',
 };
 
 export const chordFromEvent = (e: KeyboardEvent): import('@app-types/common').KeyChord => ({
