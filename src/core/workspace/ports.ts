@@ -35,6 +35,7 @@ import {
 } from '@motion/workspace';
 import { cutPathsWithLine, runFromPolygon, type CutSubpath, type CutPoint } from '@core/geometry/pathCut';
 import { shapeOutline } from '@core/scene/pathOps';
+import { resolveCornerRadii, clampCornerRadii, type CornerRadiiProps } from '@core/scene/cornerRadii';
 import { useHistoryStore } from '@stores/historyStore';
 import { readNodeAnchor, moveAnchorCompensated } from '@core/scene/anchor';
 import { enableContinuousRasterByDefault } from '@core/scene/continuousRaster';
@@ -1608,11 +1609,33 @@ function readCutRuns(node: SceneNode): CutSubpath[] | null {
   // polygon or a star would come back as a rectangle, and cutting a shape into
   // halves of a shape it isn't is worse than not cutting it.
   const primitive = g.ellipse ? 'ellipse' : 'rect';
-  const shapeType = node.components.find((c) => c.type === 'Transform')?.props.shapeType;
+  const tProps = node.components.find((c) => c.type === 'Transform')?.props as
+    | Record<string, unknown>
+    | undefined;
+  const shapeType = tProps?.shapeType;
   if (typeof shapeType === 'string' && shapeType !== 'rect' && shapeType !== 'rectangle' && shapeType !== 'ellipse') {
     return null;
   }
-  const outline = shapeOutline(primitive, g.width, g.height, 48);
+  // A rounded rect's rounding is part of its outline: seeding the cut from the
+  // sharp rect made the knife split a shape the screen was not showing — the
+  // halves came back square-cornered. Same resolution (per-corner over uniform,
+  // CSS clamping, comp-px radii mapped through the layer's scale) as the
+  // renderer's own seed in `buildSnapshot`.
+  const corner = (key: keyof CornerRadiiProps): number | undefined => {
+    const v = tProps?.[key];
+    return typeof v === 'number' && Number.isFinite(v) ? Math.max(0, v) : undefined;
+  };
+  const radii = clampCornerRadii(g.width, g.height, resolveCornerRadii({
+    cornerRadius: corner('cornerRadius'),
+    cornerRadiusTL: corner('cornerRadiusTL'),
+    cornerRadiusTR: corner('cornerRadiusTR'),
+    cornerRadiusBR: corner('cornerRadiusBR'),
+    cornerRadiusBL: corner('cornerRadiusBL'),
+  }));
+  const outline = shapeOutline(
+    primitive, g.width, g.height, 48, 0,
+    radii, [Math.abs(g.scaleX), Math.abs(g.scaleY)],
+  );
   return outline.length >= 3 ? [runFromPolygon(outline)] : null;
 }
 

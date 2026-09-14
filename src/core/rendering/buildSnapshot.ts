@@ -3617,9 +3617,20 @@ export function buildSnapshot(
         // anchors: a drawn curve came back as straight chords the moment any
         // operator was added. Trim was where it showed worst, because trimming
         // is the operator you watch the whole outline while using.
+        // The corner radii ride into the seed: a rect's rounding is part of its
+        // OUTLINE here, not a draw-time flag — the chain's output is traced
+        // verbatim as a path, so radii left behind on the layer are invisible.
+        // Dropping them from the seed squared off every rounded rect the moment
+        // any live operator was added. The resolved (animated, clamped) values
+        // and the axis compensation are exactly what `roundRect` would have
+        // drawn without the chain.
         const base = pathPoints && pathPoints.length > 1
           ? flattenOutline(pathPoints, ADAPTIVE, pathOpen === true)
-          : shapeOutline(layer.primitive, layerW, layerH, 48, dense);
+          : shapeOutline(
+              layer.primitive, layerW, layerH, 48, dense,
+              layer.cornerRadii ?? layer.cornerRadius,
+              layer.cornerRadiusScale,
+            );
         // Roughen's wiggle rides the layer's OWN time — the same axis `a` was
         // sampled on (valuesOf → remapOf). Handing it comp `t` would leave the
         // noise running at wall-clock speed while the keyframes it animates
@@ -3671,6 +3682,14 @@ export function buildSnapshot(
           layer.pathOpen = undefined;
           layer.primitive = 'path';
         }
+
+        // The radii are geometry now — the seed baked them into the outline
+        // above. Cleared so no consumer keying on the fields instead of the
+        // primitive rounds the emitted path a second time; they no longer
+        // describe what the chain produced anyway.
+        layer.cornerRadius = 0;
+        layer.cornerRadii = undefined;
+        layer.cornerRadiusScale = undefined;
 
         // GROW THE BOX to whatever the chain produced, but only for a chain
         // containing a repeater.
