@@ -304,6 +304,23 @@ export interface RenderLayer {
     /** Material Options → Diffuse (AE %). Scales Lambert response; omit ⇒ 50
      *  (AE default, identity vs the pre-material gain). */
     diffuse?: number;
+    /** Advanced-3D Reflection Intensity 0..1: scales the environment-specular
+     *  term. Omit ⇒ 1 (identity — today's IBL arithmetic to the byte). */
+    reflectionIntensity?: number;
+    /** Advanced-3D Reflection Sharpness 0..1: the prefiltered env atlas is
+     *  sampled at roughness × (1 − sharpness). Omit ⇒ 0 (identity). */
+    reflectionSharpness?: number;
+    /** Advanced-3D Reflection Rolloff 0..1: Schlick-weights the env term
+     *  toward grazing angles (F0 from `ior`). Omit ⇒ 0 (identity). */
+    reflectionRolloff?: number;
+    /** Advanced-3D Transparency 0..1: view-dependent alpha multiplier applied
+     *  per fragment (`shadeAlpha3d`). Omit ⇒ 0 (identity). */
+    transparency?: number;
+    /** Transparency Rolloff 0..1: Fresnel weight — facing transmits, grazing
+     *  stays opaque. Omit ⇒ 0 (uniform transparency). */
+    transparencyRolloff?: number;
+    /** Index of refraction feeding both rolloffs' Schlick F0. Omit ⇒ 1.52. */
+    ior?: number;
   };
   /**
    * Material Options → Casts Shadows, for the GEOMETRY-aware shadow path.
@@ -459,6 +476,10 @@ export interface RenderLayer {
   /** The text layer's own stroke — colour and width in px. */
   textStroke?: string;
   textStrokeWidth?: number;
+  /** AE paragraph/character extras (indents, space before/after, justification
+   *  soft-wrap lines, faux bold/italic, stroke join/order, none swatches,
+   *  kerning mode). Emitted only when non-default. */
+  textExtras?: import('@core/text/textExtras').TextExtras;
   /** Text on a path: the layer's chosen mask, already flattened to a polyline
    *  in layer-local space, plus how to ride it. Resolved in buildSnapshot so a
    *  backend never has to reach back into the scene graph for geometry. */
@@ -468,7 +489,15 @@ export interface RenderLayer {
     firstMargin: number;
     reversed: boolean;
     perpendicular: boolean;
+    /** Path Options Force Alignment / Last Margin — present only when set. */
+    forceAlignment?: boolean;
+    lastMargin?: number;
   };
+  /** Variable-font axes beyond wght/wdth/slnt, by tag. Absent when none. */
+  fontAxes?: Readonly<Record<string, number>>;
+  /** A text layer's stroke GRADIENT (Text component `strokePaint`); absent for
+   *  a solid stroke, which `textStroke` carries. */
+  textStrokePaint?: import('@core/paint/fill').FillPaint;
   /** CSS filter string from the layer's effect stack + DOF blur + cast shadow.
    *  Legacy: only the (deleted) Canvas2D backend read it; kept because tests
    *  assert against it and it documents the frame in one greppable string. The

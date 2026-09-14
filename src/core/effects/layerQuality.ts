@@ -23,12 +23,19 @@ import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { getEventBus } from '@core/events/EventBus';
 import type { SceneNode } from '@core/types';
 
-export type LayerQuality = 'best' | 'draft';
+/**
+ * 'wireframe' (AE's third switch position) is VIEWPORT-ONLY: the interactive
+ * viewport hosts opt in through `SnapshotComp.wireframeLayers`, which hides the
+ * layer's pixels, and the overlay draws its oriented bounding box instead. Every
+ * output path omits the flag, so a wireframe layer exports exactly as Best.
+ */
+export type LayerQuality = 'best' | 'draft' | 'wireframe';
 
 /** Read a layer's quality (defaults to 'best' — absent means antialiased). */
 export function readNodeQuality(node: SceneNode): LayerQuality {
   const fx = node.components.find((c) => c.type === 'fx');
-  return fx?.props.quality === 'draft' ? 'draft' : 'best';
+  const q = fx?.props.quality;
+  return q === 'draft' || q === 'wireframe' ? q : 'best';
 }
 
 export function getNodeQuality(nodeId: string): LayerQuality {
@@ -37,11 +44,17 @@ export function getNodeQuality(nodeId: string): LayerQuality {
 }
 
 export function setNodeQuality(nodeId: string, quality: LayerQuality): void {
-  // Store only the non-default 'draft' so the common case adds nothing to file.
-  defaultSceneGraph.setLayerQuality(nodeId, quality === 'draft' ? 'draft' : undefined);
+  // Store only the non-default values so the common case adds nothing to file.
+  defaultSceneGraph.setLayerQuality(nodeId, quality === 'best' ? undefined : quality);
   getEventBus().emit('AnimationChanged', { nodeId });
 }
 
+/** AE's switch cycle: Best → Draft → Wireframe → Best. */
+export function nextQuality(q: LayerQuality): LayerQuality {
+  return q === 'best' ? 'draft' : q === 'draft' ? 'wireframe' : 'best';
+}
+
+/** Best ↔ Draft — the inspector's two-state switch (Wireframe reads as not-Draft). */
 export function toggleNodeQuality(nodeId: string): void {
   setNodeQuality(nodeId, getNodeQuality(nodeId) === 'draft' ? 'best' : 'draft');
 }

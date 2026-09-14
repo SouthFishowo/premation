@@ -29,7 +29,14 @@ import { CameraAnimator, type Easing } from './camera/CameraAnimator';
 import { CoordinateSystem } from './coordinates/CoordinateSystem';
 import { Grid, type GridState } from './grid/Grid';
 import { Guides, type Guide, type GuideAxis } from './guides/Guides';
-import { SnapEngine, type SnapSettings, type SnapTarget, type SnapLine, type SnapResult } from './snap/SnapEngine';
+import {
+  SnapEngine,
+  type SnapSettings,
+  type SnapTarget,
+  type SnapLine,
+  type SnapResult,
+  type SnapPointTarget,
+} from './snap/SnapEngine';
 import {
   measureBetween,
   smartGuides as computeSmartGuides,
@@ -577,6 +584,8 @@ export class Workspace implements InputSink {
         this.buildSnapTargets(region, excludeIds),
       snapRect: (rect: Rect, excludeIds?: ReadonlySet<string>): SnapResult<Rect> =>
         this.snapRect(rect, excludeIds),
+      snapPoint: (point: Vec2, excludeIds?: ReadonlySet<string>, opts?: { force?: boolean }): SnapResult<Vec2> =>
+        this.snapPoint(point, excludeIds, opts),
       sizeMatches: (rect: Rect, excludeIds?: ReadonlySet<string>): readonly SizeCandidate[] =>
         this.sizeMatches(rect, excludeIds),
     };
@@ -590,8 +599,54 @@ export class Workspace implements InputSink {
    * it, so tools and callers can never disagree about the answer.
    */
   snapRect(rect: Rect, excludeIds?: ReadonlySet<string>): SnapResult<Rect> {
-    const { targets, thresholdWorld, bounds } = this.snapInputs(rect, excludeIds);
-    return this.snap.snapRect(rect, targets, thresholdWorld, bounds);
+    const { targets, thresholdWorld, bounds, points } = this.snapInputs(rect, excludeIds);
+    return this.snap.snapRect(rect, targets, thresholdWorld, bounds, points);
+  }
+
+  /**
+   * Snap a world POINT (the Pan Behind anchor, a path vertex) against the same
+   * grid / guide / object targets plus point features. `force` ignores the
+   * master snap switch — see `SnapEngine.snapPoint`.
+   */
+  snapPoint(point: Vec2, excludeIds?: ReadonlySet<string>, opts?: { force?: boolean }): SnapResult<Vec2> {
+    const probe = R.rect(point.x, point.y, 0, 0);
+    const { targets, thresholdWorld, points } = this.snapInputs(probe, excludeIds, opts?.force === true);
+    return this.snap.snapPoint(point, targets, thresholdWorld, points, opts);
+  }
+
+  /**
+   * The POINT snap features (anchors, mask/shape vertices, projected 3D points)
+   * of every layer outside `excludeIds`, each already filtered by its own snap
+   * switch, plus the world threshold and the master switch.
+   *
+   * For a gesture the tools do not own — the 3D gizmo, which solves its own
+   * axis/plane-constrained snap. Collected regardless of the master switch so
+   * Ctrl can toggle snapping mid-drag; the caller checks `enabled`. Grid lines
+   * are deliberately not part of it (a scene-wide grid would be millions of
+   * targets, and a constrained 3D move snaps to features, not to lines).
+   */
+  snapFeatures(excludeIds?: ReadonlySet<string>): { points: SnapPointTarget[]; thresholdWorld: number; enabled: boolean } {
+    const settings = this.snap.getSettings();
+    let points: SnapPointTarget[] = [];
+    if (settings.toObjects) {
+      const everywhere = R.rect(-1e7, -1e7, 2e7, 2e7);
+      const nodes = this.hitTester
+        .hitTestRegion(everywhere, 'intersect', { includeLocked: true })
+        .filter((n) => !(excludeIds && excludeIds.has(n.id)) && !n.device);
+      points = SnapEngine.featurePoints(nodes).filter((p) => this.snap.sourceAllowed(p.source));
+    }
+    return {
+      points,
+      thresholdWorld: this.camera.screenDistanceToWorld(settings.thresholdPx),
+      enabled: settings.enabled,
+    };
+  }
+
+  /** Show (or clear, with `[]`) snap indicator lines for a host-owned gesture. */
+  setSnapIndicator(lines: readonly SnapLine[]): void {
+    this.snapLines = [...lines];
+    this.pushOverlay();
+    this.renderer.markDirty();
   }
 
   /**
@@ -612,8 +667,12 @@ export class Workspace implements InputSink {
   private snapInputs(
     rect: Rect,
     excludeIds?: ReadonlySet<string>,
-  ): { targets: SnapTarget[]; thresholdWorld: number; bounds: Rect[] } {
+    force = false,
+  ): { targets: SnapTarget[]; thresholdWorld: number; bounds: Rect[]; points: SnapPointTarget[] } {
     const region = R.inflate(rect, this.camera.screenDistanceToWorld(this.snap.getSettings().thresholdPx) + 4);
+    // A forced probe (snapping switched off, Ctrl turning it on for one drag)
+    // must not reuse — or poison — the cache built for the ordinary case.
+    if (force) return this.buildSnapTargets(region, excludeIds, true);
     // During a drag, snap targets are rebuilt at most once per REGION, not once
     // per pointermove. The per-move rebuild was O(scene): the drag's own scene
     // write dirties the spatial index every event, so `hitTestRegion` inside
@@ -625,7 +684,7 @@ export class Workspace implements InputSink {
       const zoom = this.camera.zoom;
       const c = this.dragSnapCache;
       if (c && c.zoom === zoom && R.containsRect(c.region, region)) {
-        return { targets: c.targets, thresholdWorld: c.thresholdWorld, bounds: c.bounds };
+        return { targets: c.targets, thresholdWorld: c.thresholdWorld, bounds: c.bounds, points: c.points };
       }
       const wide = R.inflate(region, this.camera.screenDistanceToWorld(1500));
       const built = this.buildSnapTargets(wide, excludeIds);
@@ -635,6 +694,7 @@ export class Workspace implements InputSink {
         targets: built.targets,
         thresholdWorld: built.thresholdWorld,
         bounds: built.bounds,
+        points: built.points,
       };
       return built;
     }
@@ -656,17 +716,24 @@ export class Workspace implements InputSink {
     targets: SnapTarget[];
     thresholdWorld: number;
     bounds: Rect[];
+    points: SnapPointTarget[];
   } | null = null;
 
-  /** Assemble grid + guide + object snap targets for a world region. */
+  /**
+   * Assemble grid + guide + object snap targets for a world region, plus the
+   * POINT features (anchors, mask/shape vertices, projected 3D points) of the
+   * same neighbours. `force` builds them even with the master switch off.
+   */
   private buildSnapTargets(
     region: Rect,
     excludeIds?: ReadonlySet<string>,
-  ): { targets: SnapTarget[]; thresholdWorld: number; bounds: Rect[] } {
+    force = false,
+  ): { targets: SnapTarget[]; thresholdWorld: number; bounds: Rect[]; points: SnapPointTarget[] } {
     const settings = this.snap.getSettings();
     const targets: SnapTarget[] = [];
     let objectBounds: Rect[] = [];
-    if (settings.enabled) {
+    let points: SnapPointTarget[] = [];
+    if (settings.enabled || force) {
       // NOT gated on `grid.visible`. After Effects keeps Show Grid and Snap to
       // Grid as independent commands and snaps to a hidden grid; `toGrid` IS
       // the Snap to Grid switch. Gating on visibility instead makes the two
@@ -681,16 +748,21 @@ export class Workspace implements InputSink {
       if (settings.toObjects) {
         const nodes = this.hitTester.hitTestRegion(region, 'intersect', { includeLocked: true });
         const bounds: Rect[] = [];
+        const featureNodes: WorkspaceNode[] = [];
         for (const n of nodes) {
           if (excludeIds && excludeIds.has(n.id)) continue;
           bounds.push(n.worldBounds);
+          // Devices (camera / light icons) have no anchor or path a user
+          // means to line up with.
+          if (!n.device) featureNodes.push(n);
         }
         targets.push(...SnapEngine.objectTargets(bounds));
         objectBounds = bounds;
+        points = SnapEngine.featurePoints(featureNodes);
       }
     }
     const thresholdWorld = this.camera.screenDistanceToWorld(settings.thresholdPx);
-    return { targets, thresholdWorld, bounds: objectBounds };
+    return { targets, thresholdWorld, bounds: objectBounds, points };
   }
 
   private updateHover(screen: Vec2): void {
@@ -760,6 +832,8 @@ export class Workspace implements InputSink {
       position:
         g.axis === 'x' ? this.worldToScreen({ x: g.position, y: 0 }).x : this.worldToScreen({ x: 0, y: g.position }).y,
       locked: g.locked,
+      id: g.id,
+      ...(g.color ? { color: g.color } : {}),
     }));
 
     const hoveredNode = this.hovered ? this.scene.getNode(this.hovered) : undefined;

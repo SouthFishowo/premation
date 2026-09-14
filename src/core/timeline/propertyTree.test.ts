@@ -137,6 +137,8 @@ describe('a row only promises what the engine keeps', () => {
     expect(rows.map((r) => r.prop)).toEqual([
       'acceptsLights', 'ambient', 'diffuse', 'specular', 'shininess', 'metal',
       'castsShadows', 'acceptsShadows', 'lightTransmission', 'roughness', 'displacement',
+      'reflectionIntensity', 'reflectionSharpness', 'reflectionRolloff',
+      'transparency', 'transparencyRolloff', 'ior',
     ]);
     for (const r of rows) expect(r.members).toEqual([r.prop]);
   });

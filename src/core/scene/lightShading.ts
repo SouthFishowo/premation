@@ -377,3 +377,79 @@ export function shadeLayer(
   }
   return [clampGain(r), clampGain(g), clampGain(b)];
 }
+
+/*
+ * ── Advanced-3D view-angle terms (CPU twins of the shader's) ────────────────
+ *
+ * The GPU applies these PER FRAGMENT in `shade3d` / `shadeAlpha3d`
+ * (packages/renderer/src/shaders/builtin.ts); the functions below are the same
+ * arithmetic per quad, kept here so the two models cannot drift — the exact
+ * arrangement `shadeLayer` already has with the light loop. Like Specular and
+ * Roughness, the axes render only on the depth-tested GPU path; the CPU form
+ * is the reference the parity tests compare the shader text against.
+ */
+
+/** Schlick F0 from an index of refraction: ((n−1)/(n+1))². 1.52 → ~0.0426.
+ *  MUST match `f0FromIor` in packages/renderer/src/pipeline/uniforms.ts —
+ *  the packer derives once so the two shader dialects cannot disagree. */
+export function schlickF0FromIor(ior: number): number {
+  const r = (ior - 1) / (ior + 1);
+  return r * r;
+}
+
+/** Schlick Fresnel reflectance at |cos| view angle `ndv`, base F0. */
+export function schlickFresnel(ndv: number, f0: number): number {
+  const c = Math.max(0, Math.min(1, 1 - ndv));
+  return f0 + (1 - f0) * c ** 5;
+}
+
+/** The material's transparency axes as the shading stage reads them (0–100,
+ *  matching MaterialOptions). Absent axes are the identity. */
+export interface SurfaceTransparency {
+  transparency?: number;
+  transparencyRolloff?: number;
+  ior?: number;
+}
+
+/**
+ * The alpha multiplier Advanced-3D Transparency applies to a surface seen from
+ * `eye`. Twin of `shadeAlpha3d` in the shaders, term for term:
+ *
+ *   alpha = 1 − t · mix(1, 1 − F(N·V), rolloff)
+ *
+ * so rolloff 0 is a uniform 1 − t, and at higher rolloff the Fresnel
+ * TRANSMISSION (1 − F) weights it — facing the camera transmits most, grazing
+ * angles stay opaque, which is how glass reads. Two-sided |N·V| on purpose:
+ * a layer has no inside. `transparency` 0 returns an exact 1.0, and every
+ * caller multiplies by it, so untouched scenes keep their bytes.
+ */
+export function transparencyAlpha(
+  normal: readonly [number, number, number],
+  pos: { x: number; y: number; z: number },
+  eye: readonly [number, number, number],
+  t: SurfaceTransparency,
+): number {
+  const amount = Math.max(0, Math.min(100, t.transparency ?? 0)) / 100;
+  if (amount <= 0) return 1;
+  const vx = eye[0] - pos.x;
+  const vy = eye[1] - pos.y;
+  const vz = eye[2] - pos.z;
+  const len = Math.hypot(vx, vy, vz);
+  const ndv = len < 1e-9
+    ? 1
+    : Math.min(1, Math.abs(normal[0] * vx + normal[1] * vy + normal[2] * vz) / len);
+  const roll = Math.max(0, Math.min(100, t.transparencyRolloff ?? 0)) / 100;
+  const transmit = 1 - schlickFresnel(ndv, schlickF0FromIor(t.ior ?? 1.52));
+  return 1 - amount * ((1 - roll) + transmit * roll);
+}
+
+/**
+ * The weight Reflection Rolloff puts on the environment-specular term at |N·V|
+ * `ndv` — mix(1, F(N·V), rolloff), the shader's `rollK`. 0 is the exact
+ * identity (reflections stay uniform); 1 is pure Schlick, concentrating them
+ * at grazing angles.
+ */
+export function reflectionRolloffWeight(ndv: number, ior: number, rolloff01: number): number {
+  const roll = Math.max(0, Math.min(1, rolloff01));
+  return (1 - roll) + schlickFresnel(ndv, schlickF0FromIor(ior)) * roll;
+}

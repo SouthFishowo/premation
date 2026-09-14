@@ -1,7 +1,7 @@
 /**
  * Installing the Object Matte model.
  *
- * Three things here are worth pinning, and none of them is the download:
+ * Four things here are worth pinning, and none of them is the download:
  *
  *  • It never fetches on its own. The local edition's claim is that it does not
  *    reach the network unless asked, and a boot-time restore that quietly
@@ -10,13 +10,16 @@
  *    with a 200, and handing one to the ONNX runtime produces an exception
  *    several layers down that says nothing useful.
  *  • Bytes that fail to load are NOT cached, or every future boot reports a
- *    failure over a file nothing can use.
+ *    failure over files nothing can use.
+ *  • In the desktop app the bytes travel through the MAIN process (the page
+ *    CSP names no model host); the renderer's own fetch is only the fallback
+ *    for a plain browser tab.
  */
 
-const registerFromBytes = jest.fn(async (_bytes: Uint8Array) => ({ status: 'ok' as const }));
+const registerPipeline = jest.fn(async (_enc: Uint8Array, _dec: Uint8Array) => ({ status: 'ok' as const }));
 const unregister = jest.fn();
 jest.mock('./samOnnxLoader', () => ({
-  tryRegisterSamOnnxFromBytes: (bytes: Uint8Array) => registerFromBytes(bytes),
+  tryRegisterSamPipeline: (enc: Uint8Array, dec: Uint8Array) => registerPipeline(enc, dec),
   unregisterSamOnnx: () => unregister(),
 }));
 
@@ -35,6 +38,12 @@ import { looksLikeOnnx, restoreSamModelAtBoot, useSamModelStore } from './samMod
 /** A minimal byte string that passes the ONNX sniff (protobuf field 1). */
 const ONNX_BYTES = new Uint8Array([0x08, 0x07, ...new Array(30).fill(0)]);
 
+const ENCODER_URL = 'https://example.test/vision_encoder.onnx';
+const DECODER_URL = 'https://example.test/decoder.onnx';
+
+const install = (enc: string = ENCODER_URL, dec: string = DECODER_URL): Promise<void> =>
+  useSamModelStore.getState().install(enc, dec);
+
 /**
  * A Blob that can be read back.
  *
@@ -50,7 +59,20 @@ function readableBlob(bytes: Uint8Array): Blob {
   return blob;
 }
 
-/** A `fetch` that answers with `bytes`, optionally without a Content-Length. */
+/** A cached encoder/decoder record, as install() writes them. */
+function pairRecord(): Record<string, unknown> {
+  return {
+    id: 'sam-object-matte',
+    data: readableBlob(ONNX_BYTES),
+    sourceUrl: ENCODER_URL,
+    decoderData: readableBlob(ONNX_BYTES),
+    decoderUrl: DECODER_URL,
+    installedAt: 1_700_000_000_000,
+    bytes: ONNX_BYTES.byteLength * 2,
+  };
+}
+
+/** A `fetch` that answers every call with `bytes`, optionally without a Content-Length. */
 function stubFetch(bytes: Uint8Array, opts: { ok?: boolean; status?: number; length?: boolean } = {}): void {
   const { ok = true, status = 200, length = true } = opts;
   globalThis.fetch = jest.fn(async () => ({
@@ -64,13 +86,14 @@ function stubFetch(bytes: Uint8Array, opts: { ok?: boolean; status?: number; len
 }
 
 beforeEach(() => {
-  registerFromBytes.mockClear().mockResolvedValue({ status: 'ok' as const });
+  registerPipeline.mockClear().mockResolvedValue({ status: 'ok' as const });
   unregister.mockClear();
   cache.get.mockReset().mockResolvedValue(null);
   cache.put.mockReset().mockResolvedValue(undefined);
   cache.remove.mockReset().mockResolvedValue(undefined);
   useSamModelStore.setState({ status: { kind: 'absent' } });
   globalThis.fetch = jest.fn(async () => { throw new Error('fetch should not have been called'); }) as unknown as typeof fetch;
+  delete (window as { motionEditor?: unknown }).motionEditor;
 });
 
 describe('looksLikeOnnx', () => {
@@ -97,27 +120,23 @@ describe('boot restore', () => {
     expect(useSamModelStore.getState().status.kind).toBe('absent');
   });
 
-  it('registers a cached model without any request', async () => {
-    cache.get.mockResolvedValue({
-      id: 'sam-object-matte',
-      data: readableBlob(ONNX_BYTES),
-      sourceUrl: 'https://example.test/model.onnx',
-      installedAt: 1_700_000_000_000,
-      bytes: ONNX_BYTES.byteLength,
-    });
+  it('registers a cached pair without any request', async () => {
+    cache.get.mockResolvedValue(pairRecord());
 
     await useSamModelStore.getState().restore();
 
-    expect(registerFromBytes).toHaveBeenCalled();
+    expect(registerPipeline).toHaveBeenCalled();
     expect(globalThis.fetch).not.toHaveBeenCalled();
     const status = useSamModelStore.getState().status;
     expect(status.kind).toBe('ready');
-    expect(status.kind === 'ready' && status.sourceUrl).toBe('https://example.test/model.onnx');
+    expect(status.kind === 'ready' && status.sourceUrl).toBe(ENCODER_URL);
+    expect(status.kind === 'ready' && status.decoderUrl).toBe(DECODER_URL);
   });
 
-  it('reports a cached model that no longer loads, and keeps the file', async () => {
-    // Deleting someone's 40 MB download because it did not load today is not
-    // this module's decision to make.
+  it('treats a legacy single-file record as stale rather than registering it', async () => {
+    // The legacy naive wrapper "loads" such a file, but no published SAM export
+    // answers it — registering would look like success while every click fell
+    // through, AND would take precedence over the bundled pair that works.
     cache.get.mockResolvedValue({
       id: 'sam-object-matte',
       data: readableBlob(ONNX_BYTES),
@@ -125,7 +144,20 @@ describe('boot restore', () => {
       installedAt: 1,
       bytes: 32,
     });
-    registerFromBytes.mockResolvedValue({ status: 'failed', reason: 'runtime missing' } as never);
+
+    await useSamModelStore.getState().restore();
+
+    expect(registerPipeline).not.toHaveBeenCalled();
+    const status = useSamModelStore.getState().status;
+    expect(status.kind === 'failed' && status.message).toMatch(/earlier version/);
+    // Reported, not deleted: discarding someone's download is not this
+    // module's decision to make.
+    expect(cache.remove).not.toHaveBeenCalled();
+  });
+
+  it('reports a cached pair that no longer loads, and keeps the files', async () => {
+    cache.get.mockResolvedValue(pairRecord());
+    registerPipeline.mockResolvedValue({ status: 'failed', reason: 'runtime missing' } as never);
 
     await useSamModelStore.getState().restore();
 
@@ -136,30 +168,70 @@ describe('boot restore', () => {
 
 describe('install', () => {
   it('refuses a URL that is not a URL, without fetching', async () => {
-    await useSamModelStore.getState().install('not a url');
+    await install('not a url', DECODER_URL);
     expect(globalThis.fetch).not.toHaveBeenCalled();
     expect(useSamModelStore.getState().status.kind).toBe('failed');
   });
 
-  it('refuses plain http, which would let anything on the path swap the model', async () => {
-    await useSamModelStore.getState().install('http://example.test/model.onnx');
+  it('refuses plain http, naming which of the two URLs is wrong', async () => {
+    await install(ENCODER_URL, 'http://example.test/decoder.onnx');
     expect(globalThis.fetch).not.toHaveBeenCalled();
     const status = useSamModelStore.getState().status;
     expect(status.kind === 'failed' && status.message).toMatch(/https/i);
+    expect(status.kind === 'failed' && status.message).toMatch(/decoder/i);
   });
 
-  it('downloads, registers and caches', async () => {
+  it('downloads both files, registers the pair and caches it', async () => {
     stubFetch(ONNX_BYTES);
-    await useSamModelStore.getState().install('https://example.test/model.onnx');
+    await install();
 
-    expect(registerFromBytes).toHaveBeenCalled();
-    expect(cache.put).toHaveBeenCalled();
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+    expect(registerPipeline).toHaveBeenCalledTimes(1);
+    expect(cache.put).toHaveBeenCalledTimes(1);
+    const record = cache.put.mock.calls[0]![0] as { decoderUrl?: string; bytes?: number };
+    expect(record.decoderUrl).toBe(DECODER_URL);
+    expect(record.bytes).toBe(ONNX_BYTES.byteLength * 2);
     expect(useSamModelStore.getState().status.kind).toBe('ready');
+  });
+
+  it('prefers the main-process downloader when the desktop bridge offers one', async () => {
+    // In the desktop app the page CSP names no model host, so the renderer
+    // fetch would be refused — the bytes must come over IPC.
+    const download = jest.fn(async () => ({ ok: true as const, bytes: ONNX_BYTES }));
+    (window as { motionEditor?: unknown }).motionEditor = {
+      objectMatte: {
+        download,
+        cancelDownload: jest.fn(async () => true),
+        onDownloadProgress: jest.fn(() => () => undefined),
+      },
+    };
+
+    await install();
+
+    expect(download).toHaveBeenCalledTimes(2);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(useSamModelStore.getState().status.kind).toBe('ready');
+  });
+
+  it('surfaces the main-process downloader refusal as the failure message', async () => {
+    (window as { motionEditor?: unknown }).motionEditor = {
+      objectMatte: {
+        download: jest.fn(async () => ({ ok: false as const, message: 'The host answered 404' })),
+        cancelDownload: jest.fn(async () => true),
+        onDownloadProgress: jest.fn(() => () => undefined),
+      },
+    };
+
+    await install();
+
+    const status = useSamModelStore.getState().status;
+    expect(status.kind === 'failed' && status.message).toMatch(/404/);
+    expect(cache.put).not.toHaveBeenCalled();
   });
 
   it('reports an HTML page as a bad URL rather than as an ONNX failure', async () => {
     stubFetch(new TextEncoder().encode('<!DOCTYPE html><html>login</html>'));
-    await useSamModelStore.getState().install('https://example.test/model.onnx');
+    await install();
 
     const status = useSamModelStore.getState().status;
     expect(status.kind === 'failed' && status.message).toMatch(/did not return an ONNX model/);
@@ -168,9 +240,9 @@ describe('install', () => {
 
   it('does NOT cache bytes the runtime refused', async () => {
     stubFetch(ONNX_BYTES);
-    registerFromBytes.mockResolvedValue({ status: 'failed', reason: 'bad graph' } as never);
+    registerPipeline.mockResolvedValue({ status: 'failed', reason: 'bad graph' } as never);
 
-    await useSamModelStore.getState().install('https://example.test/model.onnx');
+    await install();
 
     expect(cache.put).not.toHaveBeenCalled();
     expect(useSamModelStore.getState().status).toEqual({ kind: 'failed', message: 'bad graph' });
@@ -178,7 +250,7 @@ describe('install', () => {
 
   it('reports a refusing host by its status', async () => {
     stubFetch(ONNX_BYTES, { ok: false, status: 404 });
-    await useSamModelStore.getState().install('https://example.test/model.onnx');
+    await install();
     const status = useSamModelStore.getState().status;
     expect(status.kind === 'failed' && status.message).toMatch(/404/);
   });
@@ -193,14 +265,14 @@ describe('install', () => {
       arrayBuffer: async () => new ArrayBuffer(0),
     })) as unknown as typeof fetch;
 
-    await useSamModelStore.getState().install('https://example.test/huge.onnx');
+    await install(ENCODER_URL, 'https://example.test/huge.onnx');
     const status = useSamModelStore.getState().status;
     expect(status.kind === 'failed' && status.message).toMatch(/larger than/);
   });
 });
 
 describe('remove', () => {
-  it('unregisters the session as well as forgetting the file', async () => {
+  it('unregisters the session as well as forgetting the files', async () => {
     // Forgetting the cache alone would leave the model running for the rest of
     // the session, so "Remove" would appear to do nothing until a restart.
     await useSamModelStore.getState().remove();

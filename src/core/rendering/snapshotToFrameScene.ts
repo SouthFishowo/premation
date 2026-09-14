@@ -582,6 +582,13 @@ export function extractSpatialEffects(
       const blades = n('blades');
       const roundness = n('roundness');
       const highlightGain = n('highlightGain');
+      // AE iris extras (camera DOF, via dofIrisParams): forwarded only at
+      // non-neutral values so an untouched camera packs identical uniforms.
+      const irisRotation = n('irisRotation');
+      const irisAspect = n('irisAspect');
+      const highlightThreshold = n('highlightThreshold');
+      const highlightSaturation = n('highlightSaturation');
+      const diffractionFringe = n('diffractionFringe');
       const params = paramsOf(e);
       const hasCoc = 'coc0' in params;
       const cocCorners = hasCoc
@@ -596,6 +603,13 @@ export function extractSpatialEffects(
         ...(blades >= 3 ? { blades } : {}),
         ...(blades >= 3 && Number.isFinite(roundness) ? { roundness } : {}),
         ...(highlightGain > 0 ? { highlightGain } : {}),
+        ...(blades >= 3 && Number.isFinite(irisRotation) && irisRotation !== 0
+          ? { irisRotationDeg: irisRotation } : {}),
+        ...(blades >= 3 && Number.isFinite(irisAspect) && irisAspect > 0 && irisAspect !== 1
+          ? { irisAspect } : {}),
+        ...(highlightThreshold > 0 ? { highlightThreshold } : {}),
+        ...(highlightSaturation > 0 ? { highlightSaturation } : {}),
+        ...(blades >= 3 && diffractionFringe > 0 ? { fringe: diffractionFringe } : {}),
         ...(cocCorners ? { cocCorners } : {}),
         // Camera-DOF blurs (buildSnapshot's `id: 'dof'`) are tagged so the
         // renderer can drop them for renderables it defocuses through the
@@ -2764,6 +2778,14 @@ export function layerToRenderable(
         ...(layer.shade3d.oneSided ? { oneSided: true } : {}),
         ...(layer.shade3d.ambient !== undefined ? { ambient: layer.shade3d.ambient } : {}),
         ...(layer.shade3d.diffuse !== undefined ? { diffuse: layer.shade3d.diffuse } : {}),
+        // Advanced-3D axes — sparse, like `metal`: absent is the identity the
+        // packer fills in, so untouched materials pack the exact old bytes.
+        ...(layer.shade3d.reflectionIntensity !== undefined ? { reflectionIntensity: layer.shade3d.reflectionIntensity } : {}),
+        ...(layer.shade3d.reflectionSharpness !== undefined ? { reflectionSharpness: layer.shade3d.reflectionSharpness } : {}),
+        ...(layer.shade3d.reflectionRolloff !== undefined ? { reflectionRolloff: layer.shade3d.reflectionRolloff } : {}),
+        ...(layer.shade3d.transparency !== undefined ? { transparency: layer.shade3d.transparency } : {}),
+        ...(layer.shade3d.transparencyRolloff !== undefined ? { transparencyRolloff: layer.shade3d.transparencyRolloff } : {}),
+        ...(layer.shade3d.ior !== undefined ? { ior: layer.shade3d.ior } : {}),
         // Only ever FALSE reaches here — a shadow catcher turned off. Absent is
         // the default (a lit surface receives), which is what every layer
         // emitted before shadow maps existed carries.

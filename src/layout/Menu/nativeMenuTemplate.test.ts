@@ -26,6 +26,10 @@ import { buildAssetCommands } from '@layout/Assets/assetCommands';
 import { buildTimelineExpandCommands } from '@layout/Timeline/expandCollapse';
 import { buildTimelineSnapCommands } from '@layout/Timeline/snapCommands';
 import { buildViewportCommands } from '@layout/Workspace/viewportCommands';
+import { buildLayerSettingsCommands } from '@layout/Composition/layerSettingsCommands';
+import { buildTextToolCommands } from '@layout/Text/textToolCommands';
+import { buildTextCommands } from '@layout/Inspector/textCommands';
+import { buildParagraphTextCommands } from '@layout/Inspector/paragraphTextCommands';
 import { registerPowerTourCommand } from '@stores/onboardingStore';
 import { readSource } from '@/__testHelpers__/readSource';
 
@@ -72,6 +76,10 @@ describe('buildNativeMenuTemplate over APP_MENU', () => {
       ...buildTimelineExpandCommands(),
       ...buildTimelineSnapCommands(),
       ...buildViewportCommands(),
+      ...buildLayerSettingsCommands(),
+      ...buildTextToolCommands(),
+      ...buildTextCommands(),
+      ...buildParagraphTextCommands(),
     ]) registry.register(cmd);
     // Registers itself rather than returning a Command — the tour's execute
     // closes over the store, so there is no build-only form of it.

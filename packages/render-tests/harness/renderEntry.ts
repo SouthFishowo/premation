@@ -388,6 +388,25 @@ async function loadHarnessFonts(): Promise<void> {
   const faces = [
     new FontFace('Arial', `url(${new URL('./fonts/arimo-latin-400-normal.woff2', import.meta.url)})`, { weight: '400' }),
     new FontFace('Arial', `url(${new URL('./fonts/arimo-latin-700-normal.woff2', import.meta.url)})`, { weight: '700' }),
+    /*
+      Non-Latin scripts, pinned the same way: bundled Noto subsets (SIL OFL 1.1,
+      licence beside each file) registered under the SAME `Arial` family with a
+      unicode-range, so the text-rtl-bidi / text-vertical-* scenes shape Arabic,
+      Hebrew and Japanese with these outlines on every machine instead of
+      whichever system font fallback finds. Each file holds only the glyphs the
+      scenes use (plus their OpenType closure: Arabic joining forms, vertical
+      forms); a character outside it would fall back — add it to the subset.
+      Harness only — the app never registers these.
+    */
+    new FontFace('Arial', `url(${new URL('./fonts/noto-sans-arabic/noto-sans-arabic-400-subset.woff2', import.meta.url)})`, {
+      weight: '400', unicodeRange: 'U+0600-06FF, U+0750-077F, U+FB50-FDFF, U+FE70-FEFF',
+    }),
+    new FontFace('Arial', `url(${new URL('./fonts/noto-sans-hebrew/noto-sans-hebrew-400-subset.woff2', import.meta.url)})`, {
+      weight: '400', unicodeRange: 'U+0590-05FF, U+FB1D-FB4F',
+    }),
+    new FontFace('Arial', `url(${new URL('./fonts/noto-sans-jp/noto-sans-jp-400-subset.woff2', import.meta.url)})`, {
+      weight: '400', unicodeRange: 'U+3000-30FF, U+4E00-9FFF, U+FE10-FE1F, U+FE30-FE4F, U+FF00-FFEF',
+    }),
   ];
   for (const face of faces) document.fonts.add(await face.load());
 }

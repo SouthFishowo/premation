@@ -17,10 +17,21 @@ const bridge = {
     openBundleDir: () => ipcRenderer.invoke('project:openBundleDir'),
   },
 
-  // Bundled Object Matte model files (allowlisted names only — see main.ts).
+  // Bundled Object Matte model files (allowlisted names only — see main.ts),
+  // plus the custom-model download that must run in main because the page CSP
+  // names no model host (electron/modelDownload.ts). The download attaches no
+  // credential and only ever runs on an explicit Install press.
   objectMatte: {
     read: (name: string) => ipcRenderer.invoke('objectMatte:read', name),
     url: (name: string) => ipcRenderer.invoke('objectMatte:url', name),
+    download: (request: { url: string; requestId: string }) =>
+      ipcRenderer.invoke('objectMatte:download', request),
+    cancelDownload: (requestId: string) => ipcRenderer.invoke('objectMatte:cancelDownload', requestId),
+    onDownloadProgress: (handler: (event: unknown) => void) => {
+      const listener = (_event: unknown, payload: unknown): void => handler(payload);
+      ipcRenderer.on('objectMatte:downloadProgress', listener);
+      return () => ipcRenderer.removeListener('objectMatte:downloadProgress', listener);
+    },
   },
 
   file: {

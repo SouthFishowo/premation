@@ -4,14 +4,23 @@
  * control). Behaviour contract:
  *
  *   • 1 × `step` per pixel of horizontal drag (step defaults to 1)
- *   • Shift = 10× coarser, Alt = 0.1× finer
+ *   • Shift = 10× coarser; Ctrl/Cmd = 0.1× finer (After Effects' binding),
+ *     with Alt kept as an alias for the fine gear
  *   • a 3px dead-zone distinguishes a click (→ edit mode) from a drag
  */
 
-/** Step multiplier from modifier keys: Shift = 10×, Alt = 0.1×. */
-export function stepScale(e: { shiftKey: boolean; altKey: boolean }): number {
+/** The modifier keys the scrub gears read. Ctrl/Cmd are optional for callers that predate them. */
+export interface ScrubModifiers {
+  shiftKey: boolean;
+  altKey: boolean;
+  ctrlKey?: boolean;
+  metaKey?: boolean;
+}
+
+/** Step multiplier from modifier keys: Shift = 10×, Ctrl/Cmd (or Alt) = 0.1×. Shift wins. */
+export function stepScale(e: ScrubModifiers): number {
   if (e.shiftKey) return 10;
-  if (e.altKey) return 0.1;
+  if (e.ctrlKey || e.metaKey || e.altKey) return 0.1;
   return 1;
 }
 
@@ -33,7 +42,7 @@ export function scrubValue(
   startVal: number,
   dx: number,
   step: number,
-  mods: { shiftKey: boolean; altKey: boolean },
+  mods: ScrubModifiers,
   min = -Infinity,
   max = Infinity,
 ): number {
@@ -80,7 +89,7 @@ export interface ScrubState {
 /** Open a scrub at `startVal` with whatever modifiers are already held. */
 export function beginScrub(
   startVal: number,
-  mods: { shiftKey: boolean; altKey: boolean },
+  mods: ScrubModifiers,
 ): ScrubState {
   return { anchorVal: startVal, dx: 0, scale: stepScale(mods), value: startVal };
 }
@@ -93,7 +102,7 @@ export function advanceScrub(
   state: ScrubState,
   movementX: number,
   step: number,
-  mods: { shiftKey: boolean; altKey: boolean },
+  mods: ScrubModifiers,
   min = -Infinity,
   max = Infinity,
 ): ScrubState {

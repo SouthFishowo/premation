@@ -32,8 +32,13 @@ import type { TextPaintSpec } from '@core/rendering/raster/textPaint';
 import type { RenderLayer } from '@core/rendering/RenderBackend';
 import type { SceneNode } from '@core/types';
 
-const OUTLINE_CACHE_MAX = 64;
-const MESH_CACHE_MAX = 128;
+// Sized for per-glyph extrusion (one outline + mesh per DISTINCT glyph of a
+// per-character 3D layer, see buildSnapshot's perGlyphExtrusion): two text
+// layers' worth of distinct glyphs must fit, or a long string thrashes the
+// LRU and re-traces every frame. Glyph meshes are small (one letterform), so
+// the ceiling's memory is dominated by the handful of whole-layer meshes.
+const OUTLINE_CACHE_MAX = 256;
+const MESH_CACHE_MAX = 512;
 
 class Lru<V> {
   private readonly map = new Map<string, V>();
@@ -148,9 +153,11 @@ function textPaintSpecFromLayer(layer: RenderLayer, width: number, height: numbe
     baselineShift: layer.baselineShift,
     textStroke: layer.textStroke,
     textStrokeWidth: layer.textStrokeWidth,
+    textExtras: layer.textExtras,
     runs: layer.runs,
     glyphs: layer.glyphs,
     textPath: layer.textPath,
+    fontAxes: layer.fontAxes,
   };
 }
 
@@ -168,6 +175,8 @@ function hashGlyphs(glyphs: NonNullable<RenderLayer['glyphs']>): string {
     mix(g.dx); mix(g.dy); mix(g.scale * 100); mix(g.scaleY * 100); mix(g.rotation);
     mix(g.opacity * 100); mix(g.fillOpacity * 100); mix(g.tracking); mix(g.lineSpacing);
     mix(g.blur); mix(g.skew); mix(g.strokeWidth ?? 0);
+    // Only when present, so a uniform-blur glyph list keeps its existing hash.
+    if (g.blurY !== undefined) mix(g.blurY);
     if (g.displayChar) for (let i = 0; i < g.displayChar.length; i++) mix(g.displayChar.charCodeAt(i));
   }
   return `${glyphs.length}:${(h >>> 0).toString(36)}`;
@@ -190,7 +199,10 @@ function textSpecKey(s: TextPaintSpec): string {
     s.align, s.letterSpacing, s.lineHeight, s.paragraphSpacing,
     s.textTransform, s.fontVariant, s.verticalAlign, s.verticalScale, s.horizontalScale, s.baselineShift,
     s.textStrokeWidth ?? 0,
+    s.textExtras ? JSON.stringify(s.textExtras) : '',
     runsKey, pathKey,
+    // Appended only when present, so an existing body's key is unchanged.
+    ...(s.fontAxes ? [JSON.stringify(s.fontAxes)] : []),
   ]);
 }
 

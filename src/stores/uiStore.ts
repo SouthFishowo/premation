@@ -60,6 +60,8 @@ export type Tool =
   // beside the pen tools because it EDITS an outline rather than creating one.
   | 'knife'
   | 'text'
+  // AE's Vertical Type Tool (Ctrl+T cycles it with the horizontal one).
+  | 'vertical-text'
   | 'shape'
   | 'ellipse'
   | 'polygon'

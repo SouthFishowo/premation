@@ -161,4 +161,25 @@ describe('material shadow tri-states', () => {
     expect(readNodeMaterial(node({ ambient: 999 })).ambient).toBe(100);
     expect(readNodeMaterial(node({ diffuse: -5 })).diffuse).toBe(0);
   });
+
+  it('the Advanced-3D axes resolve to their no-op defaults', () => {
+    // Every one an exact identity: intensity 100 reproduces today's IBL term,
+    // the rolloffs and transparency at 0 multiply by literal 1.0s, and the
+    // 1.52 IOR is inert while both rolloffs are 0 (its F0 gets a 0 weight).
+    const m = readNodeMaterial(node({}));
+    expect(m.reflectionIntensity).toBe(100);
+    expect(m.reflectionSharpness).toBe(0);
+    expect(m.reflectionRolloff).toBe(0);
+    expect(m.transparency).toBe(0);
+    expect(m.transparencyRolloff).toBe(0);
+    expect(m.ior).toBe(1.52);
+    // Clamps: percentages 0–100, IOR 1–4.
+    expect(readNodeMaterial(node({ reflectionIntensity: 400 })).reflectionIntensity).toBe(100);
+    expect(readNodeMaterial(node({ transparency: -3 })).transparency).toBe(0);
+    expect(readNodeMaterial(node({ ior: 0.2 })).ior).toBe(1);
+    expect(readNodeMaterial(node({ ior: 99 })).ior).toBe(4);
+    // And they keyframe like every other material option.
+    expect(readNodeMaterial(node({}), new Map([['transparency', 40]])).transparency).toBe(40);
+    expect(readNodeMaterial(node({}), new Map([['ior', 2.4]])).ior).toBe(2.4);
+  });
 });

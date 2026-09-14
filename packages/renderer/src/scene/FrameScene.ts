@@ -78,6 +78,17 @@ export type RenderableEffect =
       roundness?: number;
       /** Extra weight on bright samples. */
       highlightGain?: number;
+      /** Iris rotation, DEGREES (converted to radians at pack time). Absent = 0. */
+      irisRotationDeg?: number;
+      /** Iris aspect ratio (>1 = wider bokeh). Absent = 1. */
+      irisAspect?: number;
+      /** Luminance floor (0..1) below which highlightGain does not boost.
+       *  Absent = 0, the pre-threshold weighting. */
+      highlightThreshold?: number;
+      /** Extra chroma on gain-boosted highlights. Absent = 0. */
+      highlightSaturation?: number;
+      /** Diffraction fringe (0..1): rim-weighted bokeh edge. Absent = 0. */
+      fringe?: number;
       /**
        * Planar per-pixel CoC: blur radii (px) at UV corners
        * (0,0), (1,0), (1,1), (0,1). When set, CompositionPass runs `coc-blur`
@@ -946,6 +957,22 @@ export interface Renderable {
       ambient?: number;
       /** Material Diffuse % (AE). Scales Lambert on the GPU path. */
       diffuse?: number;
+      /** Advanced-3D Reflection Intensity 0..1 — scales the env-specular
+       *  term. Absent ⇒ 1 (identity). See `Shade3D.reflectionIntensity`. */
+      reflectionIntensity?: number;
+      /** Reflection Sharpness 0..1 — env atlas sampled at
+       *  roughness × (1 − sharpness). Absent ⇒ 0 (identity). */
+      reflectionSharpness?: number;
+      /** Reflection Rolloff 0..1 — Schlick view-angle weight on the env term.
+       *  Absent ⇒ 0 (identity). */
+      reflectionRolloff?: number;
+      /** Advanced-3D Transparency 0..1 — per-fragment alpha multiplier
+       *  (`shadeAlpha3d`). Absent ⇒ 0 (identity). */
+      transparency?: number;
+      /** Transparency Rolloff 0..1 — Fresnel weight. Absent ⇒ 0 (uniform). */
+      transparencyRolloff?: number;
+      /** IOR feeding both rolloffs' Schlick F0. Absent ⇒ 1.52. */
+      ior?: number;
       /**
        * This surface RECEIVES a geometric shadow (Material Options → Accepts
        * Shadows). False keeps the surface fully lit even where the map says it
@@ -1122,6 +1149,16 @@ export interface FrameScene {
       irisRoundness?: number;
       /** Extra weight on bright taps (specular bloom). */
       highlightGain?: number;
+      /** Iris rotation, DEGREES. Absent = 0 (un-rotated iris). */
+      irisRotation?: number;
+      /** Iris aspect ratio (>1 = wider bokeh). Absent = 1. */
+      irisAspect?: number;
+      /** Luminance floor (0..1) for the highlight boost. Absent = 0. */
+      highlightThreshold?: number;
+      /** Extra chroma on gain-boosted highlights. Absent = 0. */
+      highlightSaturation?: number;
+      /** Diffraction fringe (0..1): rim-weighted bokeh edge. Absent = 0. */
+      diffractionFringe?: number;
     };
   };
   /** Scene lights for per-fragment Accepts-Lights shading in 3D groups. */

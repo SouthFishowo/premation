@@ -25,8 +25,59 @@ import { useCompositionStore } from '@stores/compositionStore';
 import { useRenderQualityStore } from '@stores/renderQualityStore';
 import { useProjectStore } from '@stores/projectStore';
 import { compSizeOf } from '@core/composition/compSizes';
+import { paneViewTransform } from './useSceneRefGeometry';
+import {
+  paintWireframeQualityLayers,
+  viewToScreen,
+  wireframeQuads,
+  type WireframeNodeGeometry,
+} from './wireframeQualityOverlay';
 
+/** A 2D canvas over the content canvas, and the nodes whose wireframe boxes it draws. */
+export interface WireframeOverlayHost {
+  canvasRef: React.RefObject<HTMLCanvasElement | null>;
+  /** Comp-space geometry, projected through THIS surface's view. */
+  nodes: () => Iterable<WireframeNodeGeometry | null | undefined>;
+}
 
+/**
+ * Paint Quality = Wireframe boxes onto a host's overlay canvas, aligned to its
+ * content canvas and mapped through the same comp → canvas view the renderer
+ * used (the host's live view, else the renderer's contain fit).
+ *
+ * Touches the 2D context only when there is something to draw or clear, so a
+ * surface with no wireframe layers never creates one.
+ */
+export function paintWireframeOverlay(
+  host: WireframeOverlayHost,
+  content: HTMLCanvasElement | null,
+  view: RenderView | undefined,
+  comp: { width: number; height: number },
+  painted: { current: boolean },
+): void {
+  const overlay = host.canvasRef.current;
+  if (!overlay || !content) return;
+  const box = content.getBoundingClientRect();
+  if (box.width < 1 || box.height < 1 || comp.width <= 0 || comp.height <= 0) return;
+  const toScreen = viewToScreen(view ?? paneViewTransform(box.width, box.height, comp.width, comp.height));
+  const nodes = [...host.nodes()];
+  if (!painted.current && wireframeQuads(nodes, toScreen).length === 0) return;
+  const parent = overlay.offsetParent?.getBoundingClientRect();
+  overlay.style.left = `${box.left - (parent?.left ?? box.left)}px`;
+  overlay.style.top = `${box.top - (parent?.top ?? box.top)}px`;
+  overlay.style.width = `${box.width}px`;
+  overlay.style.height = `${box.height}px`;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(box.width * dpr);
+  const h = Math.round(box.height * dpr);
+  if (overlay.width !== w) overlay.width = w;
+  if (overlay.height !== h) overlay.height = h;
+  const ctx = overlay.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, box.width, box.height);
+  painted.current = paintWireframeQualityLayers(ctx, nodes, toScreen) > 0;
+}
 
 export interface ViewportRendererState {
   /** Why this surface is blank, or null when the renderer is healthy. */
@@ -58,6 +109,14 @@ export function useViewportRenderer(
    * never render one frame behind its own camera.
    */
   getRenderView?: () => RenderView | undefined,
+  /**
+   * Where to draw Quality = Wireframe layers' boxes. This hook renders with
+   * `wireframeLayers: true`, which HIDES those layers' pixels; without an
+   * overlay a pane or Presentation Mode showed nothing where the layer was.
+   * The host supplies a 2D canvas stacked over its content canvas and the
+   * nodes (comp-space oriented corners, from its own projection).
+   */
+  wireframeOverlay?: WireframeOverlayHost,
 ): ViewportRendererState {
   const backendRef = useRef<RenderBackend | null>(null);
   /**
@@ -72,6 +131,10 @@ export function useViewportRenderer(
   const [initError, setInitError] = useState<string | null>(null);
   const getRenderViewRef = useRef(getRenderView);
   getRenderViewRef.current = getRenderView;
+  const wireframeOverlayRef = useRef(wireframeOverlay);
+  wireframeOverlayRef.current = wireframeOverlay;
+  /** Whether the overlay holds boxes that a later frame must clear. */
+  const wireframePaintedRef = useRef(false);
   const timeRef = useRef(time);
   timeRef.current = time;
   const focusRef = useRef(focus);
@@ -185,6 +248,8 @@ export function useViewportRenderer(
             compSizeOf,
             draft3d: draft3dRef.current,
             useProxies: useProxiesRef.current,
+            // Viewport-only: Quality = Wireframe layers hide their pixels.
+            wireframeLayers: true,
             ...resolveViewCameraInput(compRef.current.width, compRef.current.height, camera3dModeRef.current),
             // Alpha view needs the comp's real alpha, not the background plate's.
             ...(channelRef.current === 'alpha' ? { transparent: true, backgroundPaint: undefined } : {}),
@@ -193,6 +258,10 @@ export function useViewportRenderer(
         // View-only: the channel never reaches export, which always writes colour.
         channel: channelRef.current,
       });
+      const overlay = wireframeOverlayRef.current;
+      if (overlay) {
+        paintWireframeOverlay(overlay, canvasRef.current, getRenderViewRef.current?.(), compRef.current, wireframePaintedRef);
+      }
     } catch (err) {
 
       console.error('[useViewportRenderer] renderImmediate failed:', err);

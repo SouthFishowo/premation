@@ -68,6 +68,12 @@
   cursor: pointer;
 }
 
+/* Fill / Stroke: a word, not a digit, so the chip sizes to its label. */
+.paintChip {
+  width: auto;
+  padding: 0 var(--space-1);
+}
+
 .fillChip:disabled {
   opacity: 0.35;
   cursor: default;

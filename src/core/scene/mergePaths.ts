@@ -21,6 +21,7 @@ import { activeCompRootId } from '@core/scene/activeComp';
 import type { SceneNode, ID } from '@core/types';
 import { readNodeKind } from '@core/scene/sceneDerive';
 import { shapeOutline } from '@core/scene/pathOps';
+import { resolveCornerRadii, clampCornerRadii, type CornerRadiiProps } from '@core/scene/cornerRadii';
 import { SCENE_KIND_PROP } from '@core/scene/seedDefaultScene';
 import { useSelectionStore } from '@stores/selectionStore';
 import { bumpScene } from '@stores/sceneStore';
@@ -208,7 +209,29 @@ export function nodeWorldOutline(
     local = flattenOutline(geom.props.points as BezierPt[], 8, !closed);
   } else {
     const shapeType = typeof p.shapeType === 'string' ? p.shapeType : 'rect';
-    const outline = shapeOutline(shapeType === 'ellipse' ? 'ellipse' : 'rect', w, h, 32);
+    // The radii ride into the primitive seed, exactly as the path-op chain's
+    // seed does: a boolean's output is polygon geometry, so a rounded rect
+    // seeded sharp here came out of every Merge Paths (and the path cloner)
+    // with square corners. Animated radii win over the stored props, the same
+    // contract x/y/width/height honour above; the axis pair keeps a scaled
+    // layer's corner circular in comp space, as the no-operator raster draws it.
+    const corner = (key: keyof CornerRadiiProps): number | undefined => {
+      const live = sample?.(key);
+      if (typeof live === 'number' && Number.isFinite(live)) return Math.max(0, live);
+      const v = p[key];
+      return typeof v === 'number' && Number.isFinite(v) ? Math.max(0, v) : undefined;
+    };
+    const radii = clampCornerRadii(w, h, resolveCornerRadii({
+      cornerRadius: corner('cornerRadius'),
+      cornerRadiusTL: corner('cornerRadiusTL'),
+      cornerRadiusTR: corner('cornerRadiusTR'),
+      cornerRadiusBR: corner('cornerRadiusBR'),
+      cornerRadiusBL: corner('cornerRadiusBL'),
+    }));
+    const outline = shapeOutline(
+      shapeType === 'ellipse' ? 'ellipse' : 'rect', w, h, 32, 0,
+      radii, [Math.abs(sx), Math.abs(sy)],
+    );
     local = outline ?? [];
   }
   if (local.length < 2) return null;

@@ -2,8 +2,9 @@
  * When an extruded TEXT layer must NOT grow (all of) its body:
  *   • while it is being edited in place — the body is traced from the
  *     layer's text, and showed the pre-edit string through the edit overlay;
- *   • per-character 3D with a bevel — the glyph planes draw the front, so the
- *     mesh must not also paint the whole string on an inset front cap.
+ *   • per-character 3D — the glyph planes draw the front and each glyph grows
+ *     its OWN body (`::ch<i>::ext-mesh`, 2026-09-14): no whole-string body at
+ *     all, and no body may paint a front cap over the planes.
  */
 import { buildSnapshot } from './buildSnapshot';
 import SceneGraph from '@core/scene/SceneGraph';
@@ -63,14 +64,28 @@ describe('buildSnapshot — extruded text body gates', () => {
     expect(ids).toContain('t');
   });
 
-  it('per-character 3D + bevel: the mesh has no textured front cap (the glyph planes are the front)', () => {
+  it('per-character 3D + bevel: per-glyph bodies, none with a front cap (the glyph planes are the front)', () => {
+    // Until 2026-09-14 this pinned a whole-string mesh under the planes; the
+    // per-glyph redesign replaced that body with one solid per glyph
+    // (buildSnapshotPerGlyphExtrusion.test.ts pins the structure in full).
     const g = new SceneGraph();
     g.addNode(text3D('t', { perChar3D: true, bevelDepth: 4 }));
     const layers = snap(g).layers;
-    const mesh = layers.find((l) => l.id === 't::ext-mesh');
-    expect(mesh?.extrudedMesh).toBeDefined();
-    expect(mesh!.extrudedMesh!.ranges.some((r) => r.role === 'front')).toBe(false);
-    expect(layers.filter((l) => l.id.startsWith('t::ch')).length).toBe(2);
+    expect(layers.some((l) => l.id.startsWith('t::ext-'))).toBe(false);
+    const bodies = layers.filter((l) => /^t::ch\d+::ext-mesh$/.test(l.id));
+    expect(bodies).toHaveLength(2);
+    for (const b of bodies) {
+      expect(b.extrudedMesh).toBeDefined();
+      expect(b.extrudedMesh!.ranges.some((r) => r.role === 'front')).toBe(false);
+    }
+    expect(layers.filter((l) => /^t::ch\d+$/.test(l.id))).toHaveLength(2);
+  });
+
+  it('per-character 3D in-place editing drops the per-glyph bodies too', () => {
+    const g = new SceneGraph();
+    g.addNode(text3D('t', { perChar3D: true }));
+    useTextEditStore.getState().begin('t');
+    expect(snap(g).layers.some((l) => l.id.includes('::ext-'))).toBe(false);
   });
 
   it('plain text + bevel: the mesh DOES own the front cap (control for the case above)', () => {

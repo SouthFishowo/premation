@@ -32,6 +32,16 @@ describe('normalizeStroke', () => {
   test('non-object → full default', () => {
     expect(normalizeStroke(undefined)).toEqual(defaultStroke());
   });
+
+  test('miterLimit: omitted when absent (cache-key contract), floored at 1, kept when set', () => {
+    // Absent stays ABSENT — writing a default 4 into every normalised stroke
+    // would change contentHash's raster cache key for every existing layer.
+    expect('miterLimit' in normalizeStroke({ width: 2 })).toBe(false);
+    expect(normalizeStroke({ width: 2, miterLimit: 10 }).miterLimit).toBe(10);
+    // Canvas2D ignores miterLimit < 1; the model never stores one.
+    expect(normalizeStroke({ width: 2, miterLimit: 0.2 }).miterLimit).toBe(1);
+    expect('miterLimit' in normalizeStroke({ width: 2, miterLimit: NaN })).toBe(false);
+  });
 });
 
 describe('readNodeStroke', () => {

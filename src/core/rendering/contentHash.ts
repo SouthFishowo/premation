@@ -142,9 +142,14 @@ function contentOf(layer: RenderLayer): unknown {
     lh: layer.lineHeight,
     al: layer.align,
     psp: layer.paragraphSpacing,
+    tx: layer.textExtras,
     gl: layer.glyphs,
     runs: layer.runs,
     tp: layer.textPath,
+    // Undefined (and so skipped by the hasher) unless the layer sets an axis.
+    fax: layer.fontAxes,
+    // Undefined (skipped) unless the text stroke is a gradient.
+    tsp: layer.textStrokePaint,
     // pre-DOF effects + media source
     fx: layer.effects,
     src: layer.src,

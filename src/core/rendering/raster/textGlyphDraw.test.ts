@@ -115,9 +115,16 @@ describe('text glyph rasterization', () => {
     expect(calls.some((c) => c.op === 'save')).toBe(false);
   });
 
-  it('draws glyph-by-glyph as soon as animator transforms are present', () => {
-    draw({ glyphs: [identityGlyphTransform('A'), identityGlyphTransform('B')] });
+  it('draws glyph-by-glyph as soon as an animator changes a glyph', () => {
+    draw({ glyphs: [identityGlyphTransform('A', { dy: 2 }), identityGlyphTransform('B')] });
     expect(fillTexts()).toEqual(['A', 'B']);
+  });
+
+  it('a line whose animator transforms are all identity still draws whole (shaping intact)', () => {
+    // No per-character variation on the line → one string from the first pen,
+    // so contextual shaping (Arabic joins, ligatures) survives.
+    draw({ glyphs: [identityGlyphTransform('A'), identityGlyphTransform('B')] });
+    expect(fillTexts()).toEqual(['AB']);
   });
 
   it('applies each glyph position offset', () => {
@@ -229,9 +236,9 @@ describe('text glyph rasterization', () => {
         width: 200,
         height: 100,
         glyphs: [
-          identityGlyphTransform('A'),
-          identityGlyphTransform(' '),
-          identityGlyphTransform('B'),
+          identityGlyphTransform('A', { dy: 1 }),
+          identityGlyphTransform(' ', { dy: 1 }),
+          identityGlyphTransform('B', { dy: 1 }),
         ],
       },
       resolutionScale: 1,

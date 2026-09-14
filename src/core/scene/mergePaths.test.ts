@@ -268,3 +268,114 @@ describe('liveMergeSelectedPaths', () => {
     useSelectionStore.getState().clear();
   });
 });
+
+describe('a rounded rect entering the boolean stays round', () => {
+  // The primitive fallback in `nodeWorldOutline` seeded a SHARP rect no matter
+  // what the layer's corner radii said, so a rounded rect entering a Merge
+  // Paths boolean (or driving the path cloner) was squared off. Same class of
+  // bug as the path-op chain's seed — see `cornerRadiusPathOps.test.ts`, whose
+  // stand-off assertion style this reuses: the rounded outline's closest
+  // approach to the sharp corner it replaced is the arc's true r(√2−1).
+  const W = 160;
+  const H = 120;
+  const R = 40;
+  const CX = 200;
+  const CY = 150;
+  const STAND_OFF = R * (Math.SQRT2 - 1); // ≈ 16.57
+
+  function roundedRect(props: Record<string, number>): SceneNode {
+    const n = rect('rr', CX, CY, W, H);
+    const t = n.components.find((c) => c.type === 'Transform')!;
+    Object.assign(t.props as Record<string, unknown>, props);
+    return n;
+  }
+
+  const CORNERS = [
+    { x: CX - W / 2, y: CY - H / 2 }, // TL
+    { x: CX + W / 2, y: CY - H / 2 }, // TR
+    { x: CX + W / 2, y: CY + H / 2 }, // BR
+    { x: CX - W / 2, y: CY + H / 2 }, // BL
+  ];
+
+  function ringPoints(
+    node: SceneNode,
+    sample?: (prop: string) => number | undefined,
+  ): Array<{ x: number; y: number }> {
+    const poly = nodeWorldPolygon(node, sample);
+    expect(poly).not.toBeNull();
+    // Drop the GeoJSON closing vertex so the first point is not counted twice.
+    return poly![0]!.slice(0, -1).map(([x, y]) => ({ x, y }));
+  }
+
+  const minDistTo = (
+    pts: ReadonlyArray<{ x: number; y: number }>,
+    c: { x: number; y: number },
+  ): number => Math.min(...pts.map((p) => Math.hypot(p.x - c.x, p.y - c.y)));
+
+  it('SHARP CONTROL: without radii a vertex sits AT each corner', () => {
+    const pts = ringPoints(roundedRect({}));
+    for (const c of CORNERS) expect(minDistTo(pts, c)).toBeLessThan(0.75);
+  });
+
+  it('a uniform radius stands every corner off by r(√2−1)', () => {
+    const pts = ringPoints(roundedRect({ cornerRadius: R }));
+    expect(pts.length).toBeGreaterThan(8);
+    for (const c of CORNERS) {
+      const d = minDistTo(pts, c);
+      expect(d).toBeGreaterThan(STAND_OFF - 1.5);
+      expect(d).toBeLessThan(STAND_OFF + 1.5);
+    }
+  });
+
+  it('every emitted point sits ON the rounded boundary, not merely off the corner', () => {
+    const pts = ringPoints(roundedRect({ cornerRadius: R }));
+    const sdf = (p: { x: number; y: number }): number => {
+      const qx = Math.abs(p.x - CX) - (W / 2 - R);
+      const qy = Math.abs(p.y - CY) - (H / 2 - R);
+      return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - R;
+    };
+    const worst = Math.max(...pts.map((p) => Math.abs(sdf(p))));
+    expect(worst).toBeLessThan(0.5);
+  });
+
+  it('per-corner radii survive: only the corner that asked is rounded', () => {
+    const pts = ringPoints(roundedRect({ cornerRadiusTL: R }));
+    const dTL = minDistTo(pts, CORNERS[0]!);
+    expect(dTL).toBeGreaterThan(STAND_OFF - 1.5);
+    expect(dTL).toBeLessThan(STAND_OFF + 1.5);
+    // TR stays the sharp vertex it authored.
+    expect(minDistTo(pts, CORNERS[1]!)).toBeLessThan(0.75);
+  });
+
+  it('an ANIMATED radius wins over the stored prop, like x/y/width/height do', () => {
+    const pts = ringPoints(
+      roundedRect({ cornerRadius: R }),
+      (prop) => (prop === 'cornerRadius' ? 36 : undefined),
+    );
+    const expected = 36 * (Math.SQRT2 - 1);
+    for (const c of CORNERS) {
+      const d = minDistTo(pts, c);
+      expect(d).toBeGreaterThan(expected - 1.5);
+      expect(d).toBeLessThan(expected + 1.5);
+    }
+  });
+
+  it('a scaled layer keeps a CIRCULAR corner in world space (axis compensation)', () => {
+    // Radii are authored in comp px; the compositor undoes the layer's scale
+    // for the corners alone (`cornerRadiusScale`), so the boolean's seed must
+    // too — without the pair, a 2× layer's corner would be a 2×-stretched
+    // ellipse the raster never draws.
+    const pts = ringPoints(roundedRect({ cornerRadius: R, scaleX: 2, scaleY: 1 }));
+    const scaledCorners = [
+      { x: CX - W, y: CY - H / 2 },
+      { x: CX + W, y: CY - H / 2 },
+      { x: CX + W, y: CY + H / 2 },
+      { x: CX - W, y: CY + H / 2 },
+    ];
+    for (const c of scaledCorners) {
+      const d = minDistTo(pts, c);
+      expect(d).toBeGreaterThan(STAND_OFF - 1.5);
+      expect(d).toBeLessThan(STAND_OFF + 1.5);
+    }
+  });
+});

@@ -67,7 +67,7 @@ rediscovered in git history and believed a second time.
 | Path operators | 9 | `src/core/scene/pathOps.ts` → `PathOpType` (less `none`) |
 | Mask modes | 7 | `src/core/effects/mask.ts` → `MaskMode` |
 | Light types | 5 | `src/core/scene/light.ts` → `LightType` |
-| Canvas tools | 22 | `packages/workspace/src/tools/builtin.ts` |
+| Canvas tools | 23 | `packages/workspace/src/tools/builtin.ts` |
 | AI tools | 65 | `packages/ai-tools/src/tools/{read,write,craft,compose}.ts` |
 | Export formats | 18 | `videoSink.ts` → `VideoFormat` + `exportManager.ts` → `ExportFormat` |
 | Stores | 64 | `src/stores/*.ts` |
@@ -469,6 +469,29 @@ and one repeater per shape; so does this (`pathOps.ts` resolves each with
 The chain's currency is a **list** of `PolyRun`s, not one polyline — that is what
 lets trim live in it, since trimming produces multiple open arcs.
 
+**Offset Paths is a real offsetter** (2026-09-14): per-edge translation with AE's
+Line Join (miter with an animatable Miter Limit falling back to bevel, round,
+bevel) and self-intersection cleanup — a convex ring offset past its inradius
+vanishes, a pinched limb's crossed loop is removed by winding
+(`splitRingAtSelfIntersections` in `pathOps.ts`), and a shape offset past a
+waist splits into real islands (the operator is chain-level, like trim, because
+it can change the run count). The old behaviour was a naive averaged-normal
+slide with no joins and bow-tie corners; the default (miter, limit 4) renders
+existing convex shapes essentially unchanged.
+
+**Parametric Polystar** (2026-09-14, `core/scene/polystar.ts`): the Polygon /
+Star tools now create AE-style parametric layers — type, points, rotation, the
+two radii and two roundnesses stored on `fx.polystar`, ALL keyframeable
+(`polystar.<param>` tracks), the outline recomputed per frame in
+`buildSnapshot` **before** the operator chain seeds so trim/repeater/wiggle
+apply on top of the live geometry. Roundness converts vertices to bezier with
+tangent handles proportional to segment length (`π·r·pct/(2·points)` — the
+same constant Lottie renders AE's `sr` shape with, which is also what the
+Lottie exporter now emits for these layers). Old baked polygons are plain
+'path' shapes and load unchanged. A rounded rect also keeps its corners under
+the chain now: `shapeOutline` threads the layer's per-corner radii into the
+seed outline as flattened arcs at the chain's own adaptive density.
+
 **Knife tool** (`K`, `KnifeTool` in `packages/workspace/src/tools/builtin.ts`,
 cutting through `core/geometry/pathCut.ts`): drag a
 line across the canvas and every targeted shape path is cut EXACTLY along it,
@@ -492,10 +515,32 @@ Full animator selector stack, multiple selectors, wiggly selector, per-character
 operator: it consumes a mask and emits glyph placement, so it neither accepts nor
 produces the chain's currency. AE models this the same way (Text → Path Options).
 
+The animator **Blur is 2-D** (2026-09-14), as in AE: `ta.<i>.blur` is the X
+radius and `ta.<i>.blurY` the Y radius, absent-means-linked so every stored
+document and glyph-list hash predating the split is byte-identical. Uniform
+blur keeps the single `ctx.filter blur()` call it always issued; unlinked X/Y
+goes through a squash → isotropic blur → stretch scratch composite in
+`textPaint.ts` (exact on the larger axis; the sharper axis picks up ≤ 1 px from
+the composite's resample floor).
+
 ### 3D
 Classic 3D: cameras, 5 light types (point/ambient/spot/parallel/environment)
 with AE falloff curves and cone feather, extrusion with bevels, face materials,
 ortho views, quad view. See §4 for what "3D" does **not** mean here.
+
+**Per-character 3D text extrudes one solid PER GLYPH** (2026-09-14, AE 26
+behaviour). Before this, per-character 3D + Extrusion Depth gave per-glyph
+front planes over a single whole-string body, and an animator pushing glyphs
+in Z or tumbling them revealed the seam — the front detached from the shared
+solid. Now each glyph plane gets a body-only mesh of its own
+(`<layer>::ch<i>::ext-mesh`), traced from that glyph's silhouette by the same
+painter as its plane and carried by the same world matrix, so the solid rides
+every animator transform with its front. Outlines/meshes are LRU-cached by
+content + box + extrusion params — repeated characters share one mesh and GPU
+buffer, and per-frame animator motion rebuilds nothing (the transform lives in
+the carrier matrix). The whole-string body remains for what the per-glyph
+route cannot stage: spatial effects / interior styles (quad-synthesis
+fallback) and headless runs with no canvas to trace from.
 
 **Environment light** (2026-09-01, `core/scene/environmentLight.ts`): an
 image-based sky — a preset equirect (studio / day sky / sunset) projected onto
@@ -798,9 +843,21 @@ Corrected 2026-08-12: extruded faces already carried per-face depth/CoC.
 Corrected 2026-08-14: flat depth-spanning quads use strip subdivision (max 8).
 Corrected 2026-09-01: strip subdivision is the FALLBACK; corner CoC + bokeh are
 the mechanism, and "no DOF code in `packages/renderer`" is retired (§5).
+Corrected 2026-09-14: the depth-buffer gather EXISTS for 3D depth groups —
+`dof-gather` in `CompositionPass` renders the group into a single-sample
+colour+depth pair and computes per-pixel CoC from the real depth buffer (same
+two models as `dofBlurPx`), dropping the per-layer `dofSource` blurs only for
+renderables it actually gathers. The per-layer paragraph above still describes
+every branch that falls off the depth path.
 
-Still missing vs AE: diffraction fringe and highlight gain, and the depth-buffer
-gather above — which is the prerequisite the other two want, not a polish item.
+The "still missing vs AE" list above it is now closed too (2026-09-14):
+highlight gain had already shipped with the iris (`highlightGain`), and the
+rest of AE's camera iris set are keyframeable Camera Options — **Iris
+Rotation**, **Iris Aspect Ratio**, **Highlight Threshold**, **Highlight
+Saturation** and **Iris Diffraction Fringe** — read by `readNodeDof`, threaded
+through `bokeh`, `coc-blur` and `dof-gather` in BOTH shader dialects, and
+defaulting to exact render-identical neutrals so existing scenes do not
+re-grade.
 
 **Lighting is per-fragment on the depth path, per-quad only as a fallback.**
 This entry previously claimed the opposite. The depth-tested 3D path runs real
@@ -872,12 +929,27 @@ receivers that accept shadows; the light's 2.5D projected copy is suppressed so
 nothing doubles. Off by default, so every earlier scene is byte-identical
 (`shadow-map-spot` / `-off` are the witness pair). Limits, stated in code: one
 mapped light per run, and a point light uses the spot frustum along its aim.
-**SSAO is not built**, and the reason is structural: every depth-eligible run
-draws into a multisampled target, and neither backend can sample a
-multisampled depth — the route is a linear-depth prepass bound before the run
-draws (ambient-only AO cannot be a post-pass once ambient and direct are
-summed). Height displacement shipped 2026-09-09 (see the Particles v2
-section). A shadow catcher already exists as Accepts Shadows ▸ Only.
+**SSAO shipped** (`rendergraph/passes/ssao.ts`), by exactly the route the
+earlier "not built" paragraph predicted: a camera-axis **linear-depth prepass**
+rendered before the run draws (a multisampled scene target has no sampleable
+depth on either backend, and ambient-only AO cannot be a post-pass once
+ambient and direct are summed), turned into a half- or full-res hemisphere AO
+buffer with a depth-aware blur, and multiplied into the AMBIENT term only
+(`aoParams` in `shade3d`). It is a composition setting — Composition Settings
+▸ World ▸ Ambient Occlusion — off by default, so every earlier scene renders
+byte-identical arithmetic. See §5's 2026-09-14 correction for how this
+paragraph briefly said otherwise. Height displacement shipped 2026-09-09 (see
+the Particles v2 section). A shadow catcher already exists as Accepts Shadows
+▸ Only. **Advanced-3D material axes shipped 2026-09-14**: Reflection
+Intensity / Sharpness / Rolloff act on the environment-specular (IBL) term per
+material, and Transparency / Transparency Rolloff / Index of Refraction give a
+view-dependent, Fresnel-weighted alpha at the shading stage (Schlick, F0 from
+the IOR) — all keyframeable Material Options rows, all defaulting to exact
+IEEE identities. AE's *Appears in Reflections* is deliberately not modelled:
+it only means anything to a layer-to-layer reflection pass, which does not
+exist here (environment reflections are the scope), and a control that changes
+no pixel is dead UI. No refraction is rendered — IOR only shapes the Fresnel
+curves.
 
 **Linear working space — storage slice shipped (2026-08-14).** Float *precision*
 (`rgba16float` intermediates) already existed; grade / blend / blur maths run
@@ -1156,7 +1228,7 @@ retiring a claim requires quoting it.
 | Claim | Reality |
 |---|---|
 | §4/§5 "no DOF code in `packages/renderer`" (retained as true on 2026-08-10) | **No longer true.** The renderer owns two DOF shaders: `coc-blur` (per-pixel CoC interpolated from four corner radii — `planDofCocCorners` in `dofStrips.ts` plans them) and `bokeh` (polygonal iris gather), both in `builtin.ts` and dispatched by `CompositionPass`. Strip subdivision is now the fallback, not the mechanism |
-| `CAMERA_SYSTEM.md` §7 "a layer that spans a range of depths gets one uniform blur, not a gradient" | **Superseded by the corner-CoC path** — the blur radius varies per pixel across the quad. Still per-layer: no cross-layer depth-buffer gather, which remains the honest gap |
+| `CAMERA_SYSTEM.md` §7 "a layer that spans a range of depths gets one uniform blur, not a gradient" | **Superseded by the corner-CoC path** — the blur radius varies per pixel across the quad. The cross-layer depth-buffer gather has since shipped too (`dof-gather`, 3D depth groups); per-layer CoC remains the off-depth-path fallback |
 | A static 3D layer under a keyframed camera renders sharp (motion blur gated on the layer's own tracks only) | **Fixed 2026-09-01**: `CAMERA_MOTION_PROPS` on the active camera extend the gate to all 3D layers, with per-sub-frame camera poses (`buildSnapshotCameraMotionBlur.test.ts`) |
 | `CAMERA_SYSTEM.md` §8.2 restated the retired per-quad lighting claim | Retired the day before, in the 2026-08-10 row above. Corrected there; the **shadow** half of that sentence (2.5D projections) was and is true and was kept |
 | Cameras have no in-place X/Y rotation, so a tripod pan is inexpressible | **Was true, now built.** `orientationX`/`orientationY` are Transform scalars composed as OFFSETS onto the base aim in `cameraFromNode`, so they also work on a two-node camera without breaking its tracking. `Rx`/`Ry` were already in the `world → camera` matrix, driven only by orbit/look-at — the matrix alone did not reveal that, the value trace did |
@@ -1370,6 +1442,12 @@ not throw, it silently blanks the layer.
 per-layer blur cannot honour them, so they would have been five more dead
 controls. They belong with the per-pixel pass, whenever the depth-buffer work
 above is done.
+
+Superseded 2026-09-14: that depth-buffer work is done (`dof-gather`), and the
+iris set shipped in full as camera options — blades, roundness, rotation,
+aspect ratio, highlight gain/threshold/saturation and diffraction fringe —
+honoured by the `bokeh` / `coc-blur` / `dof-gather` shaders on both backends,
+with neutral defaults that keep every existing scene byte-identical.
 
 ### Built 2026-08-11 — Compound Blur
 
@@ -2660,6 +2738,12 @@ features and are not this.
 **Particle density is still the ceiling it was.** Bake-to-layers shipped, which
 makes a simulation art-directable, but turbulence, particle–particle collisions,
 sub-emitters, trails, 3D particles and layer-as-particle remain absent.
+
+### Corrected 2026-09-14 — the SSAO paragraph outlived the pass that built it
+
+| §4 said | Reality |
+|---|---|
+| "SSAO is not built, and the reason is structural… the route is a linear-depth prepass" | **Built, by that exact route.** `rendergraph/passes/ssao.ts` renders the linear-depth prepass (reusing the shadow-caster shaders), estimates hemisphere AO at half or full res, blurs depth-aware, and `shade3d` multiplies it into the ambient term (`aoParams`); Composition Settings ▸ World is the UI. The paragraph correctly *predicted* the design, shipped as `AE_COMPARISON.md` item 13 already recorded — and then stood untouched as "not built": a status written once by hand and never re-derived, the same failure §0 names. The gap-matrix row and this file now agree |
 
 ### Built 2026-09-09 — Particles v2
 

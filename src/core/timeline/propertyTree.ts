@@ -56,15 +56,22 @@ import {
   type LayerStyles,
 } from '@core/effects/layerStyles';
 import { readPathOps, pathOpParamSpecs, pathOpPropPath } from '@core/scene/pathOps';
+import { readNodePolystar, polystarParamSpecs, polystarPropPath } from '@core/scene/polystar';
 import { readNodeMask, readNodeMaskAnim, maskPropPath, MASK_PROPERTY_KEYS } from '@core/effects/mask';
 import {
   readAnimatorData,
   animatorPropPath,
+  animatorAxisPropPath,
   selectorPropPath,
+  hasTextComponent,
+  OPTIONAL_ANIMATOR_PROPERTIES,
   type AnimatorParam,
   type SelectorParam,
 } from '@core/text/textAnimators';
+import { readTextPathConfig, textPathPropPath, TEXT_PATH_PARAMS } from '@core/text/textPath';
+import { readFontAxesProp, axisPropPath } from '@core/text/fontAxes';
 import { AUDIO_LEVEL_DB_PROP, AUDIO_PAN_PROP } from '@core/audio/audioParams';
+import { gradientGeometryPropsFor } from '@core/inspector/gradientGeometryProps';
 
 /**
  * The sections a layer's properties fall into, in AE's own twirl order.
@@ -137,6 +144,8 @@ export interface StaticPropertyRow {
 const MATERIAL_PROPS: ReadonlySet<string> = new Set([
   'ambient', 'diffuse', 'specular', 'shininess', 'metal', 'lightTransmission', 'roughness',
   'acceptsLights', 'castsShadows', 'acceptsShadows',
+  'reflectionIntensity', 'reflectionSharpness', 'reflectionRolloff',
+  'transparency', 'transparencyRolloff', 'ior',
 ]);
 
 /** AE Material Options rows for every 3D layer — always listed, even when
@@ -147,6 +156,9 @@ function materialRows(node: SceneNode, nodeId: string): StaticPropertyRow[] {
   const props = [
     'acceptsLights', 'ambient', 'diffuse', 'specular', 'shininess', 'metal',
     'castsShadows', 'acceptsShadows', 'lightTransmission', 'roughness', 'displacement',
+    // Advanced-3D axes, in the inspector's own order: Reflections, Transparency.
+    'reflectionIntensity', 'reflectionSharpness', 'reflectionRolloff',
+    'transparency', 'transparencyRolloff', 'ior',
   ] as const;
   return props.map((prop) => row(prop, 'material', [prop], { nodeId }));
 }
@@ -432,6 +444,19 @@ function componentPropRows(
   return out;
 }
 
+/** The parametric polystar's rows (points, rotation, radii, roundness) —
+ *  present only on a layer that IS a polystar, under Contents like the path
+ *  operators. One list (`polystarParamSpecs`) feeds this AND the inspector
+ *  section, so the two cannot disagree about which parameters exist. */
+function polystarRows(node: SceneNode, nodeId: string): StaticPropertyRow[] {
+  const ps = readNodePolystar(node);
+  if (!ps) return [];
+  return polystarParamSpecs(ps.starType).map((spec) => {
+    const path = polystarPropPath(spec.param);
+    return row(path, 'contents', [path], { nodeId });
+  });
+}
+
 /** One row per parameter of every path operator in the chain. */
 function pathOpRows(node: SceneNode, nodeId: string): StaticPropertyRow[] {
   const out: StaticPropertyRow[] = [];
@@ -468,9 +493,24 @@ function textAnimatorRows(node: SceneNode, nodeId: string): StaticPropertyRow[] 
   const out: StaticPropertyRow[] = [];
 
   animators.forEach((animator, index) => {
-    const params = is3D ? [...ANIMATOR_ROWS, ...ANIMATOR_ROWS_3D] : ANIMATOR_ROWS;
+    const params: AnimatorParam[] = is3D ? [...ANIMATOR_ROWS, ...ANIMATOR_ROWS_3D] : [...ANIMATOR_ROWS];
+    // 2-D Blur: the Y row exists once the animator stores its own blurY —
+    // the optional-property rule, so an older document's row set is unchanged.
+    if (animator.blurY !== undefined) params.splice(params.indexOf('blur') + 1, 0, 'blurY');
     for (const param of params) {
       const path = animatorPropPath(index, param);
+      out.push(row(path, 'text', [path], { nodeId }));
+    }
+    // Optional properties exist on the animator only once added (AE's
+    // Add ▸ Property), so they get rows only then.
+    const stored = animator as unknown as Record<string, unknown>;
+    for (const o of OPTIONAL_ANIMATOR_PROPERTIES) {
+      if (stored[o.param] === undefined || (o.param === 'anchorZ' && !is3D)) continue;
+      const path = animatorPropPath(index, o.param);
+      out.push(row(path, 'text', [path], { nodeId }));
+    }
+    for (const tag of Object.keys(animator.axes ?? {})) {
+      const path = animatorAxisPropPath(index, tag);
       out.push(row(path, 'text', [path], { nodeId }));
     }
     (animator.selectors ?? []).forEach((selector, selectorIndex) => {
@@ -484,6 +524,32 @@ function textAnimatorRows(node: SceneNode, nodeId: string): StaticPropertyRow[] 
       }
     });
   });
+  return out;
+}
+
+/**
+ * AE's Text group above the animators: variable-font axes (beyond the
+ * wght/wdth/slnt props the component scan already lists), Path Options when
+ * the layer rides a mask, and More Options' keyframeable Grouping Alignment
+ * once the layer has an animator for it to act on.
+ */
+function textOptionRows(node: SceneNode, nodeId: string): StaticPropertyRow[] {
+  if (!hasTextComponent(node)) return [];
+  const out: StaticPropertyRow[] = [];
+  for (const tag of Object.keys(readFontAxesProp(node))) {
+    const path = axisPropPath(tag);
+    out.push(row(path, 'text', [path], { nodeId }));
+  }
+  if (readTextPathConfig(node)) {
+    for (const param of TEXT_PATH_PARAMS) {
+      const path = textPathPropPath(param);
+      out.push(row(path, 'text', [path], { nodeId }));
+    }
+  }
+  if (readAnimatorData(node).length > 0) {
+    out.push(row('groupingAlignX', 'text', ['groupingAlignX'], { nodeId }));
+    out.push(row('groupingAlignY', 'text', ['groupingAlignY'], { nodeId }));
+  }
   return out;
 }
 
@@ -533,8 +599,16 @@ export function buildStaticPropertyTree(nodeId: string): StaticPropertyRow[] {
   // second time under Contents because some component happens to store it.
   const taken = new Set<string>(transform.flatMap((r) => [r.prop, ...r.members]));
 
-  const text = textAnimatorRows(node, nodeId);
-  const contents = [...pathOpRows(node, nodeId)];
+  const text = [...textOptionRows(node, nodeId), ...textAnimatorRows(node, nodeId)];
+  const contents = [
+    // The layer's own parametric geometry precedes the operators that deform
+    // it — the same top-down order the chain evaluates in.
+    ...polystarRows(node, nodeId),
+    ...pathOpRows(node, nodeId),
+    // A text layer's gradient geometry — fill, then stroke. Keyframeable
+    // scalars whose static value lives inside a paint (gradientGeometryProps).
+    ...gradientGeometryPropsFor(node).map((p) => row(p, 'contents', [p], { nodeId })),
+  ];
   // A layer with no Transform group has no Transform section either — an audio
   // layer that happens to carry a Style component must not sprout an Opacity
   // row under a heading it does not have.

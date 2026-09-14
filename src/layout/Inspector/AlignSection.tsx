@@ -12,8 +12,8 @@ const ALIGN_ACTIONS: { id: AlignMode; icon: IconName; label: string }[] = [
   { id: 'top',          icon: 'align-top',             label: 'Align Top' },
   { id: 'middle-v',     icon: 'align-middle',          label: 'Align Middles (V)' },
   { id: 'bottom',       icon: 'align-bottom',          label: 'Align Bottom' },
-  { id: 'distribute-h', icon: 'distribute-horizontal', label: 'Distribute Horizontally' },
-  { id: 'distribute-v', icon: 'distribute-vertical',   label: 'Distribute Vertically' },
+  { id: 'distribute-space-h', icon: 'distribute-horizontal', label: 'Distribute Spacing (H)' },
+  { id: 'distribute-space-v', icon: 'distribute-vertical',   label: 'Distribute Spacing (V)' },
 ];
 
 export function AlignSection(): JSX.Element | null {

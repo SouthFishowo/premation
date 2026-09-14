@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useSelectionStore } from '@stores/selectionStore';
 import { useCompositionStore } from '@stores/compositionStore';
-import { alignNodes, type AlignMode } from '@core/scene/alignNodes';
+import { alignNodes, distributeMinimum, type AlignMode } from '@core/scene/alignNodes';
 import { Icon, type IconName } from '@components/Icon';
 import { cn } from '@utils/cn';
 import styles from './AlignSection.module.css';
@@ -15,9 +15,21 @@ const ALIGN_ACTIONS: { id: AlignMode; icon: IconName; label: string }[] = [
   { id: 'bottom',    icon: 'align-bottom', label: 'Align Bottom' },
 ];
 
+/**
+ * AE's Distribute row: the six edge / centre buttons in AE's order, then the
+ * two Distribute Spacing buttons. The edge buttons reuse the align glyph of the
+ * edge they space (there is no separate distribute-by-edge glyph in the set);
+ * the tooltips carry the distinction.
+ */
 const DISTRIBUTE_ACTIONS: { id: AlignMode; icon: IconName; label: string }[] = [
-  { id: 'distribute-h', icon: 'distribute-horizontal', label: 'Distribute Horizontally' },
-  { id: 'distribute-v', icon: 'distribute-vertical',   label: 'Distribute Vertically' },
+  { id: 'distribute-top',     icon: 'align-top',             label: 'Distribute Top Edges' },
+  { id: 'distribute-v',       icon: 'align-middle',          label: 'Distribute Vertical Centers' },
+  { id: 'distribute-bottom',  icon: 'align-bottom',          label: 'Distribute Bottom Edges' },
+  { id: 'distribute-left',    icon: 'align-left',            label: 'Distribute Left Edges' },
+  { id: 'distribute-h',       icon: 'align-center',          label: 'Distribute Horizontal Centers' },
+  { id: 'distribute-right',   icon: 'align-right',           label: 'Distribute Right Edges' },
+  { id: 'distribute-space-h', icon: 'distribute-horizontal', label: 'Distribute Horizontal Spacing' },
+  { id: 'distribute-space-v', icon: 'distribute-vertical',   label: 'Distribute Vertical Spacing' },
 ];
 
 /**
@@ -36,7 +48,7 @@ export function AlignPanel(): JSX.Element {
   const compHeight = useCompositionStore((s) => s.height);
 
   const alignMin = alignTo === 'composition' ? 1 : 2;
-  const distributeMin = alignTo === 'composition' ? 2 : 3;
+  const distributeMin = distributeMinimum(alignTo);
   const count = selectedIds.length;
 
   const run = (mode: AlignMode): void => alignNodes([...selectedIds], mode, alignTo, compWidth, compHeight);
@@ -97,7 +109,14 @@ export function AlignPanel(): JSX.Element {
       <div className={styles.group}>
         <span className={styles.groupLabel}>Distribute</span>
         <div className={styles.grid} role="group" aria-label="Distribute">
-          {DISTRIBUTE_ACTIONS.map((a) => renderButton(a, distributeMin))}
+          {DISTRIBUTE_ACTIONS.slice(0, 6).map((a) => renderButton(a, distributeMin))}
+        </div>
+      </div>
+
+      <div className={styles.group}>
+        <span className={styles.groupLabel}>Distribute Spacing</span>
+        <div className={styles.grid} role="group" aria-label="Distribute Spacing">
+          {DISTRIBUTE_ACTIONS.slice(6).map((a) => renderButton(a, distributeMin))}
         </div>
       </div>
 
@@ -105,8 +124,8 @@ export function AlignPanel(): JSX.Element {
         {count === 0
           ? 'Select layers on the canvas or in the timeline to align them.'
           : alignTo === 'selection'
-            ? 'Aligns the selected layers to each other. Distribute needs three or more.'
-            : 'Aligns each selected layer to the composition frame.'}
+            ? 'Aligns the selected layers to each other. Distribute needs three or more; the outermost two stay put.'
+            : 'Aligns each selected layer to the composition frame. Distribute spreads them edge to edge across it.'}
       </p>
     </div>
   );

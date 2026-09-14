@@ -8,7 +8,13 @@
  * composition/world space — the overlay converts to screen via the camera.
  */
 
-import { defaultAnimation, type AnimationEngine } from '@motion/animation';
+import {
+  defaultAnimation,
+  autoSpatialTangents,
+  effectiveSpatialTangents,
+  type AnimationEngine,
+  type SpatialInterp,
+} from '@motion/animation';
 import type { SceneNode } from '@core/types';
 
 export interface PathSample {
@@ -166,15 +172,23 @@ export interface PathTangents {
   in: { x: number; y: number } | null;
 }
 
-/** Value + spatial tangents of the keyframe at `t` on one scalar track. */
+/**
+ * Value + spatial tangents of the keyframe at `t` on one scalar track.
+ * `si`/`so` are the EFFECTIVE tangents (the keyframe's spatial mode applied:
+ * none for `linear`, computed for `auto`) — what the renderer samples with.
+ */
 function kfAt(
   nodeId: string,
   prop: 'x' | 'y',
   t: number,
   engine: AnimationEngine,
-): { value: number; si?: number; so?: number; continuous?: boolean } | null {
-  const kf = (engine.getTrackKeyframes(nodeId, prop) ?? []).find((k) => k.t === t);
-  return kf ? { value: kf.value, si: kf.si, so: kf.so, continuous: kf.continuous } : null;
+): { value: number; si?: number; so?: number; continuous?: boolean; spatialInterp?: SpatialInterp } | null {
+  const kfs = engine.getTrackKeyframes(nodeId, prop) ?? [];
+  const i = kfs.findIndex((k) => k.t === t);
+  const kf = kfs[i];
+  if (!kf) return null;
+  const eff = effectiveSpatialTangents(kfs, i);
+  return { value: kf.value, si: eff.si, so: eff.so, continuous: kf.continuous, spatialInterp: kf.spatialInterp };
 }
 
 /**
@@ -194,6 +208,9 @@ export function motionPathTangents(
     const ky = kfAt(node.id, 'y', t, engine);
     let out: { x: number; y: number } | null = null;
     let inn: { x: number; y: number } | null = null;
+    // An explicit LINEAR vertex has no handles (AE draws none); Ctrl-click or
+    // the Spatial Interpolation menu converts it back.
+    if ((kx?.spatialInterp ?? ky?.spatialInterp) === 'linear') return { t, x: p.x, y: p.y, out, in: inn };
     if (i < times.length - 1) {
       const n = sampler(times[i + 1]!);
       out = {
@@ -230,6 +247,11 @@ export function setPathTangent(
   const kx = kfAt(nodeId, 'x', t, engine);
   const ky = kfAt(nodeId, 'y', t, engine);
   if (!kx || !ky) return;
+  const mode = kx.spatialInterp ?? ky.spatialInterp;
+  // Grabbing a handle of a COMPUTED vertex (auto / linear) first freezes what
+  // it renders with, so the untouched handle does not jump when the mode
+  // flips to a stored one below.
+  if (mode === 'auto' || mode === 'linear') bakeSpatialTangents(nodeId, t, engine);
   const dx = handle.x - kx.value;
   const dy = handle.y - ky.value;
   const key = which === 'out' ? 'so' : 'si';
@@ -245,6 +267,13 @@ export function setPathTangent(
     engine.updateKeyframe(nodeId, 'x', t, { continuous: false });
     engine.updateKeyframe(nodeId, 'y', t, { continuous: false });
   }
+  // AE: dragging a handle of an Auto Bezier vertex makes it Continuous Bezier;
+  // Alt-dragging breaks it to Bezier. Legacy keys (no mode) stay legacy.
+  if (mode !== undefined) {
+    const next: SpatialInterp = mirror ? 'continuous' : 'bezier';
+    engine.setSpatialInterp(nodeId, 'x', t, next);
+    engine.setSpatialInterp(nodeId, 'y', t, next);
+  }
 }
 
 /** Whether position keyframes at `t` keep linked spatial handles (AE smooth). */
@@ -254,8 +283,145 @@ export function isPathTangentContinuous(
   engine: AnimationEngine = defaultAnimation,
 ): boolean {
   const kx = kfAt(nodeId, 'x', t, engine);
+  if (kx?.spatialInterp === 'auto' || kx?.spatialInterp === 'continuous') return true;
+  if (kx?.spatialInterp === 'bezier') return false;
   // Undefined continuous means linked — same default as the temporal graph.
   return kx?.continuous !== false;
+}
+
+// ── Per-keyframe spatial interpolation (AE Keyframe Interpolation) ───
+
+const POSITION_AXES = ['x', 'y'] as const;
+
+/**
+ * The spatial interpolation a motion-path vertex at `t` has. An explicit
+ * `spatialInterp` wins; a legacy keyframe is classified from what it stores
+ * (no tangents → linear, linked → continuous, broken → bezier).
+ */
+export function spatialInterpAt(
+  nodeId: string,
+  t: number,
+  engine: AnimationEngine = defaultAnimation,
+): SpatialInterp {
+  let stored = false;
+  let continuous = true;
+  for (const prop of POSITION_AXES) {
+    const kf = (engine.getTrackKeyframes(nodeId, prop) ?? []).find((k) => k.t === t);
+    if (!kf) continue;
+    if (kf.spatialInterp) return kf.spatialInterp;
+    if (kf.si !== undefined || kf.so !== undefined) stored = true;
+    if (kf.continuous === false) continuous = false;
+  }
+  if (!stored) return 'linear';
+  return continuous ? 'continuous' : 'bezier';
+}
+
+/** Write the EFFECTIVE tangents of the vertex at `t` back as stored values. */
+function bakeSpatialTangents(nodeId: string, t: number, engine: AnimationEngine, fromAuto = false): void {
+  for (const prop of POSITION_AXES) {
+    const kfs = engine.getTrackKeyframes(nodeId, prop) ?? [];
+    const i = kfs.findIndex((k) => k.t === t);
+    if (i < 0) continue;
+    const eff = fromAuto ? autoSpatialTangents(kfs, i) : effectiveSpatialTangents(kfs, i);
+    engine.setSpatialTangent(nodeId, prop, t, { si: eff.si ?? null, so: eff.so ?? null });
+  }
+}
+
+/**
+ * The spatial tangents (2D, value-space offsets) AE's conversions start from.
+ * A vertex with no handles at all borrows the auto-bezier ones, so converting a
+ * corner to Bezier gives the user something to grab.
+ */
+function hasAnyStoredTangent(nodeId: string, t: number, engine: AnimationEngine): boolean {
+  for (const prop of POSITION_AXES) {
+    const kfs = engine.getTrackKeyframes(nodeId, prop) ?? [];
+    const i = kfs.findIndex((k) => k.t === t);
+    if (i < 0) continue;
+    const eff = effectiveSpatialTangents(kfs, i);
+    if (eff.si !== undefined || eff.so !== undefined) return true;
+  }
+  return false;
+}
+
+/**
+ * Keyframe Interpolation ▸ Spatial Interpolation for ONE motion-path vertex.
+ *
+ *  • linear     — tangents cleared, mode flag makes any stale ones inert.
+ *  • auto       — tangents cleared; the renderer computes them from neighbours.
+ *  • bezier     — current effective tangents baked, handles broken.
+ *  • continuous — baked, then the in handle is re-aimed opposite the out
+ *                 handle (lengths kept) so the vertex is smooth.
+ *
+ * Both position axes that key at `t` are converted. Callers wrap in runAnimEdit.
+ */
+export function setSpatialInterpolation(
+  nodeId: string,
+  t: number,
+  mode: SpatialInterp,
+  engine: AnimationEngine = defaultAnimation,
+): void {
+  const keyed = POSITION_AXES.filter((p) => (engine.getTrackKeyframes(nodeId, p) ?? []).some((k) => k.t === t));
+  if (keyed.length === 0) return;
+  if (mode === 'linear' || mode === 'auto') {
+    for (const prop of keyed) {
+      engine.setSpatialTangent(nodeId, prop, t, { si: null, so: null });
+      engine.setSpatialInterp(nodeId, prop, t, mode);
+      if (mode === 'auto') engine.updateKeyframe(nodeId, prop, t, { continuous: true });
+    }
+    return;
+  }
+  bakeSpatialTangents(nodeId, t, engine, !hasAnyStoredTangent(nodeId, t, engine));
+  if (mode === 'continuous') {
+    const kx = (engine.getTrackKeyframes(nodeId, 'x') ?? []).find((k) => k.t === t);
+    const ky = (engine.getTrackKeyframes(nodeId, 'y') ?? []).find((k) => k.t === t);
+    const out = { x: kx?.so ?? 0, y: ky?.so ?? 0 };
+    const inn = { x: kx?.si ?? 0, y: ky?.si ?? 0 };
+    const lenOut = Math.hypot(out.x, out.y);
+    const lenIn = Math.hypot(inn.x, inn.y);
+    if (lenOut > 1e-9 && lenIn > 1e-9) {
+      const k = -lenIn / lenOut;
+      if (kx) engine.setSpatialTangent(nodeId, 'x', t, { si: out.x * k });
+      if (ky) engine.setSpatialTangent(nodeId, 'y', t, { si: out.y * k });
+    }
+  }
+  for (const prop of keyed) {
+    engine.setSpatialInterp(nodeId, prop, t, mode);
+    engine.updateKeyframe(nodeId, prop, t, { continuous: mode === 'continuous' });
+  }
+}
+
+/**
+ * AE's Convert Vertex (Ctrl/Cmd+click a motion-path vertex): a corner becomes
+ * Auto Bezier, anything curved becomes a corner. Returns the new mode.
+ */
+export function toggleVertexInterpolation(
+  nodeId: string,
+  t: number,
+  engine: AnimationEngine = defaultAnimation,
+): SpatialInterp {
+  const next: SpatialInterp = spatialInterpAt(nodeId, t, engine) === 'linear' ? 'auto' : 'linear';
+  setSpatialInterpolation(nodeId, t, next, engine);
+  return next;
+}
+
+// ── Motion path display window (AE Preferences ▸ Display ▸ Motion Path) ──
+
+/** Which part of the path is drawn: every keyframe, none, or N seconds around the playhead. */
+export type MotionPathShow = 'all' | 'none' | 'window';
+
+/**
+ * The keyframe-time span of the motion path to DRAW, or null to draw nothing.
+ * `window` is a span of `seconds` CENTRED on `centre` (AE's "No More Than …"
+ * limit). Pure.
+ */
+export function motionPathTimeWindow(
+  show: MotionPathShow,
+  seconds: number,
+  centre: number,
+): { min: number; max: number } | null {
+  if (show === 'none') return null;
+  if (show === 'all' || !(seconds > 0)) return { min: -Infinity, max: Infinity };
+  return { min: centre - seconds / 2, max: centre + seconds / 2 };
 }
 
 /** Auto-bezier the position path (smooth curve through every keyframe). */
@@ -274,7 +440,7 @@ export function straightenMotionPath(nodeId: string, engine: AnimationEngine = d
 export function hasPathTangents(nodeId: string, engine: AnimationEngine = defaultAnimation): boolean {
   for (const prop of ['x', 'y'] as const) {
     const kfs = engine.getTrackKeyframes(nodeId, prop) ?? [];
-    if (kfs.some((k) => k.si !== undefined || k.so !== undefined)) return true;
+    if (kfs.some((k) => k.si !== undefined || k.so !== undefined || (k.spatialInterp !== undefined && k.spatialInterp !== 'linear'))) return true;
   }
   return false;
 }

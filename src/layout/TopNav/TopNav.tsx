@@ -25,12 +25,12 @@ import { Icon, type IconName } from '@components/Icon';
 import { ToolOptionsBar } from './ToolOptionsBar';
 import { ToolFlyout, type ToolFlyoutItem } from './ToolFlyout';
 import { toolShortcut, toolLabelWithShortcut } from './toolShortcuts';
-import { Tooltip } from '@components/Tooltip';
 import { useElementWidth } from './useElementWidth';
 import { collapseFor } from './toolbarCollapse';
 import { useActiveWorkspace, useProjectStore } from '@stores/projectStore';
-import { insertPrimitive, insertSolid, insertAdjustmentLayer, insertAudio, insertParticle, insertImageSequence, insertCompInstance, insert3DPrimitive, insert3DText } from '@core/scene/sceneInsert';
+import { insertPrimitive, insertAdjustmentLayer, insertAudio, insertParticle, insertImageSequence, insertCompInstance, insert3DPrimitive, insert3DText } from '@core/scene/sceneInsert';
 import { openCameraDialog, openLightDialog, openPrimitiveDialog } from '@layout/Workspace/SceneInsertDialogs';
+import { openSolidSettings } from '@layout/Composition/LayerSettingsDialog';
 import { useGuidesStore } from '@stores/guidesStore';
 import { importLottieFile } from '@core/library/lottieLibrary';
 import { reportLottieImport, reportLottieImportFailure } from '@core/lottie/lottieImportReport';
@@ -147,7 +147,11 @@ const SHAPE_TOOLS: ToolDef[] = [
   { id: 'line',     icon: 'line',       label: 'Line Segment' },
 ];
 
-const TEXT_TOOL: ToolDef = { id: 'text', icon: 'type', label: 'Text Tool' };
+/** AE's Type tool family: horizontal and vertical (Ctrl+T cycles them). */
+const TEXT_TOOLS: ToolDef[] = [
+  { id: 'text', icon: 'type', label: 'Text Tool' },
+  { id: 'vertical-text', icon: 'type-vertical', label: 'Vertical Type Tool' },
+];
 
 const MASK_TOOLS: ToolDef[] = [
   { id: 'mask-rect',    icon: 'mask-square', label: 'Rectangle Mask Tool' },
@@ -368,6 +372,9 @@ export function TopNav(): JSX.Element {
     ? { id: KNIFE_FLYOUT.tool, icon: KNIFE_FLYOUT.icon, label: KNIFE_FLYOUT.label }
     : PEN_TOOLS.find(t => t.id === (isPenActive ? activeTool : lastPenTool)) || PEN_TOOLS[0]!;
 
+  const isTextActive = TEXT_TOOLS.some(t => t.id === activeTool);
+  const textDropdownTool = TEXT_TOOLS.find(t => t.id === activeTool) || TEXT_TOOLS[0]!;
+
   const isShapeActive = SHAPE_TOOLS.some(t => t.id === activeTool);
   const shapeDropdownTool = SHAPE_TOOLS.find(t => t.id === (isShapeActive ? activeTool : lastShapeTool)) || SHAPE_TOOLS[0]!;
 
@@ -576,19 +583,14 @@ export function TopNav(): JSX.Element {
                 items={penItems}
                 data-tour="pen-tool"
               />
-              {/* A plain button, so it gets the REAL tooltip with a keycap —
-                  see the note in ToolFlyout for why a flyout trigger cannot. */}
-              <Tooltip label={TEXT_TOOL.label} shortcut={toolShortcut(TEXT_TOOL.id)}>
-                <button
-                  type="button"
-                  className={activeTool === TEXT_TOOL.id ? styles.toolActive : styles.tool}
-                  aria-label={withShortcut(TEXT_TOOL)}
-                  aria-pressed={activeTool === TEXT_TOOL.id}
-                  onClick={() => setTool(TEXT_TOOL.id)}
-                >
-                  <Icon name={TEXT_TOOL.icon} size="md" />
-                </button>
-              </Tooltip>
+              {/* The Type tools share a flyout, like AE's long-press group. */}
+              <ToolFlyout
+                icon={textDropdownTool.icon}
+                label={withShortcut(textDropdownTool)}
+                shortcut={toolShortcut(textDropdownTool.id)}
+                active={isTextActive}
+                items={flyoutItems(TEXT_TOOLS, setTool)}
+              />
               <ToolFlyout
                 icon={shapeDropdownTool.icon}
                 label={withShortcut(shapeDropdownTool)}
@@ -671,7 +673,7 @@ export function TopNav(): JSX.Element {
                 items={[
                   { type: 'item', id: 'new-shape', label: 'Shape Layer', icon: 'shape', onSelect: () => insertPrimitive('shape', 'Shape') },
                   { type: 'item', id: 'new-text', label: 'Text Layer', icon: 'type', onSelect: () => insertPrimitive('text', 'Text') },
-                  { type: 'item', id: 'new-solid', label: 'Solid…', icon: 'solid', onSelect: () => insertSolid() },
+                  { type: 'item', id: 'new-solid', label: 'Solid…', icon: 'solid', onSelect: () => openSolidSettings({ mode: 'new' }) },
                   { type: 'separator' },
                   { type: 'item', id: 'new-group', label: 'Group', icon: 'layers', onSelect: () => insertPrimitive('group', 'Group') },
                   { type: 'item', id: 'new-null', label: 'Null Object', icon: 'crosshair', onSelect: () => insertNull() },

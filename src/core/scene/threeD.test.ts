@@ -1,4 +1,4 @@
-import { is3DEnabled, readNode3D, THREE_D_PROPS } from './threeD';
+import { canBe3D, is3DEnabled, readNode3D, THREE_D_PROPS } from './threeD';
 import type { SceneNode } from '@core/types';
 
 function node(props: Record<string, unknown>): SceneNode {
@@ -56,5 +56,19 @@ describe('threeD helpers', () => {
     const n = { id: 'g', components: [{ id: 'g_s', type: 'Style', props: {} }] } as unknown as SceneNode;
     expect(is3DEnabled(n)).toBe(false);
     expect(readNode3D(n)).toEqual(ZERO);
+  });
+
+  it('an SVG layer can take the 3D switch, like the other content kinds', () => {
+    // svg rasterizes down the image path (buildSnapshot maps it to layerKind
+    // 'image'), so 3D placement and extrusion work the moment the switch is
+    // allowed — it was missing from THREE_D_CAPABLE_KINDS only, the same
+    // list-omission class that once made svg unclickable (geometry.ts).
+    for (const kind of ['svg', 'shape', 'text', 'image', 'video', 'null']) {
+      expect([kind, canBe3D(node({ x: 0, y: 0, __kind: kind }))]).toEqual([kind, true]);
+    }
+    // Devices and non-visual kinds stay out.
+    for (const kind of ['audio', 'group', 'camera', 'light', 'particle', 'adjustment']) {
+      expect([kind, canBe3D(node({ x: 0, y: 0, __kind: kind }))]).toEqual([kind, false]);
+    }
   });
 });

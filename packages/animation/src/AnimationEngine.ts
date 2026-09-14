@@ -7,9 +7,15 @@
  * authoring keyframes are the truth; sampled values are derived and disposable.
  */
 
-import type { PropPath, PropertyTrack, SceneValueSnapshot, EasingKind, BezierHandles, Keyframe } from './types';
+import type { PropPath, PropertyTrack, SceneValueSnapshot, EasingKind, BezierHandles, Keyframe, SpatialInterp } from './types';
 import { sampleTrack, upsertKeyframe, applyRoving, applyRovingSpatial, smoothTrackTangents, clearTrackTangents } from './interpolate';
 import { compileExpression, type CompiledExpression, type ExprContext, type ExprResult } from './expressions';
+import {
+  SOURCE_TEXT_PROP,
+  sampleAfterResult,
+  type SourceTextSample,
+  type SourceTextExpressionResult,
+} from './sourceText';
 import {
   sampleDataTrack,
   upsertDataKeyframe,
@@ -129,6 +135,17 @@ export type MarkerProvider = (
   nodeId: string,
   scope: 'comp' | 'layer',
 ) => readonly import('./expressions').ExprMarkerData[];
+
+/**
+ * A text layer's PRE-expression Source Text at a time — see
+ * `setSourceTextProvider`. Undefined for a node that is not a text layer.
+ *
+ * "Pre-expression" is the contract: the text the hold track (or the static
+ * content) gives, and the layer-wide style the components store. The engine
+ * layers the Source Text expression on top itself, so the host must NOT call
+ * back into `evaluateSourceText` from here — that would recurse.
+ */
+export type SourceTextProvider = (nodeId: string, t: number) => SourceTextSample | undefined;
 
 /** Which vector component a decomposed track reads from an `[x, y, z]`
  *  expression return. Unknown props read component 0. */
@@ -282,6 +299,27 @@ export class AnimationEngine {
    * `marker.numKeys === 0` is the honest answer here, not a missing wire.
    */
   private markerProvider: MarkerProvider = () => [];
+
+  /** Source Text reader for `text.sourceText` — none until the host binds one. */
+  private sourceTextProvider: SourceTextProvider = () => undefined;
+
+  /**
+   * Bind `text.sourceText` (and Source Text expressions) to the scene.
+   *
+   * Same separation as the marker provider: the engine owns the hold track,
+   * but a layer's content and style live on its components, which this
+   * package cannot see.
+   */
+  setSourceTextProvider(provider: SourceTextProvider): void {
+    this.sourceTextProvider = provider;
+    this.sourceTextProviderBound = true;
+  }
+
+  /** True once a host has bound a Source Text reader. */
+  hasSourceTextProvider(): boolean {
+    return this.sourceTextProviderBound;
+  }
+  private sourceTextProviderBound = false;
 
   /**
    * Bind the change sink (the app maps this onto its EventBus 'AnimationChanged'
@@ -562,7 +600,22 @@ export class AnimationEngine {
       si: kf.si,
       so: kf.so,
     };
+    // Carried only when set, so an untouched keyframe keeps its exact shape.
+    if (kf.spatialInterp !== undefined) next.spatialInterp = kf.spatialInterp;
     track.keyframes = upsertKeyframe(track.keyframes.filter((k) => k.t !== oldT), next);
+    this.notifyChange(nodeId);
+  }
+
+  /**
+   * Set (or clear, with null) the SPATIAL interpolation mode of the keyframe at
+   * `t` — see `Keyframe.spatialInterp`. Only the flag: callers that convert a
+   * vertex bake or clear the stored tangents themselves.
+   */
+  setSpatialInterp(nodeId: string, prop: PropPath, t: number, mode: SpatialInterp | null): void {
+    const kf = this.tracks.get(nodeId)?.get(prop)?.keyframes.find((k) => k.t === t);
+    if (!kf) return;
+    if (mode === null) delete kf.spatialInterp;
+    else kf.spatialInterp = mode;
     this.notifyChange(nodeId);
   }
 
@@ -635,6 +688,10 @@ export class AnimationEngine {
    * Returns `undefined` when neither keyframes nor an expression apply.
    */
   sample(nodeId: string, prop: PropPath, t: number): number | undefined {
+    // Source Text is a STRING property: its expression is evaluated by
+    // `evaluateSourceText`, never here, where its result would be judged as a
+    // number, fail, and cost a full evaluation per frame to do so.
+    if (prop === SOURCE_TEXT_PROP) return undefined;
     // Fast path: no enabled expression on THIS property means no cycle is
     // possible from here, so skip the visited-Set + try/catch machinery — this
     // is the per-property-per-frame hot path and the Set alone dominated it.
@@ -661,6 +718,7 @@ export class AnimationEngine {
     visited: Set<string>,
     depth: number,
   ): number | undefined {
+    if (prop === SOURCE_TEXT_PROP) return undefined;
     const key = `${nodeId}:${prop}`;
     if (visited.has(key)) {
       throw new Error(`Cycle detected across expression evaluation (${nodeId}:${prop})`);
@@ -734,6 +792,8 @@ export class AnimationEngine {
       spaceAt: (name, tt) => this.layerSpaceProvider(nodeId, name, tt),
       // And again: markers belong to the timeline, not to the engine.
       markersAt: (which) => this.markerProvider(nodeId, which),
+      // And for text: content and style live on components.
+      sourceTextAt: (name, tt) => this.sourceTextFor(nodeId, prop, name, tt, visited, depth),
       // Per-(node, prop) noise phase so `wiggle` on x and y move
       // independently (AE) — still deterministic run to run.
       propSeed: stringSeed(`${nodeId}:${prop}`),
@@ -767,6 +827,97 @@ export class AnimationEngine {
     const base = track ? sampleTrack(track, t) : undefined;
     const visited = new Set<string>([`${nodeId}:${prop}`]);
     return compileExpression(src).run(this.exprContext(nodeId, prop, t, base, visited, 1));
+  }
+
+  // ── Source Text expressions ─────────────────────────────────────
+
+  /**
+   * The Source Text expression's result for a text layer at `t`, or null when
+   * the layer has no ENABLED expression on Source Text, no provider is bound,
+   * or the expression errored (the layer then shows its un-expressed text —
+   * the same fallback a numeric property takes).
+   *
+   * This is the render hook: the snapshot builder merges the result into the
+   * layer's text spec with `applySourceTextExpressionResult` (app side).
+   */
+  evaluateSourceText(nodeId: string, t: number): SourceTextExpressionResult | null {
+    const entry = this.expressions.get(nodeId)?.get(SOURCE_TEXT_PROP);
+    if (!entry?.enabled) return null;
+    try {
+      return this.sourceTextInternal(nodeId, t, new Set(), 0).result;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Evaluate a DRAFT Source Text expression the way playback will — the editor preview. */
+  previewSourceTextExpression(
+    nodeId: string,
+    src: string,
+    t: number,
+  ): { result: SourceTextExpressionResult | null; error: string | null } {
+    const base = this.sourceTextProvider(nodeId, t);
+    if (!base) return { result: null, error: 'This layer has no Source Text.' };
+    const visited = new Set<string>([`${nodeId}:${SOURCE_TEXT_PROP}`]);
+    return compileExpression(src).runText({
+      ...this.exprContext(nodeId, SOURCE_TEXT_PROP, t, undefined, visited, 1),
+      textValue: base,
+    });
+  }
+
+  /**
+   * One layer's Source Text after its expression, with the same cycle and
+   * depth guards as `sampleInternal` — `A` reading `B`'s text while `B` reads
+   * `A`'s is a cycle whichever property type carries it.
+   */
+  private sourceTextInternal(
+    nodeId: string,
+    t: number,
+    visited: Set<string>,
+    depth: number,
+  ): { sample: SourceTextSample | undefined; result: SourceTextExpressionResult | null } {
+    const base = this.sourceTextProvider(nodeId, t);
+    if (!base) return { sample: undefined, result: null };
+    const entry = this.expressions.get(nodeId)?.get(SOURCE_TEXT_PROP);
+    if (!entry?.enabled) return { sample: base, result: null };
+    const key = `${nodeId}:${SOURCE_TEXT_PROP}`;
+    if (visited.has(key)) throw new Error(`Cycle detected across expression evaluation (${key})`);
+    if (depth > 16) throw new Error(`Maximum cross-layer evaluation depth (16) exceeded (${key})`);
+    visited.add(key);
+    try {
+      const r = entry.compiled.runText({
+        ...this.exprContext(nodeId, SOURCE_TEXT_PROP, t, undefined, visited, depth + 1),
+        textValue: base,
+      });
+      if (r.error && (/Cycle detected/i.test(r.error) || /Maximum cross-layer/i.test(r.error))) {
+        throw new Error(r.error);
+      }
+      return { sample: sampleAfterResult(base, r.result), result: r.result };
+    } finally {
+      visited.delete(key);
+    }
+  }
+
+  /**
+   * What `text.sourceText` reads from an expression on (selfId, prop).
+   *
+   * On the Source Text property itself, the layer's OWN text is the
+   * pre-expression text (AE's `value`) — reading the post-expression text
+   * there would be the expression reading itself. Every other read sees the
+   * post-expression text, as AE's cross-layer reads do.
+   */
+  private sourceTextFor(
+    selfId: string,
+    prop: PropPath,
+    name: string | null,
+    t: number,
+    visited: Set<string>,
+    depth: number,
+  ): SourceTextSample | undefined {
+    const target = name === null ? selfId : resolveLayerRef(name, this.layerResolver);
+    if (!target) return undefined;
+    if (target === selfId && prop === SOURCE_TEXT_PROP) return this.sourceTextProvider(target, t);
+    return this.sourceTextInternal(target, t, visited, depth).sample;
   }
 
   /** Evaluate a single node's animated/expressed properties at time `t`.

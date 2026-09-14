@@ -78,6 +78,7 @@ const VIEW_OPTIONS: ReadonlyArray<{ id: Camera3dMode; label: string }> = [
 
 export function SecondaryViewPane({ mode: modeProp, onModeChange, style, className }: SecondaryViewPaneProps = {}): JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const wireframeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const time = useActiveWorkspace()?.time ?? 0;
   const sceneRev = useSceneRevisionFrame();
@@ -166,7 +167,13 @@ export function SecondaryViewPane({ mode: modeProp, onModeChange, style, classNa
   // Render LAST, so it sees this pass's framing. `framingRev` rides in on the
   // revision because panning is not a scene change and nothing else would
   // repaint the canvas.
-  useViewportRenderer(canvasRef, containerRef, sceneRev + framingRev, time, undefined, undefined, mode, getRenderView);
+  // Quality = Wireframe layers: the render hides their pixels, the overlay
+  // draws their boxes from THIS pane's projection (camera/axis views included).
+  const wireframeOverlay = useMemo(
+    () => ({ canvasRef: wireframeCanvasRef, nodes: () => paneScene.getNodes() }),
+    [paneScene],
+  );
+  useViewportRenderer(canvasRef, containerRef, sceneRev + framingRev, time, undefined, undefined, mode, getRenderView, wireframeOverlay);
   const selectedIds = useSelectionStore((s) => s.ids);
   // Selection outline from the PANE's own projection — the main viewport's
   // corners describe a different view and would draw the box in the wrong place.
@@ -216,6 +223,13 @@ export function SecondaryViewPane({ mode: modeProp, onModeChange, style, classNa
           height: '100%',
           pointerEvents: 'none',
         }}
+      />
+      {/* Quality = Wireframe boxes, over the pixels and under the interaction
+          surface. Placed and sized by `paintWireframeOverlay` each frame. */}
+      <canvas
+        ref={wireframeCanvasRef}
+        aria-hidden
+        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}
       />
       {/* Interaction surface: it draws this view's selection outline and carries
           the pane's pointer handlers. The 3D chrome that follows paints above it

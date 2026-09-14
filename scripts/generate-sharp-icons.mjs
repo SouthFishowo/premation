@@ -64,7 +64,7 @@ const MAP = {
   layout: 'dashboard', crosshair: 'center_focus_strong', theme: 'contrast', undo: 'undo', redo: 'redo',
   'select-all': 'select_all', deselect: 'deselect', 'mouse-pointer': 'arrow_selector_tool',
   'direct-select': 'near_me', 'pan-behind': 'recenter', 'layer-plus': null,
-  pen: 'ink_pen', type: 'text_fields', square: 'square', circle: 'circle',
+  pen: 'ink_pen', type: 'text_fields', 'type-vertical': 'format_textdirection_vertical', square: 'square', circle: 'circle',
   'mask-square': null, 'mask-circle': null, 'mask-pen': null,
   pencil: 'edit', line: 'shape_line', star: 'star', polygon: 'pentagon', curvature: 'line_curve',
   // Arrows-in / arrows-out rather than the family's `group_work`/`workspaces`,

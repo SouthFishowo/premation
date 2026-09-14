@@ -55,6 +55,18 @@ export interface Stroke {
   dashOffset?: number;
   cap: StrokeCap;
   join: StrokeJoin;
+  /**
+   * Miter-limit ratio for `join: 'miter'` — Canvas2D's `miterLimit`: when a
+   * corner's miter length exceeds `miterLimit × width`, the join falls back to
+   * a bevel. Meaningless for round/bevel joins.
+   *
+   * Absent means 4, the Canvas2D default the rasterizer has always run with —
+   * and it is OMITTED rather than written as 4 for the same cache-key reason
+   * `dashOffset` is: `contentHash` serialises the whole stroke object, so
+   * defaulting it into every normalised stroke would invalidate every cached
+   * raster in a project on first open for a value that means "unchanged".
+   */
+  miterLimit?: number;
   /** Optional gradient paint — when set (linear/radial) it overrides `color`;
    *  `color` remains the fallback for renderers without gradient strokes. */
   paint?: FillPaint;
@@ -119,6 +131,9 @@ export function normalizeStroke(v: unknown): Stroke {
     ...(Number.isFinite(s.dashOffset) ? { dashOffset: s.dashOffset as number } : {}),
     cap: s.cap === 'round' || s.cap === 'square' ? s.cap : 'butt',
     join: s.join === 'round' || s.join === 'bevel' ? s.join : 'miter',
+    // Omitted when absent — see the field note (cache-key argument, mirroring
+    // `dashOffset`). Floored at 1: Canvas2D ignores miterLimit < 1.
+    ...(Number.isFinite(s.miterLimit) ? { miterLimit: Math.max(1, s.miterLimit as number) } : {}),
     ...(validPaint ? { paint } : {}),
     // Taper and Wave, OMITTED when absent for exactly the reason `dashOffset`
     // is: `contentHash` serialises the whole stroke as the raster cache key, so

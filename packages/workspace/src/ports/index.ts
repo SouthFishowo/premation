@@ -223,6 +223,10 @@ export interface OverlayGuide {
   /** Screen-pixel position along the perpendicular axis. */
   position: number;
   locked: boolean;
+  /** The engine guide id (lets the host open the right guide's editor). */
+  id?: string;
+  /** Per-guide stroke colour; absent = the host's default guide colour. */
+  color?: string;
 }
 
 export interface SnapLine {

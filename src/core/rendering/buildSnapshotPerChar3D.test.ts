@@ -111,12 +111,16 @@ describe('buildSnapshot — per-character 3D text', () => {
     expect(g.getNode('t::ch0')).toBeFalsy();
   });
 
-  it('a per-character 3D layer still extrudes each glyph when depth > 0', () => {
+  it('a per-character 3D layer extrudes each glyph as its OWN solid when depth > 0', () => {
     const g = new SceneGraph();
     g.addNode(text3D('t', 'AB', { perChar3D: true, extrusionDepth: 60 }));
     const s = snap(g);
-    // Glyph planes exist AND extrusion slices were synthesized for the layer.
-    expect(glyphLayers(s, 't').length).toBe(2);
-    expect(s.layers.some((l) => l.id.startsWith('t::ext-'))).toBe(true);
+    // Glyph planes exist AND each carries its own body mesh (AE 26: one solid
+    // per character, so an animator moving a glyph keeps its front attached).
+    // Detailed pins live in buildSnapshotPerGlyphExtrusion.test.ts.
+    expect(s.layers.filter((l) => /^t::ch\d+$/.test(l.id))).toHaveLength(2);
+    expect(s.layers.filter((l) => /^t::ch\d+::ext-mesh$/.test(l.id))).toHaveLength(2);
+    // The whole-string body those planes used to detach from is gone.
+    expect(s.layers.some((l) => l.id.startsWith('t::ext-'))).toBe(false);
   });
 });

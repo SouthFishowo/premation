@@ -70,6 +70,65 @@ export const textScenes: Scene[] = [
     // red rather than being quietly tolerated.
   }, 'expect-pass'),
 
+  scene('text-paragraph-box', 'Paragraph box text: fixed box clipping its overflow (top), centred and bottom-aligned in tall boxes.', (graph) => {
+    const box = (id: string, x: number, content: string, props: Record<string, unknown>) =>
+      node(id, {
+        kind: 'text',
+        position: { x, y: 100 },
+        components: [
+          {
+            id: `${id}_c`,
+            type: 'Text',
+            props: { content, fontSize: 20, opacity: 100, fontFamily: 'Arial', align: 'left', fill: '#f4f4f8', boxWidth: 140, ...props },
+          },
+        ],
+      });
+    // 6+ wrapped lines in a 72px box: only the lines that fully fit are drawn.
+    graph.addNode(box('clip', 80, 'Paragraph text wraps inside its box and lines that do not fit are clipped', { boxHeight: 72 }));
+    graph.addNode(box('mid', 240, 'Centred in a tall box', { boxHeight: 170, boxVerticalAlign: 'center', align: 'center', fill: '#5db4ff' }));
+    graph.addNode(box('low', 400, 'Bottom aligned', { boxHeight: 170, boxVerticalAlign: 'bottom', align: 'right', fill: '#ff5d73' }));
+  }),
+
+  scene('text-optical-kerning', 'Kerning Metrics (top) vs Optical (bottom): shape-based pair spacing tucks AV, To, Ly, Wa.', (graph) => {
+    const line = (id: string, y: number, kerningMode: 'metrics' | 'optical', fill: string) =>
+      node(id, {
+        kind: 'text',
+        position: { x: 240, y },
+        components: [
+          {
+            id: `${id}_c`,
+            type: 'Text',
+            props: { content: 'AVATAR To Ly Wave', fontSize: 40, opacity: 100, fontFamily: 'Arial', align: 'center', fill, kerningMode },
+          },
+        ],
+      });
+    graph.addNode(line('metrics', 62, 'metrics', '#f4f4f8'));
+    graph.addNode(line('optical', 138, 'optical', '#5db4ff'));
+  }),
+
+  scene('text-word-grouping-gradient', 'Word anchor grouping (each word turns about its own centre) + a linear gradient across the block.', (graph) => {
+    graph.addNode(
+      textNode('t', 'TWO WORDS', {
+        fontSize: 48,
+        anchorGrouping: 'word',
+        __animators: [
+          {
+            id: 'a1', basedOn: 'characters', shape: 'square', start: 0, end: 100, offset: 0,
+            x: 0, y: 0, scale: 100, rotation: 10, opacity: 100, tracking: 0, skew: 0, mode: 'range', wiggleFreq: 2,
+          },
+        ],
+      }),
+    );
+    graph.setFill('t', {
+      type: 'linear',
+      angle: 0,
+      stops: [
+        { id: 's0', offset: 0, color: '#ff5d73' },
+        { id: 's1', offset: 1, color: '#5db4ff' },
+      ],
+    });
+  }),
+
   scene('text-on-path', 'Text riding an ellipse mask path.', (graph) => {
     graph.addNode(textNode('t', 'ORBITING TEXT', { fontSize: 34 }));
     graph.setMask('t', { paths: [ellipseMask(360, 150)] });
@@ -80,4 +139,64 @@ export const textScenes: Scene[] = [
     // seam wired it matches the reference exactly, so it is GATED now: if the
     // forwarding regresses, this goes red instead of being quietly tolerated.
   }, 'expect-pass'),
+
+  // ── Non-Latin scripts (bundled Noto subsets, pinned in renderEntry) ──
+  // Strings are \u-escaped: bidi and CJK literals are invisible or ambiguous in
+  // an editor, and the escapes say exactly which characters the subsets hold.
+
+  scene('text-rtl-bidi', 'Right-to-left paragraph box: Arabic (joined) + Hebrew + Latin + digits + brackets, soft-wrapped, start (right) aligned.', (graph) => {
+    // مرحبا بالعالم (Premation 2026) שלום עולם 42!
+    const content = 'مرحبا بالعالم (Premation 2026) שלום עולם 42!';
+    graph.addNode(node('rtl', {
+      kind: 'text',
+      position: { x: 240, y: 100 },
+      components: [{
+        id: 'rtl_c',
+        type: 'Text',
+        props: { content, fontSize: 30, fontWeight: '400', opacity: 100, fontFamily: 'Arial', fill: '#f4f4f8', boxWidth: 300, direction: 'rtl' },
+      }],
+    }));
+  }),
+
+  scene('text-vertical-cjk', 'Vertical paragraph box: kinsoku (。 never starts a column), vertical 、。「」ー, auto tate-chu-yoko 2026, a sideways Latin word, justified columns.', (graph) => {
+    // 縦書きの組版。「かぎ括弧」、長音ラーメン2026年にPremationで組む
+    const content = '縦書きの組版。「かぎ括弧」、長音ラーメン'
+      + '2026年にPremationで組む';
+    graph.addNode(node('vert', {
+      kind: 'text',
+      position: { x: 240, y: 100 },
+      components: [{
+        id: 'vert_c',
+        type: 'Text',
+        props: {
+          content, fontSize: 24, fontWeight: '400', opacity: 100, fontFamily: 'Arial', fill: '#f4f4f8',
+          orientation: 'vertical', boxWidth: 320, boxHeight: 150, align: 'justify-left',
+          tateChuYokoAuto: true, tateChuYokoDigits: 4,
+        },
+      }],
+    }));
+  }),
+
+  scene('text-vertical-path', 'Vertical Japanese riding a curved (open) mask path.', (graph) => {
+    // 縦書きの道、ゆっくり進む。
+    const content = '縦書きの道、ゆっくり進む。';
+    graph.addNode(node('vpath', {
+      kind: 'text',
+      position: { x: 240, y: 100 },
+      components: [{
+        id: 'vpath_c',
+        type: 'Text',
+        props: { content, fontSize: 24, fontWeight: '400', opacity: 100, fontFamily: 'Arial', fill: '#f4f4f8', orientation: 'vertical' },
+      }],
+    }));
+    // A gentle arch, left to right (open: a path to ride, not a clip).
+    const pt = (x: number, y: number, inX: number, inY: number, outX: number, outY: number) => ({ x, y, inX, inY, outX, outY });
+    graph.setMask('vpath', {
+      paths: [{
+        id: 'arch', mode: 'none', closed: false, feather: 0, opacity: 1, expansion: 0, inverted: false,
+        points: [pt(-190, 40, -190, 40, -110, -70), pt(190, 40, 110, -70, 190, 40)],
+      }],
+    });
+    graph.setTextPath('vpath', { pathId: 'arch', firstMargin: 20, reversed: false, perpendicular: true });
+  }),
 ];

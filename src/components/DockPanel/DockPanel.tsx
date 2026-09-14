@@ -33,7 +33,7 @@
  * Reordering is still drag-and-drop along the rail.
  */
 
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode, type DragEvent } from 'react';
+import { createContext, useCallback, useContext, useMemo, useState, type ReactNode, type DragEvent } from 'react';
 import { useLayoutStore } from '@stores/layoutStore';
 import type { RegionId } from '@stores/layoutStore';
 import type { IconName } from '@components/Icon';
@@ -51,6 +51,9 @@ export interface DockPanelHeaderContextValue {
 }
 
 export const DockPanelHeaderContext = createContext<DockPanelHeaderContextValue | null>(null);
+
+/** One shared empty list, so "no custom rows" never changes identity. */
+const NO_ITEMS: DropdownItem[] = [];
 
 export function useDockPanelHeader(): DockPanelHeaderContextValue | null {
   return useContext(DockPanelHeaderContext);
@@ -136,18 +139,28 @@ export function DockPanel({
   const activeItem = allItems.find((i) => i.id === effectiveActiveId);
 
   const [headerActionsEl, setHeaderActionsEl] = useState<HTMLDivElement | null>(null);
-  const [customMenuItems, setCustomMenuItems] = useState<DropdownItem[]>([]);
+  // The active panel's own rows for the ⋯ menu, tagged with the panel that
+  // handed them over; rows whose owner is not the active panel are ignored. A
+  // tab switch therefore drops the old rows without a reset effect — and a
+  // reset effect cannot work here: a parent's effects run AFTER its children's
+  // on the same commit, so clearing on `effectiveActiveId` wiped the rows the
+  // newly mounted panel had just set.
+  const [customMenu, setCustomMenu] = useState<{ owner: string | undefined; items: DropdownItem[] }>(
+    { owner: undefined, items: NO_ITEMS },
+  );
+  const customMenuItems = customMenu.owner === effectiveActiveId ? customMenu.items : NO_ITEMS;
 
-  useEffect(() => {
-    setCustomMenuItems([]);
-  }, [effectiveActiveId]);
+  const setCustomMenuItems = useCallback(
+    (items: DropdownItem[]) => setCustomMenu({ owner: effectiveActiveId, items }),
+    [effectiveActiveId],
+  );
 
   const headerContextValue = useMemo(
     () => ({
       target: headerActionsEl,
       setCustomMenuItems,
     }),
-    [headerActionsEl],
+    [headerActionsEl, setCustomMenuItems],
   );
 
   const otherSide: RegionId = isLeft ? 'rightInspector' : 'leftSidebar';

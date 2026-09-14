@@ -27,11 +27,19 @@ describe('Animation menu keyframe assistants', () => {
     expect(providers).toContain(`asCommandId('${id}')`);
   });
 
-  it('Time-Reverse ships with the AE chord (Cmd/Ctrl+Alt+R)', () => {
+  it('Cmd/Ctrl+Alt+R is Time-Reverse LAYER (AE), and Time-Reverse Keyframes has no chord', () => {
+    // AE binds Ctrl+Alt+R to Layer ▸ Time ▸ Time-Reverse Layer; its keyframe
+    // assistant ships unbound. The chord used to sit on the keyframe one.
     const at = providers.indexOf(`asCommandId('animation.timeReverseKeyframes')`);
     expect(at).toBeGreaterThan(0);
     const next = providers.indexOf('asCommandId(', at + 1);
     const block = providers.slice(at, next < 0 ? providers.length : next);
-    expect(block).toMatch(/shortcut:\s*\{\s*key:\s*'r',\s*meta:\s*true,\s*alt:\s*true/);
+    expect(block).not.toMatch(/shortcut:/);
+
+    const time = readSource('core/animation/layerTimeCommands.ts');
+    const layerAt = time.indexOf(`asCommandId('time.reverseLayer')`);
+    expect(layerAt).toBeGreaterThan(0);
+    const layerBlock = time.slice(layerAt, time.indexOf('asCommandId(', layerAt + 1));
+    expect(layerBlock).toMatch(/shortcut:\s*\{\s*key:\s*'r',\s*meta:\s*true,\s*alt:\s*true/);
   });
 });

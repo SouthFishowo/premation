@@ -88,8 +88,9 @@ describe('Unified Text Panel (Character + Paragraph)', () => {
     expect(screen.getByLabelText('Leading (Line Height)')).toHaveValue(1.3);
 
     // Verify character style buttons
-    expect(screen.getByRole('button', { name: 'Bold' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Italic' })).toBeInTheDocument();
+    // AE's synthetic styles — independent of the weight menu and the font's italic.
+    expect(screen.getByRole('button', { name: 'Faux Bold' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Faux Italic' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'All Caps' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Small Caps' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Superscript' })).toBeInTheDocument();

@@ -1,49 +1,60 @@
 /**
  * Installing the Object Matte model — the last mile of neural rotoscoping.
  *
- * Everything else has been in the tree since the tracking column shipped: the
- * segmenter (`samSegment.ts`), the ONNX wrapper (`samOnnxLoader.ts`),
- * `onnxruntime-web` in the dependency list, and a boot hook reading
- * `VITE_SAM_MODEL_URL`. What was missing was a MODEL — and a build-time
- * environment variable is not a way for a person to get one.
+ * A build already ships a working pair (`samBundled.ts`); this flow exists for
+ * the person who wants a DIFFERENT model — a bigger SAM export, a fine-tune —
+ * without waiting for a release. SAM-class checkpoints ship as an
+ * encoder/decoder pair (see `samPipeline.ts`), so that is what this installs:
+ * two ONNX files, cached together, registered together.
  *
  * ── Never automatic ────────────────────────────────────────────────────
  * The local edition's claim is that it does not reach the network unless you
  * ask it to, and that claim is worth more than the convenience of a silent
- * download. So nothing here runs on its own: a person types or accepts a URL
- * and presses a button, the host is stated before the request, and a build with
- * no cached model behaves exactly as it does today — clicks fall back to
- * classical GrabCut, which is a real matte and not an error state.
+ * download. So nothing here runs on its own: a person types or accepts URLs
+ * and presses a button, the hosts are stated before the request, and a build
+ * with nothing installed falls back to the bundled pair, then to classical
+ * GrabCut — a real matte, not an error state.
  *
- * Once installed the model is cached (`samModelCache.ts`) and restored at boot
+ * ── Who carries the bytes ──────────────────────────────────────────────
+ * In the desktop app the fetch itself runs in the MAIN process
+ * (`electron/modelDownload.ts`): the page CSP names no model host, and it must
+ * not start to — Hugging Face bounces `/resolve/` URLs through rotating CDN
+ * hostnames, so a `connect-src` allowlist would be wide AND stale. Outside
+ * Electron (a browser tab, a dev server) the renderer fetch remains, and works
+ * exactly where the page's own policy allows it to.
+ *
+ * Once installed the pair is cached (`samModelCache.ts`) and restored at boot
  * with no network at all.
  */
 
 import { create } from 'zustand';
 import { ModelCache, SAM_MODEL_KEY, type CachedModel } from './samModelCache';
-import { tryRegisterSamOnnxFromBytes, unregisterSamOnnx } from './samOnnxLoader';
+import { tryRegisterSamPipeline, unregisterSamOnnx } from './samOnnxLoader';
 
 /**
  * A suggested model, not a bundled one.
  *
- * Offered as a default in the field so the common case is one click, and
- * editable because the right model is a moving target and nobody should have to
- * wait for a release to try a better one. Any ONNX file whose first input takes
- * NCHW float RGB will load; see `wrapSession`.
+ * The same SlimSAM pair the app bundles — offered as the field default so the
+ * common case is one click, and editable because the right model is a moving
+ * target. Both halves of the transformers.js export layout are needed; a
+ * single-file URL cannot work, because no published SAM export answers
+ * "image in, mask out" in one session (see `samPipeline.ts`).
  */
 export const SUGGESTED_MODEL = {
-  label: 'MobileSAM (decoder, ONNX)',
-  url: 'https://huggingface.co/Xenova/slimsam-77-uniform/resolve/main/onnx/model_quantized.onnx',
-  approxBytes: 40 * 1024 * 1024,
+  label: 'SlimSAM-77 (encoder + decoder, ONNX)',
+  encoderUrl: 'https://huggingface.co/Xenova/slimsam-77-uniform/resolve/main/onnx/vision_encoder_quantized.onnx',
+  decoderUrl: 'https://huggingface.co/Xenova/slimsam-77-uniform/resolve/main/onnx/prompt_encoder_mask_decoder_quantized.onnx',
+  approxBytes: 14 * 1024 * 1024,
 } as const;
 
-/** The largest file this will accept, so a wrong URL cannot fill the disk. */
+/** The largest file this will accept, so a wrong URL cannot fill the disk.
+ *  The main-process downloader enforces the same cap on its side. */
 const MAX_MODEL_BYTES = 512 * 1024 * 1024;
 
 export type ModelStatus =
   | { kind: 'absent' }
   | { kind: 'downloading'; receivedBytes: number; totalBytes: number | null }
-  | { kind: 'ready'; sourceUrl: string; bytes: number; installedAt: number }
+  | { kind: 'ready'; sourceUrl: string; decoderUrl?: string; bytes: number; installedAt: number }
   /** The encoder/decoder pair that ships inside the app (samBundled.ts) is
    *  registered. Nothing was downloaded and there is nothing to remove —
    *  installing a custom model overrides it for the session. */
@@ -52,10 +63,10 @@ export type ModelStatus =
 
 interface SamModelState {
   status: ModelStatus;
-  /** Restore a cached model and register it. Safe to call repeatedly. */
+  /** Restore a cached pair and register it. Safe to call repeatedly. */
   restore: () => Promise<void>;
   /** Fetch, cache and register. Rejects nothing — the status carries failure. */
-  install: (url: string) => Promise<void>;
+  install: (encoderUrl: string, decoderUrl: string) => Promise<void>;
   /** Forget the cached model and unregister the session. */
   remove: () => Promise<void>;
   /** Abort a download in flight. */
@@ -128,12 +139,92 @@ export function looksLikeOnnx(bytes: Uint8Array): boolean {
   return bytes[0] === 0x08;
 }
 
+/** The main-process downloader, when the desktop bridge offers one. */
+interface DownloadBridge {
+  download: (request: { url: string; requestId: string }) => Promise<
+    { ok: true; bytes: Uint8Array } | { ok: false; message: string }
+  >;
+  cancelDownload: (requestId: string) => Promise<boolean>;
+  onDownloadProgress: (handler: (event: unknown) => void) => () => void;
+}
+
+function downloadBridge(): DownloadBridge | null {
+  const om = window.motionEditor?.objectMatte;
+  if (om?.download && om.cancelDownload && om.onDownloadProgress) return om as DownloadBridge;
+  return null;
+}
+
+/**
+ * Fetch one model file, preferring the main-process downloader.
+ *
+ * Same contract either way: bytes on success, a thrown Error naming what went
+ * wrong, an AbortError when `signal` fired, and progress along the way. The
+ * bridge path exists because the page CSP blocks model hosts (see module doc);
+ * the fetch path keeps a plain browser tab working where its policy allows.
+ */
+async function fetchModelBytes(
+  url: string,
+  signal: AbortSignal,
+  onProgress: (received: number, total: number | null) => void,
+): Promise<Uint8Array> {
+  const bridge = downloadBridge();
+  if (!bridge) {
+    const response = await fetch(url, { signal, redirect: 'follow' });
+    if (!response.ok) {
+      throw new Error(`The host answered ${response.status} ${response.statusText || ''}`.trim());
+    }
+    return readWithProgress(response, onProgress, signal);
+  }
+
+  const requestId =
+    typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID()
+      : Math.random().toString(36).slice(2);
+  const unsubscribe = bridge.onDownloadProgress((event) => {
+    const p = event as { requestId?: unknown; receivedBytes?: unknown; totalBytes?: unknown };
+    if (p?.requestId !== requestId || typeof p.receivedBytes !== 'number') return;
+    onProgress(p.receivedBytes, typeof p.totalBytes === 'number' ? p.totalBytes : null);
+  });
+  // Main owns the fetch, so Cancel must cross the bridge to reach it.
+  const onAbort = (): void => void bridge.cancelDownload(requestId);
+  signal.addEventListener('abort', onAbort);
+  try {
+    const result = await bridge.download({ url, requestId });
+    if (signal.aborted) throw new DOMException('Download cancelled', 'AbortError');
+    if (!result?.ok) throw new Error(result?.message || 'The download failed.');
+    // Structured clone can deliver a Buffer-backed view; normalise.
+    return new Uint8Array(result.bytes);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+    unsubscribe();
+  }
+}
+
 const statusFor = (model: CachedModel): ModelStatus => ({
   kind: 'ready',
   sourceUrl: model.sourceUrl,
+  ...(model.decoderUrl ? { decoderUrl: model.decoderUrl } : {}),
   bytes: model.bytes,
   installedAt: model.installedAt,
 });
+
+/** Both files must be https; the reason names which one is wrong. */
+function checkUrls(encoderUrl: string, decoderUrl: string): string | null {
+  for (const [label, value] of [['encoder', encoderUrl], ['decoder', decoderUrl]] as const) {
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      return `The ${label} URL is not a valid URL.`;
+    }
+    if (parsed.protocol !== 'https:') {
+      // Plain HTTP would let anything on the path substitute the model that is
+      // about to be run on the user's footage.
+      return `Only https:// model URLs are accepted (the ${label} URL is not).`;
+    }
+  }
+  return null;
+}
 
 export const useSamModelStore = create<SamModelState>((set) => ({
   status: { kind: 'absent' },
@@ -141,32 +232,44 @@ export const useSamModelStore = create<SamModelState>((set) => ({
   async restore() {
     const cached = await ModelCache.get();
     if (!cached) return;
-    const bytes = new Uint8Array(await cached.data.arrayBuffer());
-    const result = await tryRegisterSamOnnxFromBytes(bytes);
+    if (!cached.decoderData) {
+      // A record from before the install flow spoke the real SAM protocol: one
+      // file, loadable only by the legacy naive wrapper, which no published SAM
+      // export answers. Registering it would look like success while every
+      // click fell through — worse, it would take precedence over the bundled
+      // pair that actually works. Reported, not deleted: discarding someone's
+      // download is not this module's decision to make.
+      set({
+        status: {
+          kind: 'failed',
+          message:
+            'The installed model is a single file from an earlier version, which the segmenter '
+            + 'no longer uses. Install again to fetch an encoder/decoder pair.',
+        },
+      });
+      return;
+    }
+    const [encoder, decoder] = await Promise.all([
+      cached.data.arrayBuffer().then((b) => new Uint8Array(b)),
+      cached.decoderData.arrayBuffer().then((b) => new Uint8Array(b)),
+    ]);
+    const result = await tryRegisterSamPipeline(encoder, decoder);
     if (result.status === 'ok') {
       set({ status: statusFor(cached) });
       return;
     }
     // Cached but unusable — a runtime that is no longer installed, or a model
-    // this build cannot read. Reported rather than silently discarded: deleting
-    // someone's 40 MB download because it did not load today is not this
-    // module's decision to make.
+    // this build cannot read. Reported rather than silently discarded, for the
+    // same reason as above.
     set({ status: { kind: 'failed', message: result.reason } });
   },
 
-  async install(url) {
-    const trimmed = url.trim();
-    let parsed: URL;
-    try {
-      parsed = new URL(trimmed);
-    } catch {
-      set({ status: { kind: 'failed', message: 'That is not a valid URL.' } });
-      return;
-    }
-    if (parsed.protocol !== 'https:') {
-      // Plain HTTP would let anything on the path substitute the model that is
-      // about to be run on the user's footage.
-      set({ status: { kind: 'failed', message: 'Only https:// model URLs are accepted.' } });
+  async install(encoderUrl, decoderUrl) {
+    const encTrimmed = encoderUrl.trim();
+    const decTrimmed = decoderUrl.trim();
+    const refusal = checkUrls(encTrimmed, decTrimmed);
+    if (refusal) {
+      set({ status: { kind: 'failed', message: refusal } });
       return;
     }
 
@@ -176,37 +279,63 @@ export const useSamModelStore = create<SamModelState>((set) => ({
     set({ status: { kind: 'downloading', receivedBytes: 0, totalBytes: null } });
 
     try {
-      const response = await fetch(trimmed, { signal: controller.signal, redirect: 'follow' });
-      if (!response.ok) {
-        throw new Error(`The host answered ${response.status} ${response.statusText || ''}`.trim());
-      }
-      const bytes = await readWithProgress(
-        response,
-        (receivedBytes, totalBytes) => set({ status: { kind: 'downloading', receivedBytes, totalBytes } }),
-        controller.signal,
-      );
+      // One progress envelope across both files. The combined total is only
+      // claimed once both are known — a percentage over half the bytes would
+      // be a lie, so until then the UI shows megabytes received.
+      let encReceived = 0;
+      let encTotal: number | null = null;
+      let decReceived = 0;
+      let decTotal: number | null = null;
+      const report = (): void =>
+        set({
+          status: {
+            kind: 'downloading',
+            receivedBytes: encReceived + decReceived,
+            totalBytes: encTotal !== null && decTotal !== null ? encTotal + decTotal : null,
+          },
+        });
 
-      if (!looksLikeOnnx(bytes)) {
-        throw new Error('That URL did not return an ONNX model — check it points at the .onnx file itself.');
+      const encoder = await fetchModelBytes(encTrimmed, controller.signal, (received, total) => {
+        encReceived = received;
+        encTotal = total;
+        report();
+      });
+      encReceived = encoder.byteLength;
+      encTotal = encoder.byteLength;
+      const decoder = await fetchModelBytes(decTrimmed, controller.signal, (received, total) => {
+        decReceived = received;
+        decTotal = total;
+        report();
+      });
+
+      if (!looksLikeOnnx(encoder)) {
+        throw new Error('The encoder URL did not return an ONNX model — check it points at the .onnx file itself.');
+      }
+      if (!looksLikeOnnx(decoder)) {
+        throw new Error('The decoder URL did not return an ONNX model — check it points at the .onnx file itself.');
       }
 
-      const registered = await tryRegisterSamOnnxFromBytes(bytes);
+      const registered = await tryRegisterSamPipeline(encoder, decoder);
       if (registered.status !== 'ok') {
         // NOT cached on failure. Keeping bytes that cannot be loaded would give
-        // every future boot a "failed" state to report over a file nothing can
+        // every future boot a "failed" state to report over files nothing can
         // use, which is worse than having to download again.
         throw new Error(registered.reason);
       }
 
+      // Copied into fresh ArrayBuffers: a Uint8Array can be backed by a
+      // SharedArrayBuffer, which Blob does not accept, and the copy is also
+      // what detaches the cached bytes from the download buffers.
+      const asBlob = (bytes: Uint8Array): Blob =>
+        new Blob([new Uint8Array(bytes).buffer as ArrayBuffer], { type: 'application/octet-stream' });
       const model: CachedModel = {
         id: SAM_MODEL_KEY,
-        // Copied into a fresh ArrayBuffer: a Uint8Array can be backed by a
-        // SharedArrayBuffer, which Blob does not accept, and the copy is also
-        // what detaches the cached bytes from the download buffer.
-        data: new Blob([new Uint8Array(bytes).buffer as ArrayBuffer], { type: 'application/octet-stream' }),
-        sourceUrl: trimmed,
+        data: asBlob(encoder),
+        sourceUrl: encTrimmed,
+        decoderData: asBlob(decoder),
+        decoderUrl: decTrimmed,
         installedAt: Date.now(),
-        bytes: bytes.byteLength,
+        bytes: encoder.byteLength + decoder.byteLength,
       };
       await ModelCache.put(model);
       set({ status: statusFor(model) });

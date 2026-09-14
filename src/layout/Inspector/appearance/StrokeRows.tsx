@@ -228,6 +228,24 @@ export function StrokeRows({ nodeId }: { nodeId: string }): JSX.Element | null {
                   </select>
                 </div>
 
+                {/* Miter limit only means something on a miter join — shown
+                    unconditionally it would be a control that provably does
+                    nothing, the same rule the Dash Offset row follows. 4 is the
+                    Canvas2D default the rasterizer has always run with. */}
+                {(stroke?.join ?? 'miter') === 'miter' && (
+                  <div className={styles.popoverRow}>
+                    <span className={styles.popoverLabel}>Miter Limit</span>
+                    <ValueField
+                      value={stroke?.miterLimit ?? 4}
+                      min={1}
+                      step={0.5}
+                      precision={1}
+                      onChange={(v) => updateNodeStroke(nodeId, { miterLimit: Number(v) })}
+                      aria-label="Miter limit"
+                    />
+                  </div>
+                )}
+
                 <div className={styles.popoverRow}>
                   <span className={styles.popoverLabel}>Dash</span>
                   <input

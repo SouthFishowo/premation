@@ -28,6 +28,7 @@ import {
   type PathOpParam,
 } from '@core/scene/pathOps';
 import type { RepeaterComposite } from '@core/scene/repeater';
+import type { OffsetLineJoin } from '@core/scene/pathOps';
 import styles from './TextAnimatorControls.module.css';
 import { AnimToggle } from './AnimToggle';
 import { InspectorSection } from './InspectorSection';
@@ -64,6 +65,14 @@ const TYPES: { id: PathOpType; label: string }[] = [
 const COMPOSITE: { id: RepeaterComposite; label: string }[] = [
   { id: 'above', label: 'Above' },
   { id: 'below', label: 'Below' },
+];
+
+/** Offset Paths' corner treatment — AE's Line Join. Discrete, like Composite:
+ *  interpolating a join style has no meaning between the stops. */
+const LINE_JOINS: { id: OffsetLineJoin; label: string }[] = [
+  { id: 'miter', label: 'Miter' },
+  { id: 'round', label: 'Round' },
+  { id: 'bevel', label: 'Bevel' },
 ];
 
 /** AE's "Trim Multiple Shapes". `simultaneously` is AE's default and what a
@@ -253,6 +262,29 @@ function PathOpCard({
               label: c.label,
               icon: (op.composite ?? 'above') === c.id ? 'check' : undefined,
               onSelect: () => updatePathOp(nodeId, op.id, { composite: c.id }),
+            }))}
+          />
+        </div>
+      )}
+      {/* Offset Paths' one discrete parameter — a picker without a stopwatch,
+          exactly as Composite is for the Repeater. */}
+      {op.type === 'offset' && (
+        <div className={styles.selectorRow}>
+          <span className={styles.paramLabel}>Line Join</span>
+          <Dropdown
+            placement="left-start"
+            trigger={
+              <button type="button" className={styles.pick}>
+                <span>{LINE_JOINS.find((j) => j.id === (op.lineJoin ?? 'miter'))?.label ?? 'Miter'}</span>
+                <Icon name="chevron-down" size="sm" />
+              </button>
+            }
+            items={LINE_JOINS.map((j) => ({
+              type: 'item' as const,
+              id: j.id,
+              label: j.label,
+              icon: (op.lineJoin ?? 'miter') === j.id ? 'check' : undefined,
+              onSelect: () => updatePathOp(nodeId, op.id, { lineJoin: j.id }),
             }))}
           />
         </div>

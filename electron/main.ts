@@ -11,6 +11,7 @@ import { registerThumbIpc } from './thumbCache';
 import { registerRevealIpc } from './ipc/reveal';
 import { registerAiKeyIpc } from './aiKeyVault';
 import { registerAiProxyIpc, abortAllStreams } from './aiProxy';
+import { registerModelDownloadIpc, abortAllModelDownloads } from './modelDownload';
 import { registerMediaKeyIpc } from './mediaKeyVault';
 import { registerAiMediaProxyIpc } from './aiMediaProxy';
 import { registerApiProxyIpc, abortAllApiStreams } from './apiProxy';
@@ -1582,6 +1583,10 @@ app.whenReady().then(() => {
   // Bundled neural segmentation model — read-only, allowlisted, no gate: the
   // files ship in every edition and reading our own bundle spends nothing.
   registerObjectMatteIpc();
+  // The custom-model download (Settings ▸ Object Matte ▸ Install). In main
+  // because the page CSP names no model host — see electron/modelDownload.ts.
+  // Ungated: it attaches no credential and runs only on an explicit press.
+  registerModelDownloadIpc();
   // A plugin's outbound requests. Here rather than in the renderer because the
   // app shell's `connect-src` does not name a plugin's hosts, and widening it
   // to cover them would widen the whole renderer rather than the plugin.
@@ -1683,4 +1688,5 @@ app.on('before-quit', () => {
   // gone.
   abortAllStreams();
   abortAllApiStreams();
+  abortAllModelDownloads();
 });

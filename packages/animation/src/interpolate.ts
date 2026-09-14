@@ -136,13 +136,53 @@ export function sampleTrack(track: PropertyTrack, t: number): number | undefined
     (kind === 'bezier' || kind === 'autoBezier' || kind === 'continuousBezier') && a.bezier
       ? cubicBezierEase(a.bezier, local)
       : ease(kind, local);
-  if (a.so !== undefined || b.si !== undefined) {
+  // Spatial MODE (per keyframe): absent = the stored tangents as-is (legacy,
+  // and the fast path); `linear` ignores them; `auto` computes them from the
+  // neighbours so the curve stays smooth when a neighbour moves.
+  const so = a.spatialInterp === undefined ? a.so : effectiveSpatialTangents(kfs, i).so;
+  const si = b.spatialInterp === undefined ? b.si : effectiveSpatialTangents(kfs, i + 1).si;
+  if (so !== undefined || si !== undefined) {
     const third = (b.value - a.value) / 3; // linear default for the missing side
-    const c1 = a.value + (a.so ?? third);
-    const c2 = b.value + (b.si ?? -third);
+    const c1 = a.value + (so ?? third);
+    const c2 = b.value + (si ?? -third);
     return cubicValueAt(a.value, c1, c2, b.value, eased);
   }
   return a.value + (b.value - a.value) * eased;
+}
+
+/**
+ * The Auto-Bezier (Catmull-Rom) spatial tangents keyframe `i` would have: the
+ * slope is the chord through its neighbours (one-sided at the ends), and each
+ * side's offset is scaled by that side's segment duration ÷ 3. Ends get no
+ * tangent on their open side. Pure.
+ */
+export function autoSpatialTangents(kfs: readonly Keyframe[], i: number): { si?: number; so?: number } {
+  const k = kfs[i];
+  if (!k || kfs.length < 2) return {};
+  const prev = kfs[Math.max(0, i - 1)]!;
+  const next = kfs[Math.min(kfs.length - 1, i + 1)]!;
+  const dt = next.t - prev.t;
+  const m = dt > 0 ? (next.value - prev.value) / dt : 0;
+  const out: { si?: number; so?: number } = {};
+  if (i < kfs.length - 1) out.so = (m * (kfs[i + 1]!.t - k.t)) / 3;
+  if (i > 0) out.si = (-m * (k.t - kfs[i - 1]!.t)) / 3;
+  return out;
+}
+
+/**
+ * The spatial tangents keyframe `i` actually renders with, honouring its
+ * `spatialInterp` mode: `linear` → none, `auto` → computed, otherwise (and
+ * when absent) the stored `si`/`so`. Pure.
+ */
+export function effectiveSpatialTangents(kfs: readonly Keyframe[], i: number): { si?: number; so?: number } {
+  const k = kfs[i];
+  if (!k) return {};
+  if (k.spatialInterp === 'linear') return {};
+  if (k.spatialInterp === 'auto') return autoSpatialTangents(kfs, i);
+  const out: { si?: number; so?: number } = {};
+  if (k.si !== undefined) out.si = k.si;
+  if (k.so !== undefined) out.so = k.so;
+  return out;
 }
 
 /**
@@ -299,19 +339,16 @@ export function applyRovingSpatial(
 export function smoothTrackTangents(kfs: Keyframe[]): Keyframe[] {
   if (kfs.length < 2) return kfs.map((k) => ({ ...k }));
   const out = kfs.map((k) => ({ ...k }));
-  const slope = (i: number): number => {
-    const prev = out[Math.max(0, i - 1)]!;
-    const next = out[Math.min(out.length - 1, i + 1)]!;
-    const dt = next.t - prev.t;
-    return dt > 0 ? (next.value - prev.value) / dt : 0;
-  };
   for (let i = 0; i < out.length; i++) {
     const k = out[i]!;
-    const m = slope(i);
-    if (i < out.length - 1) k.so = (m * (out[i + 1]!.t - k.t)) / 3;
+    const auto = autoSpatialTangents(kfs, i);
+    if (auto.so !== undefined) k.so = auto.so;
     else delete k.so;
-    if (i > 0) k.si = (-m * (k.t - out[i - 1]!.t)) / 3;
+    if (auto.si !== undefined) k.si = auto.si;
     else delete k.si;
+    // Baked: a per-key mode (a `linear` corner) would otherwise override the
+    // tangents this just wrote.
+    delete k.spatialInterp;
   }
   return out;
 }
@@ -322,6 +359,9 @@ export function clearTrackTangents(kfs: Keyframe[]): Keyframe[] {
     const next = { ...k };
     delete next.si;
     delete next.so;
+    // An `auto` vertex computes tangents at sample time — straightening has to
+    // drop the mode too, or it would still curve.
+    delete next.spatialInterp;
     return next;
   });
 }

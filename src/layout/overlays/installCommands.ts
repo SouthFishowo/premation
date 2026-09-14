@@ -10,6 +10,9 @@ import { installHelpCommands } from '@layout/Help/helpCommands';
 import { maybeOpenWhatsNew } from '@layout/Help/WhatsNewDialog';
 import { installExportPanelCommands } from '@layout/Export/exportPanelCommands';
 import { registerPowerTourCommand } from '@stores/onboardingStore';
+import { installTextToolCommands } from '@layout/Text/textToolCommands';
+import { installTextCommands } from '@layout/Inspector/textCommands';
+import { installParagraphTextCommands } from '@layout/Inspector/paragraphTextCommands';
 
 let installed = false;
 
@@ -20,6 +23,10 @@ export function installOverlayCommands(): void {
     installHelpCommands();
     installExportPanelCommands();
     registerPowerTourCommand();
+    installTextToolCommands();
+    // Shift+X (Swap Fill and Stroke) must work before the Character panel mounts.
+    installTextCommands();
+    installParagraphTextCommands();
   } catch {
     /* a pre-boot route without a registry — the editor route installs later */
   }

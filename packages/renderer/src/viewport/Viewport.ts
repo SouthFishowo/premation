@@ -12,8 +12,17 @@ import { nextId } from '../utils/ids';
 
 export interface Guide {
   axis: 'x' | 'y';
-  /** Position in world units. */
+  /** Position in world units (already resolved from unit/edge by the host). */
   position: number;
+  /**
+   * AE 26.5 guide metadata. The renderer only draws `position`; `unit` and
+   * `edge` describe how the host re-resolves it on a comp resize and ride along
+   * so a viewport's overlay state round-trips without loss. Absent = px/start.
+   */
+  unit?: 'px' | '%';
+  edge?: 'start' | 'end';
+  /** Stroke colour; absent = the overlay pass's default guide colour. */
+  color?: Color;
 }
 
 export interface ViewportOverlays {

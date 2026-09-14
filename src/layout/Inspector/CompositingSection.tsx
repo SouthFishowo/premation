@@ -15,6 +15,10 @@ import { getNodeAdjustment, setNodeAdjustment } from '@core/effects/adjustment';
 import { getNodeMotionBlur, setNodeMotionBlur } from '@core/effects/motionBlur';
 import { enableLayerMotionBlurWithFeedback, disableLayerMotionBlur, setAdjustmentWithFeedback } from '@core/effects/layerSwitchFeedback';
 import { getNodeLayerTime, updateNodeLayerTime, FRAME_BLENDS } from '@core/scene/layerTime';
+import { applyTimeStretch, isRetimableLayer, stretchValueOf } from '@core/animation/layerTimeCommands';
+import { getNodeQuality, setNodeQuality, type LayerQuality } from '@core/effects/layerQuality';
+import { runDocumentEdit } from '@core/commands/documentEdit';
+import { Segmented } from '@components/Segmented';
 import { createIdMatteLayer, cryptomatteForNode } from '@core/media/cryptomatteCommands';
 import styles from './CompositingSection.module.css';
 
@@ -213,6 +217,31 @@ export function CompositingSection({ nodeId }: { nodeId: string }): JSX.Element 
           />
         </div>
 
+        {/* AE's three-position Quality switch — the same value (and undo step)
+            as the timeline's Quality switch. Wireframe is viewport-only: the
+            layer exports as Best. */}
+        {!isRoot && (
+          <div className={styles.row}>
+            <span
+              className={styles.label}
+              title="Draft: nearest-neighbour sampling. Wireframe: the viewport shows only the layer outline (exports as Best)."
+            >
+              Quality
+            </span>
+            <Segmented<LayerQuality>
+              size="sm"
+              value={getNodeQuality(nodeId)}
+              onChange={(q) => runDocumentEdit(q === 'best' ? 'Best Quality' : q === 'draft' ? 'Draft Quality' : 'Wireframe Quality', () => setNodeQuality(nodeId, q))}
+              options={[
+                { value: 'best', label: 'Best' },
+                { value: 'draft', label: 'Draft' },
+                { value: 'wireframe', label: 'Wireframe' },
+              ]}
+              aria-label="Layer quality"
+            />
+          </div>
+        )}
+
         <div className={styles.row}>
           <span className={styles.label}>Motion Blur</span>
           <Switch
@@ -254,17 +283,43 @@ export function CompositingSection({ nodeId }: { nodeId: string }): JSX.Element 
       {/* -- Time & Playback -- */}
       <div className={styles.group}>
         <div className={styles.row}>
-          <span className={styles.label}>Time Stretch</span>
+          <span
+            className={styles.label}
+            title={isRetimableLayer(nodeId)
+              ? 'Playback speed of the source: 200 % plays at half speed'
+              : 'Stretches this layer’s bar, keyframes and markers about its in-point (negative reverses them). Applied on release.'}
+          >
+            Time Stretch
+          </span>
           <div style={{ width: 120 }}>
-            <ValueField
-              value={time.stretch}
-              min={1}
-              max={1000}
-              precision={0}
-              unit="%"
-              onChange={(v) => updateNodeLayerTime(nodeId, { stretch: v })}
-              aria-label="Time stretch"
-            />
+            {isRetimableLayer(nodeId) ? (
+              <ValueField
+                value={time.stretch}
+                min={1}
+                max={1000}
+                precision={0}
+                unit="%"
+                onChange={(v) => updateNodeLayerTime(nodeId, { stretch: v })}
+                aria-label="Time stretch"
+              />
+            ) : (
+              <ValueField
+                // The layer's stored, absolute stretch (e.g. 200 or −100).
+                value={stretchValueOf(nodeId)}
+                min={-1000}
+                max={1000}
+                precision={0}
+                unit="%"
+                // A bake per pointer move would compound; the scrub's final
+                // onChange (on release) is the one stretch, one undo step.
+                onScrub={() => undefined}
+                onChange={(v) => {
+                  const pct = Math.round(v);
+                  if (pct !== 100 && pct !== 0) void applyTimeStretch([nodeId], pct, 'in');
+                }}
+                aria-label="Time stretch"
+              />
+            )}
           </div>
         </div>
 
