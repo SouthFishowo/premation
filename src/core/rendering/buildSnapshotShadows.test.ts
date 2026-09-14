@@ -215,6 +215,80 @@ describe('projected cast shadows', () => {
       // emitted BEFORE the layer standing in front of it.
       expect(ids.indexOf('caster::shadow')).toBeLessThan(ids.indexOf('infront'));
     });
+
+    /**
+     * A shadow must never paint over the object that throws it.
+     *
+     * The shadows used to be APPENDED to the layer list and left to the depth
+     * sort below to place. That sort only reorders within runs bounded by
+     * order-dependent layers — 2D layers, adjustments, matte pairs — so a single
+     * 2D layer stacked above the caster stranded every shadow alone in the last
+     * run, painting over the caster, the receiver and everything else. Measured:
+     * the caster's own pixels came back 6 levels darker down its shadowed edge.
+     *
+     * They are spliced next to the geometry they belong between instead: after
+     * the receiver, before the caster. Both bounds matter — after the receiver
+     * so the surface cannot bury the shadow it caught, before the caster so the
+     * caster always wins where the two overlap.
+     */
+    it('lands between its receiver and its caster, across a 2D barrier', () => {
+      const g = scene(0);
+      // 2D (no z / rotationX / rotationY), stacked above the caster.
+      g.addNode(node('badge', 'shape', { x: 100, y: 100, width: 40, height: 40 }));
+      const s = buildSnapshot(g, new AnimationEngine(), 0, undefined, undefined, undefined, undefined, COMP as never);
+      const ids = s.layers.map((l) => l.id);
+      expect(ids.indexOf('badge')).toBeGreaterThanOrEqual(0);
+      expect(ids.indexOf('wall')).toBeLessThan(ids.indexOf('caster::shadow'));
+      expect(ids.indexOf('caster::shadow')).toBeLessThan(ids.indexOf('caster'));
+    });
+
+    it('keeps that placement for every light when two cast at once', () => {
+      const g = scene(0);
+      g.addNode(node('light2', 'light', { x: 100, y: 100, z: -600, intensity: 100, radius: 2000, castShadows: true }));
+      g.addNode(node('badge', 'shape', { x: 100, y: 100, width: 40, height: 40 }));
+      const s = buildSnapshot(g, new AnimationEngine(), 0, undefined, undefined, undefined, undefined, COMP as never);
+      const ids = s.layers.map((l) => l.id);
+      for (const id of ['caster::shadow', 'caster::shadow:1']) {
+        expect(ids.indexOf('wall')).toBeLessThan(ids.indexOf(id));
+        expect(ids.indexOf(id)).toBeLessThan(ids.indexOf('caster'));
+      }
+      // Emission order is preserved, so light 2's shadow stays above light 1's.
+      expect(ids.indexOf('caster::shadow')).toBeLessThan(ids.indexOf('caster::shadow:1'));
+    });
+
+    /**
+     * Throwing a shadow must not demote the lamp's own WASH.
+     *
+     * A light's wash is lifted out of the depth sort and put back at the slot the
+     * timeline gave it — counted as "how many layers precede the light". While
+     * shadows were appended to the END of the list, they were not counted, so a
+     * light that cast a shadow had its wash re-inserted one slot too LOW per
+     * shadow: the topmost light stopped brightening the very caster standing in
+     * front of it, and only when it cast. Splicing shadows into the stack counts
+     * them, which is what makes the lit and shadow-casting cases agree.
+     *
+     * This is what moved the `shadow-catcher` golden: its caster is now washed by
+     * the lamp it sits in front of, exactly as it already was with the lamp's
+     * shadows switched off.
+     */
+    it('leaves the light wash on the slot it holds when nothing casts', () => {
+      // The light is authored TOPMOST here, so its wash must end up above both
+      // the wall and the caster — and stay there once it starts casting.
+      const build = (casts: boolean): string[] => {
+        const g = new SceneGraph();
+        g.addNode(node('wall', 'shape', { x: 400, y: 300, z: 500, width: 900, height: 900, rotationX: 0, rotationY: 0 }));
+        g.addNode(node('caster', 'shape', { x: 200, y: 150, z: 0, rotationX: 0, rotationY: 0 }));
+        g.addNode(node('light', 'light', { x: 400, y: 100, z: -600, intensity: 100, radius: 2000, castShadows: casts }));
+        return buildSnapshot(g, new AnimationEngine(), 0, undefined, undefined, undefined, undefined, COMP as never)
+          .layers.map((l) => l.id);
+      };
+      const casting = build(true);
+      expect(casting).toContain('caster::shadow');
+      // Same sequence once the synthesized shadow is taken out: the shadow is the
+      // ONLY difference the lamp's switch may make to the stack.
+      expect(casting.filter((id) => !id.includes('::shadow'))).toEqual(build(false));
+      expect(casting.indexOf('light')).toBeGreaterThan(casting.indexOf('caster'));
+    });
   });
 
   it('projects one shadow per shadow-casting light', () => {
