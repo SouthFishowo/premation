@@ -1972,7 +1972,7 @@ export function buildSnapshot(
    * can only be projected onto receivers that exist — and the walk is the only
    * place a layer's resolved world z is known.
    */
-  const shadowReceivers: Array<{ z: number; depth: number }> = [];
+  const shadowReceivers: Array<{ z: number; depth: number; layer: RenderLayer }> = [];
   /**
    * Planes a BEAM can land on: 3D layers whose material accepts lights, recorded
    * as {z, depth} by the same walk that records shadow receivers.
@@ -1995,8 +1995,17 @@ export function buildSnapshot(
    *  of the caster's own colour bleeds into its shadow (0 = a black silhouette,
    *  1 = the caster's colour, which is how stained glass and gels read). */
   const shadowCasters: Array<{ layer: RenderLayer; z: number; transmission: number; world3d: readonly number[] }> = [];
-  /** The projected shadow quads, appended once the walk has placed everything. */
-  const shadowLayers: RenderLayer[] = [];
+  /**
+   * The projected shadow quads, spliced into the stack once the walk has placed
+   * everything — each one next to the layers it belongs between, NOT appended.
+   *
+   * `caster` and `receiver` ride along for that splice: the 3D depth sort can
+   * only reorder within a run bounded by order-dependent layers, so a shadow
+   * parked at the END of the list is stuck there whenever any 2D layer,
+   * adjustment or matte sits above the caster — and paints over the very object
+   * that threw it.
+   */
+  const shadowLayers: Array<{ layer: RenderLayer; caster: RenderLayer; receiver: RenderLayer }> = [];
   /**
    * A shadow's colour: black lerped toward the caster's own fill by Light
    * Transmission (0..1). Non-hex or missing fills fall back to black, which is
@@ -4002,7 +4011,7 @@ export function buildSnapshot(
           if (castFx) gpuFx.push(castFx);
         }
       }
-      if (is3D && mat.acceptsShadows) shadowReceivers.push({ z: z3, depth });
+      if (is3D && mat.acceptsShadows) shadowReceivers.push({ z: z3, depth, layer });
       /*
         The same two switches, carried to the GPU shadow-map path.
 
@@ -5285,7 +5294,7 @@ export function buildSnapshot(
         const FY = project(Matrix4Math.transformPoint(M, { x: 0, y: 1, z: 0 }));
         const sm = [FX.x - O.x, FX.y - O.y, FY.x - O.x, FY.y - O.y, O.x, O.y] as const;
 
-        shadowLayers.push({
+        const shadow: RenderLayer = {
           ...src,
           id: lightIndex === 0 ? `${src.id}::shadow` : `${src.id}::shadow:${lightIndex}`,
           // The caster may be hidden (`Casts Shadows: Only`) — its SHADOW is
@@ -5331,12 +5340,47 @@ export function buildSnapshot(
           isAdjustment: undefined,
           motionSamples: undefined,
           frameBlend: undefined,
-        } as RenderLayer);
+        } as RenderLayer;
+        shadowLayers.push({ layer: shadow, caster: src, receiver: receiver.layer });
       }
       lightIndex++;
     }
   }
-  if (shadowLayers.length > 0) layers.push(...shadowLayers);
+  /*
+    Put every shadow where it BELONGS in the stack rather than on the end of it.
+
+    Appending was fine only while the depth sort below could be trusted to move
+    them, and it cannot: it sorts within runs bounded by order-dependent layers
+    (2D layers, adjustments, matte pairs), so one 2D layer stacked above the
+    caster left the shadow alone in the final run — painting last, over the
+    caster, the receiver, and everything else. A shadow drawn on top of the
+    object throwing it is the one arrangement that is always wrong.
+
+    Where the receiver already precedes the caster, the slot just after it is
+    exact: above the surface the shadow lands on, below the object that casts it,
+    which is what the depth sort would produce anyway when nothing splits them.
+    Otherwise fall back to "immediately before the caster" — the guarantee worth
+    keeping when the stack is already telling a different story.
+
+    Back-to-front so the earlier indices this loop reads stay valid, and so two
+    lights' shadows of one caster keep their emission order. A caster whose
+    `layer` never reached this list (an extrusion clones it) has no anchor: it
+    appends, exactly as before.
+
+    Being IN the stack also fixes a second-order bug: the light-wash parking
+    below records a wash's slot as "how many layers precede the lamp", and an
+    appended shadow was not one of them. A lamp that cast therefore had its wash
+    re-inserted one slot too low per shadow and stopped washing the caster
+    standing in front of it — while the same lamp with shadows off washed it.
+    That asymmetry is what moved the `shadow-catcher` reference.
+  */
+  for (let i = shadowLayers.length - 1; i >= 0; i--) {
+    const { layer: shadow, caster, receiver } = shadowLayers[i]!;
+    const ci = layers.indexOf(caster);
+    if (ci < 0) { layers.push(shadow); continue; }
+    const ri = layers.indexOf(receiver);
+    layers.splice(ri >= 0 && ri < ci ? ri + 1 : ci, 0, shadow);
+  }
 
   // 3D depth sort (painter's order: farthest first), applied WITHIN runs bounded
   // by order-dependent layers rather than abandoned when any exists.
