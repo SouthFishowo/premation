@@ -220,6 +220,12 @@ jobs:
 
       - name: Build renderer and main process
         shell: bash
+        env:
+          # Rollup's chunk graph for the renderer outgrew Node's default heap
+          # on the macOS arm64 runner (v0.8.3 died at "Reached heap limit").
+          # 6 GB fits every hosted runner this job uses; harmless where the
+          # default already sufficed.
+          NODE_OPTIONS: --max-old-space-size=6144
         run: |
           if [ -n "${{ vars.VITE_BACKEND_ORIGIN }}" ]; then export VITE_BACKEND_ORIGIN="${{ vars.VITE_BACKEND_ORIGIN }}"; fi
           if [ -n "${{ vars.VITE_MEDIA_ORIGINS }}" ]; then export VITE_MEDIA_ORIGINS="${{ vars.VITE_MEDIA_ORIGINS }}"; fi
