@@ -26,8 +26,18 @@ function textNode(id: string, content: string, extraTextProps: Record<string, un
   });
 }
 
-function scene(id: string, description: string, build: Scene['build'], gpuParity: Scene['gpuParity'] = 'expect-pass'): Scene {
-  return defineScene({ id, description, size: SIZE, comp: COMP, fps: 30, frames: [0], gpuParity, build });
+function scene(
+  id: string,
+  description: string,
+  build: Scene['build'],
+  gpuParity: Scene['gpuParity'] = 'expect-pass',
+  /** Per-scene diff tolerance when the 0.5% default is too tight (see effects.ts). */
+  tolerance?: number,
+): Scene {
+  return defineScene({
+    id, description, size: SIZE, comp: COMP, fps: 30, frames: [0], gpuParity, build,
+    ...(tolerance !== undefined ? { tolerance } : {}),
+  });
 }
 
 export const textScenes: Scene[] = [
@@ -87,7 +97,10 @@ export const textScenes: Scene[] = [
     graph.addNode(box('clip', 80, 'Paragraph text wraps inside its box and lines that do not fit are clipped', { boxHeight: 72 }));
     graph.addNode(box('mid', 240, 'Centred in a tall box', { boxHeight: 170, boxVerticalAlign: 'center', align: 'center', fill: '#5db4ff' }));
     graph.addNode(box('low', 400, 'Bottom aligned', { boxHeight: 170, boxVerticalAlign: 'bottom', align: 'right', fill: '#ff5d73' }));
-  }),
+    // Tolerance: dense text is all edge pixels, and glyph AA differs between
+    // the hardware adapter the reference was blessed on and CI's SwiftShader —
+    // measured 0.574% on CI vs the 0.5% default gate (v0.8.3).
+  }, 'expect-pass', 0.009),
 
   scene('text-optical-kerning', 'Kerning Metrics (top) vs Optical (bottom): shape-based pair spacing tucks AV, To, Ly, Wa.', (graph) => {
     const line = (id: string, y: number, kerningMode: 'metrics' | 'optical', fill: string) =>
@@ -175,7 +188,9 @@ export const textScenes: Scene[] = [
         },
       }],
     }));
-  }),
+    // Tolerance: same cross-adapter glyph-AA drift as text-paragraph-box, and
+    // worst here — vertical CJK is the densest ink of the suite; 0.897% on CI.
+  }, 'expect-pass', 0.013),
 
   scene('text-vertical-path', 'Vertical Japanese riding a curved (open) mask path.', (graph) => {
     // 縦書きの道、ゆっくり進む。
@@ -198,5 +213,7 @@ export const textScenes: Scene[] = [
       }],
     });
     graph.setTextPath('vpath', { pathId: 'arch', firstMargin: 20, reversed: false, perpendicular: true });
-  }),
+    // Tolerance: cross-adapter glyph-AA drift (see text-paragraph-box); every
+    // glyph here is also rotated along the arch — 0.592% on CI.
+  }, 'expect-pass', 0.009),
 ];
