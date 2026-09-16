@@ -130,7 +130,7 @@ describe('installing brings a declared module up', () => {
   it('stages an archive\'s binary first, and loads the staged name', async () => {
     const bytes = new Uint8Array([1, 2, 3, 4]);
     // Consent is pinned to the bytes, so it has to be pinned to THESE.
-    const digest = await crypto.subtle.digest('SHA-256', bytes.slice().buffer as ArrayBuffer);
+    const digest = await webcrypto.subtle.digest('SHA-256', Buffer.from(bytes));
     const sha = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
     resetNativeConsentForTests();
     const { recordNativeConsent } = await import('./native/nativeTrust');
