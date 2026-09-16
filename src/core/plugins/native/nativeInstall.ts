@@ -185,9 +185,8 @@ export async function sweepStagedNative(installedIds: readonly string[]): Promis
 export async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const subtle = globalThis.crypto?.subtle;
   if (!subtle) return '';
-  // Copied into a fresh buffer: `digest` wants an ArrayBuffer, and a view into
-  // a larger one would hash the whole of it.
-  const copy = bytes.slice();
-  const digest = await subtle.digest('SHA-256', copy.buffer as ArrayBuffer);
+  // The view itself, not `.buffer`: a view into a larger buffer would hash the
+  // whole of it, and Node 20's jsdom rejects a cross-realm ArrayBuffer.
+  const digest = await subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>);
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
