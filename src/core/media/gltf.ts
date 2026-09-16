@@ -366,11 +366,19 @@ export function parseGltf(data: ArrayBuffer): ParsedGltf {
 
 interface GltfJson {
   asset?: { version?: string };
+  /** Extensions a loader MUST understand to read the file correctly. */
+  extensionsRequired?: string[];
   buffers?: { byteLength: number; uri?: string }[];
   bufferViews?: { buffer: number; byteOffset?: number; byteLength: number; byteStride?: number }[];
   accessors?: {
     bufferView?: number; byteOffset?: number; componentType: number; normalized?: boolean;
     count: number; type: string;
+    /** Values that override the base (or all-zero) array at the listed indices. */
+    sparse?: {
+      count: number;
+      indices: { bufferView: number; byteOffset?: number; componentType: number };
+      values: { bufferView: number; byteOffset?: number };
+    };
   }[];
   images?: { uri?: string; mimeType?: string; bufferView?: number; name?: string }[];
   textures?: { source?: number }[];
@@ -476,7 +484,31 @@ function decodeDataUri(uri: string): Uint8Array {
   return new TextEncoder().encode(decodeURIComponent(body));
 }
 
+/**
+ * Required extensions this reader decodes. Anything else in
+ * `extensionsRequired` changes how the bytes must be read — Draco and meshopt
+ * accessors have no plain bufferView, so they read as zeros (every triangle a
+ * point) and the import "succeeded" with nothing to draw.
+ */
+const SUPPORTED_REQUIRED_EXTENSIONS = new Set(['KHR_texture_transform', 'KHR_materials_emissive_strength']);
+
+const EXTENSION_HINTS: Record<string, string> = {
+  KHR_draco_mesh_compression: 'Draco-compressed',
+  EXT_meshopt_compression: 'meshopt-compressed',
+  KHR_meshopt_compression: 'meshopt-compressed',
+  KHR_mesh_quantization: 'quantized',
+  KHR_texture_basisu: 'KTX2/Basis-texture',
+};
+
 function parseJson(g: GltfJson, glbBin: Uint8Array | null): ParsedGltf {
+  const unsupported = (g.extensionsRequired ?? []).filter((e) => !SUPPORTED_REQUIRED_EXTENSIONS.has(e));
+  if (unsupported.length > 0) {
+    const kinds = unsupported.map((e) => EXTENSION_HINTS[e] ?? e).join(', ');
+    throw new Error(
+      `This model needs ${unsupported.join(', ')} (${kinds}), which is not supported yet. `
+      + 'Re-export it without compression (e.g. Blender ▸ glTF ▸ uncheck Compression).',
+    );
+  }
   // Buffers: GLB BIN chunk, or embedded data: URIs. External files refused.
   const buffers: Uint8Array[] = (g.buffers ?? []).map((b, i) => {
     if (b.uri === undefined) {
@@ -506,27 +538,55 @@ function parseJson(g: GltfJson, glbBin: Uint8Array | null): ParsedGltf {
     const compBytes = COMPONENT_BYTES[a.componentType];
     if (!comps || !compBytes) throw new Error(`accessor ${index}: unsupported type ${a.type}/${a.componentType}`);
     const out = new Float32Array(a.count * comps);
-    if (a.bufferView === undefined) return out; // spec: zeros
-    const { bytes, stride } = viewBytes(a.bufferView);
-    const elemBytes = comps * compBytes;
-    const step = stride && stride > 0 ? stride : elemBytes;
-    const base = (bytes.byteOffset ?? 0) + (a.byteOffset ?? 0);
-    const dv = new DataView(bytes.buffer, 0);
-    for (let e = 0; e < a.count; e++) {
-      const at = base + e * step;
-      for (let c = 0; c < comps; c++) {
-        const o = at + c * compBytes;
-        let v: number;
-        switch (a.componentType) {
-          case 5126: v = dv.getFloat32(o, true); break;
-          case 5125: v = dv.getUint32(o, true); break;
-          case 5123: v = dv.getUint16(o, true); if (a.normalized) v /= 65535; break;
-          case 5122: v = dv.getInt16(o, true); if (a.normalized) v = Math.max(v / 32767, -1); break;
-          case 5121: v = dv.getUint8(o); if (a.normalized) v /= 255; break;
-          case 5120: v = dv.getInt8(o); if (a.normalized) v = Math.max(v / 127, -1); break;
-          default: throw new Error(`accessor ${index}: componentType ${a.componentType}`);
+    const readComponent = (dv: DataView, o: number, componentType: number, normalized: boolean | undefined): number => {
+      switch (componentType) {
+        case 5126: return dv.getFloat32(o, true);
+        case 5125: return dv.getUint32(o, true);
+        case 5123: { const v = dv.getUint16(o, true); return normalized ? v / 65535 : v; }
+        case 5122: { const v = dv.getInt16(o, true); return normalized ? Math.max(v / 32767, -1) : v; }
+        case 5121: { const v = dv.getUint8(o); return normalized ? v / 255 : v; }
+        case 5120: { const v = dv.getInt8(o); return normalized ? Math.max(v / 127, -1) : v; }
+        default: throw new Error(`accessor ${index}: componentType ${componentType}`);
+      }
+    };
+    // No bufferView ⇒ the base is all zeros (spec) — typically a sparse morph
+    // target, whose real values follow below.
+    if (a.bufferView !== undefined) {
+      const { bytes, stride } = viewBytes(a.bufferView);
+      const elemBytes = comps * compBytes;
+      const step = stride && stride > 0 ? stride : elemBytes;
+      const base = (bytes.byteOffset ?? 0) + (a.byteOffset ?? 0);
+      const dv = new DataView(bytes.buffer, 0);
+      for (let e = 0; e < a.count; e++) {
+        const at = base + e * step;
+        for (let c = 0; c < comps; c++) {
+          out[e * comps + c] = readComponent(dv, at + c * compBytes, a.componentType, a.normalized);
         }
-        out[e * comps + c] = v;
+      }
+    }
+    /*
+      SPARSE substitution: `count` (index, value) pairs overwrite the base.
+      Blender writes morph targets this way whenever it is smaller, and
+      ignoring it left every blend shape reading as zeros — sliders that moved
+      nothing. Indices are tightly packed unsigned ints; values are elements of
+      the accessor's own type, tightly packed (sparse views have no stride).
+    */
+    if (a.sparse && a.sparse.count > 0) {
+      const sp = a.sparse;
+      const idxBytes = COMPONENT_BYTES[sp.indices.componentType];
+      if (!idxBytes) throw new Error(`accessor ${index}: sparse index type ${sp.indices.componentType}`);
+      const iv = viewBytes(sp.indices.bufferView).bytes;
+      const vv = viewBytes(sp.values.bufferView).bytes;
+      const idv = new DataView(iv.buffer, 0);
+      const vdv = new DataView(vv.buffer, 0);
+      const iBase = iv.byteOffset + (sp.indices.byteOffset ?? 0);
+      const vBase = vv.byteOffset + (sp.values.byteOffset ?? 0);
+      for (let s = 0; s < sp.count; s++) {
+        const target = readComponent(idv, iBase + s * idxBytes, sp.indices.componentType, false);
+        if (target < 0 || target >= a.count) continue;
+        for (let c = 0; c < comps; c++) {
+          out[target * comps + c] = readComponent(vdv, vBase + (s * comps + c) * compBytes, a.componentType, a.normalized);
+        }
       }
     }
     return out;

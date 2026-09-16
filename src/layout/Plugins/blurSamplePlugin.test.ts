@@ -13,7 +13,12 @@
  */
 
 import { parseManifest } from '@core/plugins/manifest';
-import { chainCost, MAX_PASS_COST, composeEffectShader } from '@core/plugins/effectSchema';
+import {
+  chainCost,
+  MAX_PASS_COST,
+  composeEffectShader,
+  UNIFORM_HEADER_BYTES,
+} from '@core/plugins/effectSchema';
 import { pluginEffectMaterial } from '@core/plugins/pluginEffectMaterial';
 import { registerEffects, effectById } from '@core/plugins/pluginEffects';
 import { readPluginZip } from '@core/plugins/pluginPackage';
@@ -171,9 +176,12 @@ describe('what the host will generate for it', () => {
     expect(v!.wgsl).toContain('0.0, params.texelSize.y');
   });
 
-  it('puts `radius` after the host pass block, at 96', () => {
+  it('puts `radius` after the host pass block', () => {
+    // Pinned to the constant, not to a literal: the host block has grown once
+    // already (96 -> 128 when the per-frame inputs landed), and a number here
+    // just fails the next time it grows without saying anything useful.
     const { layout } = composeEffectShader(effect(), 0);
-    expect(layout.layout).toEqual([{ name: 'radius', type: 'number', offset: 96 }]);
+    expect(layout.layout).toEqual([{ name: 'radius', type: 'number', offset: UNIFORM_HEADER_BYTES }]);
   });
 
   it('gives each pass the standard three bindings and no more', () => {

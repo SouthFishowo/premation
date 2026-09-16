@@ -106,9 +106,11 @@ describe('TextSpec → raster cache signature parity', () => {
     // +2 (2026-09-13): `fontAxes` (variable-font axes beyond wght/wdth/slnt)
     // and `fillPaint` (a gradient across the text block).
     // +1 (2026-09-13): `strokePaint` — a gradient on the text stroke.
+    // +1 (2026-09-15): `paint` — Brush / Eraser / Clone strokes drawn into the
+    // text raster (keyed by digest).
     // (RTL direction, vertical orientation and the auto-height box offset ride
     // inside `textExtras`, which is keyed whole.)
-    expect(fields.length).toBe(36);
+    expect(fields.length).toBe(37);
   });
 
   it.each(

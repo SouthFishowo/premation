@@ -1682,14 +1682,14 @@
       }
     },
     {
-      "name": "two layer parameters are refused",
+      "name": "a fifth layer parameter is refused",
       "valid": false,
       "manifest": {
         "id": "com.example.fx",
         "name": "FX",
         "version": "1.0.0",
         "description": "Draws pixels.",
-        "apiVersion": 4,
+        "apiVersion": 7,
         "main": "main.js",
         "contributes": {
           "effects": [
@@ -1703,8 +1703,146 @@
                 },
                 "b": {
                   "type": "layer"
+                },
+                "c": {
+                  "type": "layer"
+                },
+                "d": {
+                  "type": "layer"
+                },
+                "e": {
+                  "type": "layer"
                 }
               }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "four layer parameters are accepted",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "depth",
+              "label": "Depth",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {
+                "a": {
+                  "type": "layer"
+                },
+                "b": {
+                  "type": "layer"
+                },
+                "c": {
+                  "type": "layer"
+                },
+                "d": {
+                  "type": "layer"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a GLSL ES 3.0 kernel beside the WGSL one",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "glsl": "vec4 fs(vec2 uv) { return texture(src, uv); }",
+              "params": {}
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "an effect with no kernel at all is refused",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 4,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "params": {}
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a parameter colliding with a host-filled name is refused",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 4,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {
+                "time": {
+                  "type": "number",
+                  "default": 0
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "extended limits are refused for a package the installer did not vouch for",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "limits": "extended",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {}
             }
           ]
         }
@@ -2933,6 +3071,988 @@
               }
             }
           ]
+        }
+      }
+    },
+    {
+      "name": "a CPU kernel beside the WGSL one",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {},
+              "cpu": {
+                "module": "kernels/tint.wasm"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a \"cpu\" kernel is refused below apiVersion 7",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 6,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {},
+              "cpu": {
+                "module": "kernels/tint.wasm"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a \"glsl\" kernel is refused below apiVersion 7",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 6,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {},
+              "glsl": "vec4 fs(vec2 uv) { return texture(src, uv); }"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "per-side expand over a number parameter",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {
+                "radius": {
+                  "type": "number",
+                  "default": 8,
+                  "min": 0,
+                  "max": 64
+                }
+              },
+              "expand": {
+                "left": 0,
+                "top": 0,
+                "right": {
+                  "param": "radius",
+                  "factor": 2.5
+                },
+                "bottom": 4
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "\"expand\" is refused below apiVersion 7",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 6,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {
+                "radius": {
+                  "type": "number",
+                  "default": 8,
+                  "min": 0,
+                  "max": 64
+                }
+              },
+              "expand": {
+                "right": 4
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "identity rules over a number and a boolean parameter",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {
+                "amount": {
+                  "type": "number",
+                  "default": 0,
+                  "min": 0,
+                  "max": 100
+                },
+                "enabled": {
+                  "type": "boolean",
+                  "default": true
+                }
+              },
+              "identity": [
+                {
+                  "param": "amount",
+                  "equals": 0
+                },
+                {
+                  "param": "enabled",
+                  "equals": false
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "\"identity\" is refused below apiVersion 7",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 6,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {
+                "amount": {
+                  "type": "number",
+                  "default": 0
+                }
+              },
+              "identity": [
+                {
+                  "param": "amount",
+                  "equals": 0
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "an identity rule naming a parameter the effect does not declare is refused",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {
+                "amount": {
+                  "type": "number",
+                  "default": 0
+                }
+              },
+              "identity": [
+                {
+                  "param": "strength",
+                  "equals": 0
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a thread-safety declaration on a kernel",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {},
+              "cpu": {
+                "module": "kernels/tint.js"
+              },
+              "threadSafety": "unsafe"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "\"threadSafety\" is refused below apiVersion 7",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 6,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {},
+              "threadSafety": "full"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a temporal window, with the kernel that receives it",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {},
+              "cpu": {
+                "module": "kernels/trail.wasm"
+              },
+              "frames": [
+                -2,
+                0
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "\"frames\" without a \"cpu\" kernel is refused",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {},
+              "frames": [
+                -1,
+                0
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a temporal window is refused below apiVersion 7",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 6,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {},
+              "cpu": {
+                "module": "kernels/trail.wasm"
+              },
+              "frames": [
+                -1,
+                0
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a second layer parameter is refused below apiVersion 7",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 6,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {
+                "a": {
+                  "type": "layer"
+                },
+                "b": {
+                  "type": "layer"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "one layer parameter is still accepted on the older grammar",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 4,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {
+                "depthMap": {
+                  "type": "layer"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "\"limits\" is refused below apiVersion 7",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.fx",
+        "name": "FX",
+        "version": "1.0.0",
+        "description": "Draws pixels.",
+        "apiVersion": 6,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "tint",
+              "label": "Tint",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {},
+              "limits": "standard"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a generator layer kind",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.kinds",
+        "name": "Kinds",
+        "version": "1.0.0",
+        "description": "Declares a layer kind.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "layerKinds": [
+            {
+              "id": "particles",
+              "label": "Particles",
+              "render": "generator",
+              "schemaVersion": 1,
+              "props": {
+                "count": {
+                  "type": "number",
+                  "default": 100,
+                  "min": 1,
+                  "max": 1000
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a generator layer kind is refused below apiVersion 6",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.kinds",
+        "name": "Kinds",
+        "version": "1.0.0",
+        "description": "Declares a layer kind.",
+        "apiVersion": 5,
+        "main": "main.js",
+        "contributes": {
+          "layerKinds": [
+            {
+              "id": "particles",
+              "label": "Particles",
+              "render": "generator",
+              "schemaVersion": 1,
+              "props": {
+                "count": {
+                  "type": "number",
+                  "default": 100,
+                  "min": 1,
+                  "max": 1000
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a shader kind naming one of this plugin s own effects",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.kinds",
+        "name": "Kinds",
+        "version": "1.0.0",
+        "description": "Declares a layer kind.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "plasma",
+              "label": "Plasma",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {}
+            }
+          ],
+          "layerKinds": [
+            {
+              "id": "plasmaLayer",
+              "label": "Plasma",
+              "render": "shader",
+              "shader": "plasma",
+              "schemaVersion": 1,
+              "props": {
+                "speed": {
+                  "type": "number",
+                  "default": 1,
+                  "min": 0,
+                  "max": 10
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a shader kind naming an effect this plugin does not declare is refused",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.kinds",
+        "name": "Kinds",
+        "version": "1.0.0",
+        "description": "Declares a layer kind.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "plasma",
+              "label": "Plasma",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {}
+            }
+          ],
+          "layerKinds": [
+            {
+              "id": "plasmaLayer",
+              "label": "Plasma",
+              "render": "shader",
+              "shader": "ripple",
+              "schemaVersion": 1,
+              "props": {
+                "speed": {
+                  "type": "number",
+                  "default": 1
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a \"shader\" name on a generator kind is refused",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.kinds",
+        "name": "Kinds",
+        "version": "1.0.0",
+        "description": "Declares a layer kind.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "effects": [
+            {
+              "id": "plasma",
+              "label": "Plasma",
+              "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }",
+              "params": {}
+            }
+          ],
+          "layerKinds": [
+            {
+              "id": "particles",
+              "label": "Particles",
+              "render": "generator",
+              "schemaVersion": 1,
+              "props": {
+                "count": {
+                  "type": "number",
+                  "default": 100,
+                  "min": 1,
+                  "max": 1000
+                }
+              },
+              "shader": "plasma"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "an inspector panel on somebody else s layer",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.ui",
+        "name": "UI",
+        "version": "1.0.0",
+        "description": "Adds controls.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "commands": [
+            {
+              "id": "reset",
+              "label": "Reset"
+            }
+          ],
+          "inspector": [
+            {
+              "id": "grade",
+              "title": "Grade",
+              "icon": "palette",
+              "appliesTo": [
+                "shape",
+                "text"
+              ],
+              "params": [
+                {
+                  "name": "exposure",
+                  "type": "slider",
+                  "label": "Exposure",
+                  "default": 0,
+                  "min": -4,
+                  "max": 4,
+                  "unit": "EV",
+                  "animatable": true
+                },
+                {
+                  "name": "look",
+                  "type": "enum",
+                  "default": "neutral",
+                  "options": [
+                    {
+                      "value": "neutral",
+                      "label": "Neutral"
+                    },
+                    {
+                      "value": "warm",
+                      "label": "Warm"
+                    }
+                  ]
+                },
+                {
+                  "name": "tint",
+                  "type": "color",
+                  "default": "#ffffffff",
+                  "alpha": true
+                },
+                {
+                  "name": "reset",
+                  "type": "button",
+                  "command": "reset"
+                },
+                {
+                  "name": "state",
+                  "type": "status",
+                  "text": "Idle"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "\"contributes.inspector\" requires apiVersion 7",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.ui",
+        "name": "UI",
+        "version": "1.0.0",
+        "description": "Adds controls.",
+        "apiVersion": 6,
+        "main": "main.js",
+        "contributes": {
+          "inspector": [
+            {
+              "id": "grade",
+              "title": "Grade",
+              "params": [
+                {
+                  "name": "exposure",
+                  "type": "number",
+                  "default": 0
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "an inspector button naming a command this plugin does not declare is refused",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.ui",
+        "name": "UI",
+        "version": "1.0.0",
+        "description": "Adds controls.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "inspector": [
+            {
+              "id": "grade",
+              "title": "Grade",
+              "params": [
+                {
+                  "name": "reset",
+                  "type": "button",
+                  "command": "reset"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a contributed tool",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.ui",
+        "name": "UI",
+        "version": "1.0.0",
+        "description": "Adds controls.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "tools": [
+            {
+              "id": "rig-pin",
+              "label": "Rig Pin",
+              "icon": "puppet-pin",
+              "cursor": "crosshair",
+              "tooltip": "Drop a rig pin."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "\"contributes.tools\" requires apiVersion 7",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.ui",
+        "name": "UI",
+        "version": "1.0.0",
+        "description": "Adds controls.",
+        "apiVersion": 6,
+        "main": "main.js",
+        "contributes": {
+          "tools": [
+            {
+              "id": "rig-pin",
+              "label": "Rig Pin",
+              "icon": "puppet-pin",
+              "cursor": "crosshair"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a contributed shortcut on one of this plugin s commands",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.ui",
+        "name": "UI",
+        "version": "1.0.0",
+        "description": "Adds controls.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "commands": [
+            {
+              "id": "go",
+              "label": "Go"
+            }
+          ],
+          "shortcuts": [
+            {
+              "command": "go",
+              "chord": "Mod+Alt+G"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "\"contributes.shortcuts\" requires apiVersion 7",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.ui",
+        "name": "UI",
+        "version": "1.0.0",
+        "description": "Adds controls.",
+        "apiVersion": 6,
+        "main": "main.js",
+        "contributes": {
+          "commands": [
+            {
+              "id": "go",
+              "label": "Go"
+            }
+          ],
+          "shortcuts": [
+            {
+              "command": "go",
+              "chord": "Mod+Alt+G"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a shortcut naming a command this plugin does not declare is refused",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.ui",
+        "name": "UI",
+        "version": "1.0.0",
+        "description": "Adds controls.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "shortcuts": [
+            {
+              "command": "go",
+              "chord": "Mod+Alt+G"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a contributed expression function",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.ui",
+        "name": "UI",
+        "version": "1.0.0",
+        "description": "Adds controls.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "contributes": {
+          "expressions": [
+            {
+              "name": "noiseAt",
+              "args": 2,
+              "default": 0,
+              "description": "Field value at a point."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "\"contributes.expressions\" requires apiVersion 7",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.ui",
+        "name": "UI",
+        "version": "1.0.0",
+        "description": "Adds controls.",
+        "apiVersion": 6,
+        "main": "main.js",
+        "contributes": {
+          "expressions": [
+            {
+              "name": "noiseAt",
+              "args": 2,
+              "default": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a native module, one binary per platform",
+      "valid": true,
+      "manifest": {
+        "id": "com.example.native",
+        "name": "Native",
+        "version": "1.0.0",
+        "description": "Ships a compiled module.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "native": {
+          "abi": 1,
+          "platforms": {
+            "win32-x64": "bin/win32-x64/fx.node",
+            "darwin-arm64": "bin/darwin-arm64/fx.node"
+          },
+          "threadSafety": "instance",
+          "timeoutMs": 5000
+        }
+      }
+    },
+    {
+      "name": "a native platform key that is not \"<platform>-<arch>\" is refused",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.native",
+        "name": "Native",
+        "version": "1.0.0",
+        "description": "Ships a compiled module.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "native": {
+          "abi": 1,
+          "platforms": {
+            "windows": "bin/fx.node"
+          }
+        }
+      }
+    },
+    {
+      "name": "a native block with no ABI number is refused",
+      "valid": false,
+      "manifest": {
+        "id": "com.example.native",
+        "name": "Native",
+        "version": "1.0.0",
+        "description": "Ships a compiled module.",
+        "apiVersion": 7,
+        "main": "main.js",
+        "native": {
+          "platforms": {
+            "win32-x64": "bin/fx.node"
+          }
         }
       }
     }

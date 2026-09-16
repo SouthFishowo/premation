@@ -111,7 +111,13 @@ describe('the material descriptor', () => {
   it('uses the established effect binding layout', () => {
     // The same shape DISPLACEMENT_MAP_MATERIAL and friends use. A plugin effect
     // is not a new kind of pass; it is another material.
-    expect(pluginEffectMaterial(PLUGIN, effect()).layout).toBe(PLUGIN_EFFECT_MATERIAL_LAYOUT);
+    //
+    // Compared by VALUE rather than by identity since the layout gained layer
+    // bindings: an effect with no layer parameter and no origin gets exactly
+    // the three entries it always did, built by the same code path as the wider
+    // ones instead of by a branch that returns a shared constant.
+    expect(pluginEffectMaterial(PLUGIN, effect()).layout)
+      .toEqual([...PLUGIN_EFFECT_MATERIAL_LAYOUT]);
   });
 });
 

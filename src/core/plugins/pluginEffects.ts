@@ -38,7 +38,16 @@
  */
 
 import { useUIStore } from '@stores/uiStore';
-import { composeEffectShader, namespacedEffect, type EffectContribution } from './effectSchema';
+import {
+  composeEffectGlsl,
+  composeEffectShader,
+  effectHasGpuKernel,
+  effectKernelFor,
+  namespacedEffect,
+  type EffectBackend,
+  type EffectContribution,
+} from './effectSchema';
+import { remapCompileLog } from './glslValidation';
 // The single owner of the pass → registry-name rule. Imported rather than
 // re-derived; see the note in `registerEffects`.
 import { passShaderName } from './pluginEffectMaterial';
@@ -68,6 +77,18 @@ export type EffectState =
   | 'ready'
   /** Compilation failed or timed out. Renders passthrough. */
   | 'failed'
+  /**
+   * Ships no kernel this backend can run.
+   *
+   * SEPARATE from `failed`, and the distinction is the whole point of the
+   * state: `failed` is "your shader has an error", `unsupported` is "your
+   * shader is fine and this machine cannot run it". They call for different
+   * actions from the author (fix the code / ship a second kernel) and for
+   * different words to the user (this plugin is broken / this plugin needs
+   * WebGPU), and one state for both is what produced the old silent
+   * passthrough that read as a broken plugin.
+   */
+  | 'unsupported'
   /** Turned off after a device loss it was implicated in. Re-enableable. */
   | 'disabled';
 
@@ -92,6 +113,16 @@ export interface RegisteredPass {
    */
   shaderId: string;
   wgsl: string;
+  /**
+   * The composed GLSL ES 3.0 program, when this pass ships one.
+   *
+   * Composed at registration beside the WGSL rather than on demand, so a
+   * backend asking "does this compile?" is handed a string rather than a
+   * generator — and so `preambleLines` travels with the source it describes.
+   * A log re-pointed with the wrong preamble length is worse than one that was
+   * never re-pointed.
+   */
+  glsl?: { vertex: string; fragment: string; preambleLines: number };
   /** Linear downsample of this pass's target. 1 unless declared otherwise. */
   scale: number;
   /** Whether this pass samples the chain's pass-0 input at binding 4. */
@@ -132,6 +163,55 @@ export interface RegisteredEffect {
 export interface EffectCompiler {
   /** Resolves when the shader is usable, rejects with the driver's complaint. */
   compile(id: string, wgsl: string): Promise<void>;
+  /**
+   * The same for a GLSL ES 3.0 program, when the live backend is WebGL2.
+   *
+   * Optional, because a WebGPU backend has no opinion about GLSL and a backend
+   * that cannot check anything must not be read as "everything failed".
+   */
+  compileGlsl?(id: string, vertex: string, fragment: string): Promise<void>;
+  /**
+   * Which backend is live.
+   *
+   * ★ This is what decides WHICH kernel is compiled, and it is the single
+   * change that makes a missing kernel an error instead of silence. Compiling
+   * every variant everywhere would fail a WGSL-only effect on the machine where
+   * its GLSL twin was never going to run, and compiling none would leave the
+   * old behaviour: an effect that renders its input unchanged and says nothing.
+   *
+   * Defaults to `webgpu`, which is what every caller before this meant.
+   */
+  backend?: EffectBackend;
+}
+
+/**
+ * Compile diagnostics, newest last, for the plugin log.
+ *
+ * Kept here rather than in a store because this is where the mapping from a
+ * driver's complaint to a PLUGIN exists — and because the log has to survive a
+ * surface that is not mounted. A UI reads it; nothing depends on it.
+ */
+export interface EffectLogEntry {
+  at: number;
+  effectId: string;
+  pluginName: string;
+  level: 'error' | 'warning';
+  message: string;
+}
+
+const LOG_LIMIT = 200;
+const log: EffectLogEntry[] = [];
+
+export function pluginEffectLog(): readonly EffectLogEntry[] {
+  return log;
+}
+
+function note(effect: RegisteredEffect, level: EffectLogEntry['level'], message: string): void {
+  log.push({ at: Date.now(), effectId: effect.id, pluginName: effect.pluginName, level, message });
+  // Bounded, because a shader that fails to compile fails on every sync and a
+  // sync happens on every plugin change. An unbounded log is a leak with a
+  // plausible excuse.
+  if (log.length > LOG_LIMIT) log.splice(0, log.length - LOG_LIMIT);
 }
 
 const effects = new Map<string, RegisteredEffect>();
@@ -223,10 +303,15 @@ export function registerEffects(
     const passes: RegisteredPass[] = [];
     for (let i = 0; i < count; i++) {
       const declared = contribution.passes?.[i];
+      const authorsGlsl = declared ? !!declared.glsl : !!contribution.glsl?.trim();
+      const glsl = authorsGlsl ? composeEffectGlsl(contribution, i) : null;
       passes.push({
         index: i,
         shaderId: passShaderName(pluginId, contribution, i),
         wgsl: composeEffectShader(contribution, i).wgsl,
+        ...(glsl
+          ? { glsl: { vertex: glsl.vertex, fragment: glsl.fragment, preambleLines: glsl.preambleLines } }
+          : {}),
         scale: declared?.scale ?? 1,
         readsOrigin: declared?.reads === 'origin' || declared?.reads === 'both',
       });
@@ -271,6 +356,45 @@ export async function compileEffect(id: string, compiler: EffectCompiler): Promi
   // user's protection without asking.
   if (effect.state === 'disabled') return 'disabled';
 
+  const backend: EffectBackend = compiler.backend ?? 'webgpu';
+  /*
+    Does this effect have a kernel this backend can run at all?
+
+    Asked BEFORE compiling, because the answer is not a compile failure and
+    must not be reported as one. An effect that ships only WGSL on a WebGL2
+    machine is not broken — its author simply has not shipped a GLSL twin — and
+    the state it lands in says exactly that, in words the author can act on.
+
+    The frame still renders: `snapshotToFrameScene` emits a pass only for a
+    `ready` effect, so an unsupported one contributes nothing and the layer
+    draws as it would with the effect removed.
+  */
+  const kernel = effectKernelFor(effect.contribution, backend);
+  if (!kernel.ok) {
+    effect.state = 'unsupported';
+    effect.reason = kernel.reason;
+    note(effect, 'warning', kernel.reason);
+    changed();
+    return effect.state;
+  }
+
+  /*
+    A CPU-only effect compiles nothing and is ready immediately.
+
+    Handing the driver `pass.wgsl` here would hand it an empty string, which
+    fails, which reports a shader error against an effect that ships no shader —
+    the least actionable message this subsystem could produce. The effect is
+    `ready` in the sense that matters: something can draw it. What must NOT
+    happen is a GPU pass being emitted for it, and `extractSpatialEffects` asks
+    `effectHasGpuKernel` for exactly that reason.
+  */
+  if (!effectHasGpuKernel(effect.contribution, backend)) {
+    effect.state = 'ready';
+    effect.reason = '';
+    changed();
+    return effect.state;
+  }
+
   const timers: Array<ReturnType<typeof setTimeout>> = [];
   const startedAt = Date.now();
   try {
@@ -295,8 +419,29 @@ export async function compileEffect(id: string, compiler: EffectCompiler): Promi
         );
       }
       const budget = Math.min(COMPILE_TIMEOUT_MS, remaining);
+      /*
+        One variant per pass, chosen by the live backend.
+
+        A WebGL2 frame compiles the GLSL twin and a WebGPU frame the WGSL, and
+        neither is asked about the other's language: a driver handed the wrong
+        one produces a wall of syntax errors that name the host's generated
+        preamble, which is the least actionable error message this subsystem
+        could possibly produce.
+      */
+      const asGlsl = backend === 'webgl2' && !!pass.glsl && !!compiler.compileGlsl;
       await Promise.race([
-        compiler.compile(pass.shaderId, pass.wgsl),
+        asGlsl
+          ? compiler.compileGlsl!(pass.shaderId, pass.glsl!.vertex, pass.glsl!.fragment)
+            // The driver counts lines from the top of a file the author never
+            // saw. Re-pointed here, where the preamble length is known, so the
+            // message the author reads names the line they wrote.
+            .catch((err: unknown) => {
+              throw new Error(remapCompileLog(
+                err instanceof Error ? err.message : String(err),
+                pass.glsl!.preambleLines,
+              ));
+            })
+          : compiler.compile(pass.shaderId, pass.wgsl),
         new Promise<never>((_, reject) => {
           timers.push(setTimeout(
             () => reject(new Error(
@@ -317,6 +462,7 @@ export async function compileEffect(id: string, compiler: EffectCompiler): Promi
     // Logged with the plugin named. A driver error message on its own is
     // unattributable, and this is the one place the mapping is known.
     console.warn(`[plugins] effect "${id}" (${effect.pluginName}) failed to compile: ${effect.reason}`);
+    note(effect, 'error', effect.reason);
   } finally {
     // Cleared on BOTH paths. A pending timer that outlives a successful compile
     // keeps the process awake and, under fake timers in a test, rejects into a
@@ -378,7 +524,16 @@ export function currentlyDrawing(): string | null {
 function invalidateCompiledEffects(): number {
   let n = 0;
   for (const effect of effects.values()) {
-    if (effect.state !== 'ready') continue;
+    /*
+      `unsupported` is invalidated too, and that is not incidental.
+
+      Recovery from a device loss can come back on a DIFFERENT backend — the
+      renderer re-inits WebGPU and falls through to WebGL2 — and "this effect
+      has no kernel for the live backend" is a judgement about a backend that
+      may no longer be live. Leaving it would keep a GLSL-only effect inert on
+      the very tier it was written for.
+    */
+    if (effect.state !== 'ready' && effect.state !== 'unsupported') continue;
     effect.state = 'pending';
     effect.reason = '';
     n++;
@@ -476,6 +631,7 @@ export function noteInertPluginEffect(pluginName: string): void {
 /** Test seam. Never called by the app. */
 export function resetEffectsForTests(): void {
   toldAboutWebgl2 = false;
+  log.length = 0;
   effects.clear();
   revision = 0;
   inFlight = null;

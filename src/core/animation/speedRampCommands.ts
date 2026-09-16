@@ -49,6 +49,8 @@ import { getNodeLayerTime, updateNodeLayerTime } from '@core/scene/layerTime';
 import { runAnimEdit } from './animationCommands';
 import { spliceRecordedRange } from './motionSketch';
 import { buildTimeRemap, type SpeedPoint } from './speedRamp';
+import { compToKeyframeTime } from '@core/timeline/TimelineController';
+import { SPEED_PROP, readRetimeMode } from './retime';
 
 /** How long the ease from the old speed to the new one takes. */
 const TRANSITION_SEC = 0.5;
@@ -99,6 +101,28 @@ function sourceAt(nodeId: string, atTime: number): number {
   return defaultAnimation.sample(nodeId, 'timeRemap', atTime) ?? atTime;
 }
 
+/**
+ * The ramp as SPEED % points: keys before the playhead stay, then the current
+ * speed at the playhead easing linearly to the target and holding. The speed
+ * integral (`retime.ts`) keeps the frame on screen where it is by construction
+ * — speed changes at the playhead do not move source time up to it.
+ */
+function rampSpeedTrack(nodeId: string, at: number, target: number): void {
+  const u = compToKeyframeTime(nodeId, at);
+  const uEnd = compToKeyframeTime(nodeId, at + TRANSITION_SEC);
+  const existing = defaultAnimation.getTrackKeyframes(nodeId, SPEED_PROP) ?? [];
+  const from = defaultAnimation.isAnimated(nodeId, SPEED_PROP)
+    ? defaultAnimation.sample(nodeId, SPEED_PROP, u) ?? 100
+    : 100;
+  // Speed holds flat before the first key, so a new curve needs no head key.
+  const kept = existing.filter((k) => k.t < u - 1e-9);
+  defaultAnimation.setKeyframes(nodeId, SPEED_PROP, [
+    ...kept,
+    { t: u, value: from, easing: 'linear' },
+    { t: uEnd, value: target * 100, easing: 'linear' },
+  ]);
+}
+
 function rampTo(target: number): void {
   const nodeIds = rampTargets();
   if (nodeIds.length === 0) {
@@ -125,6 +149,14 @@ function rampTo(target: number): void {
   let blended = 0;
   runAnimEdit(`Speed ramp to ${Math.round(target * 100)}%`, () => {
     for (const nodeId of nodeIds) {
+      // Speed % is the ramp's own language. Only a layer already keyed in
+      // Frame Number keeps ramping its remap curve, so its keys are not
+      // silently converted by a one-click command.
+      if (readRetimeMode(defaultAnimation, nodeId) !== 'frames') {
+        rampSpeedTrack(nodeId, at, target);
+        ramped++;
+        continue;
+      }
       const from = currentSpeed(nodeId, at);
       const profile: SpeedPoint[] = [
         { t: at, speed: from },

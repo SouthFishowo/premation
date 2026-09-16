@@ -150,10 +150,22 @@ describe('effects', () => {
   });
 
   it('sets a parameter', () => {
+    // Blur's one parameter is `amount` (0–40 px). This case used to write
+    // `radius`, which Blur does not have — and passed, because the host stored
+    // the unknown key beside the real one. That is the bug `propValidation`
+    // closes; the refusal is pinned below.
     const id = newLayer();
     const fx = api['effects.add']!(id, 'blur') as string;
-    api['effects.setParam']!(id, fx, 'radius', 12);
-    expect(getNodeEffects(id).find((e) => e.id === fx)?.params?.radius).toBe(12);
+    api['effects.setParam']!(id, fx, 'amount', 12);
+    expect(getNodeEffects(id).find((e) => e.id === fx)?.params?.amount).toBe(12);
+  });
+
+  it('★ refuses a parameter the effect does not have, listing the ones it does', () => {
+    const id = newLayer();
+    const fx = api['effects.add']!(id, 'blur') as string;
+    expect(() => api['effects.setParam']!(id, fx, 'radius', 12))
+      .toThrow(/"radius" is not a parameter of Blur[\s\S]*Its parameters: amount/);
+    expect(getNodeEffects(id).find((e) => e.id === fx)?.params).not.toHaveProperty('radius');
   });
 
   it('removes an effect', () => {

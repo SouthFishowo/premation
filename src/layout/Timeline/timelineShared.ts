@@ -64,7 +64,7 @@ export const TL_COLUMN_WIDTHS = {
   gap: 4,
   /** A divider rule's margin + padding, on the one side that draws it. */
   rule: 16,
-  preInfo: 72,
+  preInfo: 97,
   name: 190,
   /** Ten 22px switches + nine 4px gaps — mirrors `--tl-col-switches`. */
   switches: 256,
@@ -156,6 +156,7 @@ export const GROUP_HEADING: Readonly<Record<TimelineGroupKey, { label: string; i
   styles: { label: 'Layer Styles', icon: 'palette' },
   camera: { label: 'Camera Options', icon: 'camera' },
   light: { label: 'Light Options', icon: 'light' },
+  geometry: { label: 'Geometry Options', icon: 'cube' },
   material: { label: 'Material Options', icon: 'cube' },
   audio: { label: 'Audio', icon: 'audio' },
   time: { label: 'Time', icon: 'clock' },

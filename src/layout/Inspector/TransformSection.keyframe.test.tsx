@@ -78,15 +78,19 @@ const xField = (): HTMLElement => screen.getByRole('spinbutton', { name: 'Positi
 const shownX = (): number => Number(xField().getAttribute('aria-valuenow'));
 
 /**
- * The stopwatch in the Position X row — what makes the property animated.
+ * The Position row's stopwatch — what makes X (and Y) animated.
  *
  * Found by ACCESSIBLE NAME, not by tag or DOM structure. It used to walk two
  * parents up and grab an `input[type=checkbox]`, which broke the moment the
  * row became a shared component with a real stopwatch button — and would have
  * broken again on any layout change. The name is the contract; the markup is not.
+ *
+ * Since 2026-09-15 X and Y share ONE row (`MultiPropertyPairRow`) and the
+ * row's stopwatch is the group's, so the name is "Position", not "Position X".
+ * Everything below still asserts on X alone.
  */
 function lightXStopwatch(): void {
-  const sw = screen.getByRole('button', { name: /(Enable|Disable) Position X animation/ });
+  const sw = screen.getByRole('button', { name: /(Enable|Disable) Position animation/ });
   fireEvent.click(sw);
 }
 
@@ -101,7 +105,11 @@ function typeValue(field: HTMLElement, value: string): void {
 
 describe('keyframing position from the inspector', () => {
   beforeEach(() => {
+    // The Position row's stopwatch lights X AND Y, so both tracks must go: a Y
+    // track left over from the previous case makes the next click REMOVE the
+    // group's animation instead of starting it.
     defaultAnimation.removeTrack(NODE, 'x');
+    defaultAnimation.removeTrack(NODE, 'y');
     try { defaultSceneGraph.removeNode(NODE); } catch { /* first run */ }
     const c = getTimelineController();
     const track = c.timeline.getTracks()[0];

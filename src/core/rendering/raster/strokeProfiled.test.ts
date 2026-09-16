@@ -33,6 +33,7 @@ import { strokeShapeProfiled } from './vectorDraw';
 import { IDENTITY_TAPER, IDENTITY_WAVE, taperWidthFactorAt, type StrokeTaper, type StrokeWave } from '@core/scene/strokeProfile';
 import type { Stroke } from '@core/paint/stroke';
 import type { RenderLayer } from '../RenderBackend';
+import { flattenOutline } from '@core/scene/mergePaths';
 
 interface Pt { x: number; y: number }
 
@@ -121,10 +122,10 @@ describe('what it refuses, so the ordinary stroke still runs', () => {
     expect({ fills: ctx.fills, points: ctx.ring.length }).toEqual({ fills: 0, points: 0 });
   });
 
-  it('refuses a non-path primitive', () => {
+  it('refuses a PATH primitive that carries no geometry', () => {
     const ctx = recordingCtx();
-    const rect = { ...layer(), primitive: 'rect' } as unknown as RenderLayer;
-    expect(strokeShapeProfiled(ctx, stroke({ taper: TAPER }), rect)).toBe(false);
+    const empty = { ...layer(), pathPoints: undefined } as unknown as RenderLayer;
+    expect(strokeShapeProfiled(ctx, stroke({ taper: TAPER }), empty)).toBe(false);
   });
 
   it('refuses a zero-width stroke', () => {
@@ -563,5 +564,199 @@ describe('a profiled stroke honours the stroke join', () => {
     });
     expect(rings[1]).toEqual(rings[0]);
     expect(rings[2]).toEqual(rings[0]);
+  });
+});
+
+/**
+ * MITER LIMIT — the stroke's, not a hard-coded 10.
+ *
+ * A V whose arms open by 2·atan(10/80) ≈ 14° has a miter ratio of
+ * 1 / sin(atan(10/80)) ≈ 8.06: past the default limit of 4 (bevel), within 10
+ * (tip). The plain stroke hands `miterLimit ?? 4` to Canvas2D, so the ribbon
+ * must bevel here by default — it used to spike, because it tested against 10.
+ */
+describe('a profiled stroke honours the stroke miter limit', () => {
+  const V = [
+    { x: -80, y: -10, inX: -80, inY: -10, outX: -80, outY: -10 },
+    { x: 0, y: 0, inX: 0, inY: 0, outX: 0, outY: 0 },
+    { x: -80, y: 10, inX: -80, inY: 10, outX: -80, outY: 10 },
+  ];
+  const vLayer = (): RenderLayer => ({
+    id: 'V', kind: 'shape', primitive: 'path',
+    x: 0, y: 0, width: 200, height: 200, opacity: 1, visible: true,
+    pathPoints: V, pathOpen: true,
+  } as unknown as RenderLayer);
+  /** Ramps over the first 20%, so the tip at t = 0.5 is at FULL width. */
+  const RAMP: StrokeTaper = { ...IDENTITY_TAPER, startLength: 0.2, startWidth: 0.2 };
+  const tipReach = (extra: Partial<Stroke>): number => {
+    const ctx = recordingCtx();
+    strokeShapeProfiled(ctx, stroke({ taper: RAMP, join: 'miter', cap: 'butt', ...extra }), vLayer());
+    return Math.max(...ctx.spans[0]!.map((p) => p.x));
+  };
+  const RATIO = 1 / Math.sin(Math.atan2(10, 80));
+
+  it('POSITIVE CONTROL: the fixture really is past 4 and within 10', () => {
+    expect(RATIO).toBeGreaterThan(4);
+    expect(RATIO).toBeLessThan(10);
+  });
+
+  it('BEVELS at the default limit of 4, as the plain stroke does', () => {
+    expect(tipReach({})).toBeLessThan(WIDTH / 2);
+  });
+
+  it('draws the TIP when the stroke allows it', () => {
+    expect(tipReach({ miterLimit: 10 })).toBeCloseTo((WIDTH / 2) * RATIO, 3);
+  });
+});
+
+/**
+ * THE SEAM of a closed run.
+ *
+ * A closed square whose first vertex is a corner. Treated as two open ends, the
+ * seam got no join: each end offset along its own segment only, so the corner
+ * reached h·cos45 along its bisector while the other three reached h/cos45 — a
+ * notch at vertex 0. The taper is symmetric (half width at both ends, full in
+ * the middle) so the two sides of the seam agree on the width.
+ */
+describe('a closed profiled stroke joins across its seam', () => {
+  const SQUARE = [[-50, -50], [50, -50], [50, 50], [-50, 50]]
+    .map(([x, y]) => ({ x: x!, y: y!, inX: x!, inY: y!, outX: x!, outY: y! }));
+  const squareLayer = (): RenderLayer => ({
+    id: 'sq', kind: 'shape', primitive: 'path',
+    x: 0, y: 0, width: 100, height: 100, opacity: 1, visible: true,
+    pathPoints: SQUARE, pathOpen: false,
+  } as unknown as RenderLayer);
+  const ENDS: StrokeTaper = { ...IDENTITY_TAPER, startLength: 0.1, endLength: 0.1, startWidth: 0.5, endWidth: 0.5 };
+  const H = (WIDTH * 0.5) / 2;
+
+  const ringFor = (join: Stroke['join']): Pt[] => {
+    const ctx = recordingCtx();
+    strokeShapeProfiled(ctx, stroke({ taper: ENDS, join, cap: 'round' }), squareLayer());
+    expect(ctx.fills).toBe(1);
+    return ctx.spans[0]!;
+  };
+  /** Furthest reach past the seam corner (-50,-50) along its outward bisector. */
+  const seamReach = (ring: Pt[]): number =>
+    Math.max(...ring.map((p) => ((p.x + 50) * -Math.SQRT1_2) + ((p.y + 50) * -Math.SQRT1_2)));
+
+  it('a MITER seam reaches the full tip, h / cos45', () => {
+    expect(seamReach(ringFor('miter'))).toBeCloseTo(H * Math.SQRT2, 3);
+  });
+
+  it('a ROUND seam arcs at h — and draws no cap, a closed run has no ends', () => {
+    // A round cap at an open seam would ALSO reach h, so the miter case above is
+    // the discriminating one; this pins that the round join lands where it should.
+    expect(seamReach(ringFor('round'))).toBeCloseTo(H, 3);
+  });
+});
+
+/** Rect and ellipse primitives have no path geometry of their own. */
+describe('Taper and Wave on rect and ellipse primitives', () => {
+  const bbox = (ring: Pt[]) => ({
+    minX: Math.min(...ring.map((p) => p.x)), maxX: Math.max(...ring.map((p) => p.x)),
+    minY: Math.min(...ring.map((p) => p.y)), maxY: Math.max(...ring.map((p) => p.y)),
+  });
+
+  it.each(['rect', 'ellipse'] as const)('a tapered %s draws a ribbon around its box', (primitive) => {
+    // They used to be refused while the Stroke panel still showed the rows.
+    const ctx = recordingCtx();
+    const prim = { ...layer(), primitive, pathPoints: undefined, pathOpen: undefined } as unknown as RenderLayer;
+    expect(strokeShapeProfiled(ctx, stroke({ taper: TAPER, cap: 'butt', join: 'round' }), prim)).toBe(true);
+    expect(ctx.fills).toBe(1);
+    const b = bbox(ctx.spans[0]!);
+    // The layer is 200×120, centred: the outline sits on ±100 × ±60 and the
+    // ribbon straddles it by at most half the stroke.
+    expect(b.maxX).toBeGreaterThan(100 - 1e-6);
+    expect(b.maxX).toBeLessThanOrEqual(100 + WIDTH / 2 + 1e-6);
+    expect(b.minY).toBeLessThan(-60 + 1e-6);
+    expect(b.minY).toBeGreaterThanOrEqual(-60 - WIDTH / 2 - 1e-6);
+  });
+
+  it('a waved rect leaves its own outline', () => {
+    const ctx = recordingCtx();
+    const rect = { ...layer(), primitive: 'rect', pathPoints: undefined } as unknown as RenderLayer;
+    strokeShapeProfiled(ctx, stroke({ wave: { amount: 12, wavelength: 60, phase: 90 } }), rect);
+    expect(bbox(ctx.spans[0]!).maxX).toBeGreaterThan(100 + WIDTH / 2 + 1);
+  });
+});
+
+/**
+ * PER-RUN PAINT BATCHES stroke only their own runs.
+ *
+ * The rasterizer draws each painted run (a repeater copy) as its own batch. The
+ * profiled stroke used to read every run off the layer regardless, so three
+ * copies came out stroked three times each, once in every copy's colour.
+ */
+describe('a profiled stroke restricted to a batch', () => {
+  const twoRuns = (): RenderLayer => ({
+    ...layer(),
+    pathPoints: undefined,
+    subpaths: [
+      { points: CURVE, open: true },
+      { points: CURVE.map((p) => ({ ...p, y: p.y + 40, inY: p.inY + 40, outY: p.outY + 40 })), open: true },
+    ],
+  } as unknown as RenderLayer);
+
+  it('POSITIVE CONTROL: with no restriction it ribbons every run', () => {
+    const ctx = recordingCtx();
+    strokeShapeProfiled(ctx, stroke({ taper: TAPER }), twoRuns());
+    expect(ctx.fills).toBe(2);
+  });
+
+  it('given runs, it ribbons exactly those', () => {
+    const l = twoRuns();
+    const ctx = recordingCtx();
+    strokeShapeProfiled(ctx, stroke({ taper: TAPER }), l, 100, 100, [l.subpaths![1]!]);
+    expect(ctx.fills).toBe(1);
+    // And it is the SECOND run — shifted 40px down.
+    expect(Math.max(...ctx.spans[0]!.map((p) => p.y))).toBeGreaterThan(30);
+  });
+});
+
+/**
+ * AE's Length Units and Wave Units reach the ribbon.
+ *
+ * The unit maths is pinned in `strokeProfile.test.ts`; these pin the PLUMBING —
+ * that the ribbon converts per run with that run's own length. Each is an
+ * equivalence against a ribbon the original model already draws, so the
+ * expectation is the renderer's own output rather than a re-derivation.
+ */
+describe('taper length units and wave cycles in the ribbon', () => {
+  const ringOf = (s: Stroke): Pt[] => {
+    const ctx = recordingCtx();
+    expect(strokeShapeProfiled(ctx, s, layer())).toBe(true);
+    return [...ctx.ring];
+  };
+  const closeRings = (a: Pt[], b: Pt[]): void => {
+    expect(a.length).toBe(b.length);
+    for (let i = 0; i < a.length; i++) {
+      expect(a[i]!.x).toBeCloseTo(b[i]!.x, 6);
+      expect(a[i]!.y).toBeCloseTo(b[i]!.y, 6);
+    }
+  };
+
+  it('a pixel ramp longer than the path IS a full-length percent ramp', () => {
+    const px = ringOf(stroke({ taper: { ...IDENTITY_TAPER, startWidth: 0.2, startLength: 1e6, lengthUnits: 'pixels' } }));
+    const pct = ringOf(stroke({ taper: { ...IDENTITY_TAPER, startWidth: 0.2, startLength: 1 } }));
+    closeRings(px, pct);
+  });
+
+  it('POSITIVE CONTROL: a SHORT pixel ramp is not the full-length one', () => {
+    const px = ringOf(stroke({ taper: { ...IDENTITY_TAPER, startWidth: 0.2, startLength: 20, lengthUnits: 'pixels' } }));
+    const pct = ringOf(stroke({ taper: { ...IDENTITY_TAPER, startWidth: 0.2, startLength: 1 } }));
+    // Midway along the path the short ramp is long over: full width there.
+    const mid = Math.floor(px.length / 4);
+    expect(widthAtPair(px, mid)).toBeGreaterThan(widthAtPair(pct, mid) + 0.5);
+  });
+
+  it('N cycles on the run is a pixel wave of (run length / N)', () => {
+    // The run length the ribbon measures: the curve flattened at the wave's
+    // sampling density, as `strokeShapeProfiled` flattens it.
+    const flat = flattenOutline(CURVE, 64, true);
+    let total = 0;
+    for (let i = 1; i < flat.length; i++) total += Math.hypot(flat[i]!.x - flat[i - 1]!.x, flat[i]!.y - flat[i - 1]!.y);
+    const cycles = ringOf(stroke({ wave: { amount: 4, wavelength: 3, phase: 0, units: 'cycles' } }));
+    const pixels = ringOf(stroke({ wave: { amount: 4, wavelength: total / 3, phase: 0 } }));
+    closeRings(cycles, pixels);
   });
 });

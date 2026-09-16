@@ -49,10 +49,10 @@
    */
   --tl-col-gap: var(--space-2);
   --tl-col-name: 190px;
-  /* The A/V gutter — video · solo · lock. AE's leftmost column, and ours now
+  /* The A/V gutter — video · audio · solo · lock. AE's leftmost column, and ours now
      too; the row and the legend both put it before the layer name.
-     3 × 22px cells + 2 × 3px gaps. */
-  --tl-col-preinfo: 72px;
+     4 × 22px cells + 3 × 3px gaps. */
+  --tl-col-preinfo: 97px;
   --tl-col-mode: 70px;
   /* The legend reads "TrkMat" now — AE's name for it — rather than a bare "T". */
   --tl-col-matte: 58px;
@@ -301,7 +301,7 @@
 .clip {
   position: absolute;
   top: 3px;
-  border-radius: 4px;
+  border-radius: 0;
   border: none;
   overflow: hidden;
   cursor: pointer;
@@ -448,15 +448,13 @@
 .clipHandle[data-edge='start'] {
   left: 0;
   border-left: 2.5px solid rgba(255, 255, 255, 0.7);
-  border-top-left-radius: 3px;
-  border-bottom-left-radius: 3px;
+  border-radius: 0;
 }
 
 .clipHandle[data-edge='end'] {
   right: 0;
   border-right: 2.5px solid rgba(255, 255, 255, 0.7);
-  border-top-right-radius: 3px;
-  border-bottom-right-radius: 3px;
+  border-radius: 0;
 }
 
 .clip:hover .clipHandle {
@@ -1103,8 +1101,8 @@
 }
 
 .timelineSelectTrigger {
-  background: var(--color-surface-1);
-  border: 1px solid var(--color-border-subtle);
+  background: var(--color-timeline-well, #141414);
+  border: 1px solid var(--color-border);
   font-family: var(--font-family-sans);
   font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
@@ -1115,7 +1113,7 @@
   align-items: center;
   justify-content: space-between;
   box-sizing: border-box;
-  border-radius: var(--radius-sm);
+  border-radius: 2px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1505,32 +1503,25 @@
   text-shadow: 0 0 6px color-mix(in srgb, var(--color-switch-solo) 50%, transparent);
 }
 
-/* A hidden track's eye is a de-emphasis, not an accent — stay muted. */
+.trackAction:disabled,
+.trackAction[data-spacer] {
+  background: var(--color-timeline-well);
+  border: 1px solid var(--color-border-subtle);
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* Visibility icon is crisp when visible. */
 .trackAction[data-kind="visible"][data-on] {
-  color: var(--color-text-muted);
-  opacity: 0.8;
-}
-
-/* Speaker. Audible is the resting state of nearly every layer, so `on` stays as
-   quiet as the eye; the MUTED state is the one worth noticing, because a silent
-   layer reads as a bug until you spot the switch that did it. */
-.trackAction[data-kind="audio"][data-on] {
-  color: var(--color-text-muted);
-  opacity: 0.8;
-}
-
-.trackAction[data-kind="audio"]:not([data-on]):not([data-spacer]) {
-  color: var(--color-warning);
+  color: var(--color-text-primary);
   opacity: 1;
 }
 
-/* Layers that make no sound hold the column's alignment without offering a
-   switch that would toggle nothing. */
-.trackAction[data-spacer] {
-  background: none;
-  border-color: transparent;
-  cursor: default;
-  pointer-events: none;
+/* Speaker icon is crisp when unmuted. */
+.trackAction[data-kind="audio"][data-on] {
+  color: var(--color-text-primary);
+  opacity: 1;
 }
 
 /* FX button on = blue italic, off = desaturated. */
@@ -2376,46 +2367,6 @@
   color: var(--color-primary);
 }
 
-/* ── Quiet switches ──────────────────────────────────────────────
-   Seven glyphs per row that are OFF on almost every layer read as noise at a
-   glance. `visibility`, not `display`, so the column keeps its width and the
-   row does not reflow as the pointer crosses it — a track list that shifts
-   sideways under the cursor is worse than one that is busy. */
-.aeSwitchesCol[data-quiet] > * {
-  visibility: hidden;
-}
-
-.trackHeader:hover .aeSwitchesCol[data-quiet] > *,
-.aeSwitchesCol[data-quiet]:focus-within > * {
-  visibility: visible;
-}
-
-.switchPin {
-  display: inline-grid;
-  place-items: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border: none;
-  background: none;
-  color: var(--color-text-tertiary);
-  cursor: pointer;
-}
-
-.switchPin:hover {
-  color: var(--color-text-primary);
-}
-
-.switchPin[data-on] {
-  color: var(--color-primary);
-}
-
-/* A pinned row keeps everything — including the control that unpins it,
-   which is otherwise the one thing you cannot reach without hovering the row
-   you just told to stop needing a hover. */
-.aeSwitchesCol:not([data-quiet]) .switchPin {
-  visibility: visible;
-}
 
 /* ── Trim-handle hit region ──────────────────────────────────────
    The handle DRAWS as a 10px edge and HITS as ~24. The outward half of the

@@ -47,6 +47,54 @@ export const MAX_FILE_BYTES = 2 * 1024 * 1024;
 export const MAX_PACKAGE_BYTES = 8 * 1024 * 1024;
 const MAX_FILES = 200;
 
+/** The three ceilings, as one thing a caller can pass. */
+export interface PackageLimits {
+  maxFileBytes: number;
+  maxPackageBytes: number;
+  maxFiles: number;
+}
+
+/**
+ * What a package downloaded from the registry may be. The default everywhere.
+ *
+ * Unchanged from the numbers above, which are kept as named exports because
+ * several surfaces quote them in copy.
+ */
+export const REGISTRY_LIMITS: PackageLimits = {
+  maxFileBytes: MAX_FILE_BYTES,
+  maxPackageBytes: MAX_PACKAGE_BYTES,
+  maxFiles: MAX_FILES,
+};
+
+/**
+ * What a package the user put on their own disk may be.
+ *
+ * ── Why the two tiers differ by 64× ──────────────────────────────────────────
+ *
+ * The registry ceiling is not a statement about how big a plugin can reasonably
+ * be. It bounds what an ANONYMOUS PUBLISHER can push into a user's browser
+ * storage over the network, in a quota shared with the account token — so it is
+ * deliberately mean.
+ *
+ * A folder under `…/Plugins` is a different proposition: the user, or the
+ * machine's administrator, put it there, and what makes a plugin more than a
+ * script is exactly the things that do not fit in 2 MB — a segmentation model,
+ * a set of LUTs, a font, a mesh library compiled to WebAssembly. Holding those
+ * to the registry's number would refuse the packages this tier exists for, and
+ * would push authors back to base64-in-a-.js, which is the same bytes plus 33%
+ * with no size check at all.
+ *
+ * Mirrored in `electron/pluginLoader.ts`, which applies the same numbers while
+ * READING, before any of it is in memory. Both are needed: that one stops the
+ * app dying on a mis-set search path, this one is the check that runs over
+ * whatever actually arrived.
+ */
+export const LOCAL_LIMITS: PackageLimits = {
+  maxFileBytes: 64 * 1024 * 1024,
+  maxPackageBytes: 512 * 1024 * 1024,
+  maxFiles: 5000,
+};
+
 /** Text extensions a package may contain. Anything else is dropped. */
 const TEXT_EXT = /\.(js|mjs|json|html|htm|css|svg|txt|md|wgsl|glsl)$/i;
 
@@ -75,8 +123,22 @@ const TEXT_EXT = /\.(js|mjs|json|html|htm|css|svg|txt|md|wgsl|glsl)$/i;
  *
  * `WebAssembly.instantiateStreaming` is removed at lockdown: it takes a network
  * response, and the worker has no network. See `pluginWorker.ts`.
+ *
+ * ── The asset extensions added with local installs ───────────────────────────
+ *
+ * `.bin .onnx` (weights), `.glb .gltf` (meshes), `.ttf .otf .woff2` (fonts),
+ * `.cube` (LUTs), `.exr .hdr` (HDR images), `.mp3 .wav` (audio). All of it is
+ * DATA a plugin hands to its own code through `package.read` — nothing here is
+ * executed by the host, and nothing here is a native module. `.node`, `.dll`,
+ * `.so`, `.dylib` and `.exe` are absent and stay absent: a compiled library in
+ * a package would run in this process, which is a different tier with its own
+ * signing gate.
+ *
+ * Allowed in BOTH tiers, unlike the size ceilings. A 2 MB lookup texture in a
+ * registry package is already bounded by the registry's own limits; refusing it
+ * by extension as well would only make authors rename the file.
  */
-const BINARY_EXT = /\.(png|jpg|jpeg|webp|wasm)$/i;
+const BINARY_EXT = /\.(png|jpg|jpeg|webp|wasm|bin|onnx|glb|gltf|ttf|otf|woff2|cube|exr|hdr|mp3|wav)$/i;
 
 const MANIFEST_NAME = 'plugin.json';
 
@@ -187,7 +249,12 @@ function isPackageFile(path: string): boolean {
  * size is a field in an attacker-supplied header and believing it is the same
  * mistake one level down.
  */
-export function readPluginZip(bytes: Uint8Array): PackageResult {
+export function readPluginZip(
+  bytes: Uint8Array,
+  /** `LOCAL_LIMITS` for a package that was already on the user's own disk. */
+  limits: PackageLimits = REGISTRY_LIMITS,
+): PackageResult {
+  const { maxFileBytes: MAX_FILE_BYTES, maxPackageBytes: MAX_PACKAGE_BYTES, maxFiles: MAX_FILES } = limits;
   if (bytes.byteLength > MAX_PACKAGE_BYTES) {
     return { pkg: null, errors: [`Package is larger than ${Math.round(MAX_PACKAGE_BYTES / 1024 / 1024)} MB.`] };
   }
@@ -259,7 +326,11 @@ export function readPluginZip(bytes: Uint8Array): PackageResult {
  * The browser hands back every file with a `webkitRelativePath` rooted at the
  * chosen folder, which is exactly the "single wrapping directory" case above.
  */
-export async function readPluginFolder(fileList: readonly File[]): Promise<PackageResult> {
+export async function readPluginFolder(
+  fileList: readonly File[],
+  limits: PackageLimits = REGISTRY_LIMITS,
+): Promise<PackageResult> {
+  const { maxFileBytes: MAX_FILE_BYTES, maxPackageBytes: MAX_PACKAGE_BYTES, maxFiles: MAX_FILES } = limits;
   if (fileList.length === 0) return { pkg: null, errors: ['That folder is empty.'] };
   if (fileList.length > MAX_FILES) return { pkg: null, errors: [`Folder contains more than ${MAX_FILES} files.`] };
 
@@ -283,11 +354,73 @@ export async function readPluginFolder(fileList: readonly File[]): Promise<Packa
   return readPluginFiles(files, binaries);
 }
 
+/**
+ * Validate a payload that was read somewhere else — the main process, for a
+ * plugin found in a folder on this machine.
+ *
+ * The ceilings are re-applied HERE even though `electron/pluginLoader.ts`
+ * applied them while reading. Not belt-and-braces: the two checks answer
+ * different questions. That one stops the app dying on a search path pointed at
+ * a home directory; this one is the check that runs over whatever actually
+ * arrived, on the side that decides whether to install it, and it is the only
+ * one that still runs if the payload ever reaches here another way.
+ */
+export function readPluginPayload(
+  files: Record<string, string>,
+  binaries: Record<string, Uint8Array>,
+  limits: PackageLimits = LOCAL_LIMITS,
+): PackageResult {
+  const paths = [...Object.keys(files), ...Object.keys(binaries)];
+  if (paths.length === 0) return { pkg: null, errors: ['That folder holds no plugin files.'] };
+  if (paths.length > limits.maxFiles) {
+    return { pkg: null, errors: [`Package contains more than ${limits.maxFiles} files.`] };
+  }
+
+  let total = 0;
+  const encoder = new TextEncoder();
+  for (const [path, text] of Object.entries(files)) {
+    // UTF-8 length, not `String.length`: a package of CJK source would pass a
+    // code-unit count and blow the real one.
+    const size = encoder.encode(text).byteLength;
+    if (size > limits.maxFileBytes) {
+      return { pkg: null, errors: [`${path} is larger than ${Math.round(limits.maxFileBytes / 1024 / 1024)} MB.`] };
+    }
+    total += size;
+  }
+  for (const [path, bytes] of Object.entries(binaries)) {
+    if (bytes.byteLength > limits.maxFileBytes) {
+      return { pkg: null, errors: [`${path} is larger than ${Math.round(limits.maxFileBytes / 1024 / 1024)} MB.`] };
+    }
+    total += bytes.byteLength;
+  }
+  if (total > limits.maxPackageBytes) {
+    return {
+      pkg: null,
+      errors: [`Package is larger than ${Math.round(limits.maxPackageBytes / 1024 / 1024)} MB.`],
+    };
+  }
+
+  // The same predicate the zip and folder readers use, so a path one of them
+  // would have dropped cannot arrive by this route instead.
+  const keptFiles: Record<string, string> = {};
+  const keptBinaries: Record<string, Uint8Array> = {};
+  for (const [path, text] of Object.entries(files)) {
+    if (isPackageFile(normalize(path))) keptFiles[normalize(path)] = text;
+  }
+  for (const [path, bytes] of Object.entries(binaries)) {
+    if (isPackageFile(normalize(path))) keptBinaries[normalize(path)] = bytes;
+  }
+  return readPluginFiles(keptFiles, keptBinaries);
+}
+
 /** Route a picked file by extension. Zip magic is checked, not trusted from the name. */
-export async function readPluginFile(file: File): Promise<PackageResult> {
+export async function readPluginFile(
+  file: File,
+  limits: PackageLimits = REGISTRY_LIMITS,
+): Promise<PackageResult> {
   const bytes = new Uint8Array(await file.arrayBuffer());
   const isZip = bytes[0] === 0x50 && bytes[1] === 0x4b; // "PK"
-  if (isZip) return readPluginZip(bytes);
+  if (isZip) return readPluginZip(bytes, limits);
   return {
     pkg: null,
     errors: [

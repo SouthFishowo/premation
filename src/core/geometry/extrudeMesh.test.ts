@@ -179,6 +179,36 @@ describe('extrudeOutline — cylinder and holes', () => {
     expect(windingAgrees(m)).toBe(true);
   });
 
+  it('hole bevel scale chamfers the counter less than the rim (AE Hole Bevel Depth)', () => {
+    const outer = rectOutline(100, 100)[0]!;
+    const inner = rectOutline(40, 40)[0]!;
+    const rings = [outer, { points: inner.points, hole: true }];
+    const full = extrudeOutline(rings, { depth: 40, bevel: 6 })!;
+    const none = extrudeOutline(rings, { depth: 40, bevel: 6, holeBevelScale: 0 })!;
+    const half = extrudeOutline(rings, { depth: 40, bevel: 6, holeBevelScale: 0.5 })!;
+    // Rim perimeter 400 · √2 · 6 per end; the hole's 160 adds its own share.
+    const ring = (per: number, b: number) => 2 * per * b * Math.SQRT2;
+    expect(roleArea(none, 'bevel')).toBeLessThan(roleArea(half, 'bevel'));
+    expect(roleArea(half, 'bevel')).toBeLessThan(roleArea(full, 'bevel'));
+    // Square-edged hole ⇒ its wall runs the whole depth; the rim's stays shortened.
+    expect(roleArea(none, 'side')).toBeCloseTo(400 * (40 - 12) + 160 * 40, 1);
+    expect(roleArea(full, 'bevel')).toBeGreaterThan(ring(400, 6) * 0.9);
+    for (const m of [full, none, half]) expect(windingAgrees(m)).toBe(true);
+  });
+
+  it('frontBevel: false runs the walls to z = 0 and chamfers the back only', () => {
+    const m = extrudeOutline(rectOutline(100, 60), { depth: 40, bevel: 5, frontBevel: false, frontCap: true })!;
+    // Nothing for a front quad to inset to.
+    expect(m.bevel).toBe(0);
+    expect(roleArea(m, 'side')).toBeCloseTo(320 * 35, 3);
+    // Front cap is the FULL outline, back cap the inset.
+    expect(roleArea(m, 'front')).toBeCloseTo(100 * 60, 3);
+    expect(roleArea(m, 'back')).toBeCloseTo(90 * 50, 3);
+    const r = range(m, 'bevel')!;
+    for (let i = r.first; i < r.first + r.count; i++) expect(vert(m, m.indices[i]!).z).toBeGreaterThanOrEqual(35 - 1e-6);
+    expect(windingAgrees(m)).toBe(true);
+  });
+
   it('depth 0 yields nothing', () => {
     expect(extrudeOutline(rectOutline(10, 10), { depth: 0 })).toBeNull();
   });

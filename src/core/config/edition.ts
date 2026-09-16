@@ -112,32 +112,39 @@ export const aiEnabled = (): boolean => true;
 export const aiRunsThroughBackend = (): boolean => isServerEdition();
 
 /**
- * Plugins — the whole feature, not just the registry.
+ * Plugins — the sandbox, the host API, and installing from a local file.
  *
- * Off in the local edition, and this is the predicate to read. It is newer than
- * `pluginRegistryEnabled` below and strictly wider: that one asks "may this
- * build talk to the marketplace", which was the only question while the local
- * edition still ran plugins from disk. It no longer does. A plugin is a hosted
- * product feature: the registry, the review queue, the signed revocation list
- * and the takedown path are the things that make running third-party code in
- * someone's editor defensible, and a build with none of them should not be
- * offering the sandbox either.
+ * ON in both editions. The local edition was briefly plugin-less on the
+ * argument that the registry, review queue and revocation list are what make
+ * running third-party code defensible. That conflated two things. Those
+ * mechanisms protect REGISTRY installs; a package the user picked from their own
+ * disk never went through them in either edition. What actually protects a
+ * local install is the same in both: the manifest parsed before any code
+ * exists, the per-permission consent screen, the signature check when the
+ * package carries one, and the Worker sandbox. None of those need a backend.
+ * An offline After-Effects-style editor that cannot load a plugin file is the
+ * product with its most-requested capability removed.
  *
- * ── This gate is load-bearing, and a predicate alone would hide nothing ─────
+ * What stays server-only is everything that needs motion-back — browsing and
+ * downloading from the registry, update checks, the revocation list, the
+ * account's installed-set sync, publishing — and that is `pluginRegistryEnabled`
+ * below, asked at the network boundary in `registry.ts`, plus
+ * `pluginPublishEnabled` in the main process.
  *
- * The same shape `aiEnabled` was in. Every plugin surface is gated
- * individually — the panel registry, the Plugins menu group, the layer-creation
- * entries, the effects browser folder, the command palette, and the host's own
- * boot in `Providers` — and `editionPluginSurface.test.ts` is what keeps that
- * list honest. If you add a plugin entry point, it fails until it is gated.
+ * ── Still load-bearing ───────────────────────────────────────────────────────
  *
- * What is deliberately NOT gated: everything that reads plugin content out of a
- * DOCUMENT. A project containing a custom layer kind, a plugin effect or a
- * proxy subtree opens, renders and re-saves byte-identically in a build with no
- * plugin support, exactly as it does after an uninstall in a hosted build.
+ * Every plugin surface still reads this predicate individually — the panel
+ * registry, the Plugins menu group, the layer-creation entries, the effects
+ * browser folder, the command palette, and the host's boot in `Providers` — and
+ * `editionPluginSurface.test.ts` keeps that list honest, so turning the feature
+ * off again for some future build is one line that actually hides everything.
+ *
+ * Deliberately never gated: reading plugin content out of a DOCUMENT. A project
+ * containing a custom layer kind, a plugin effect or a proxy subtree opens,
+ * renders and re-saves byte-identically without the plugin installed.
  * `uninstalledDocumentRoundTrip.test.ts` is that property.
  */
-export const pluginsEnabled = (): boolean => isServerEdition();
+export const pluginsEnabled = (): boolean => true;
 
 /**
  * The hosted plugin registry (browse / download / update checks).

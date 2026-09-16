@@ -18,53 +18,27 @@
  * scalar subscription, so a scrub on another layer leaves this row alone.
  *
  * Values are shown in DISPLAY units (`meta.displayScale`, e.g. 0..1 stored as
- * 0..100 %) and written back in engine units; the conversion lives here so
- * the model beneath never learns about percent signs.
+ * 0..100 %) and written back in engine units; the conversion lives in
+ * `useMultiPropertyField`, shared with the two/three-field
+ * `MultiPropertyPairRow`, so the model beneath never learns about percent
+ * signs and the two rows cannot disagree about what a drag means.
+ *
+ * Inside the Properties panel (`useInspectorHosted`) the row draws the compact
+ * inspector layout — label, field, navigator; stopwatch / `=` / whip on hover;
+ * reset in the menu. Anywhere else it keeps the default grid.
  */
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, type ReactNode } from 'react';
 import { ValueField } from '@components/ValueField';
-import { PropertyRow, KeyframeLane } from '@components/PropertyRow';
+import { PropertyRow, KeyframeLane, type PropertyRowLayout } from '@components/PropertyRow';
 import { PickWhip } from '@components/PickWhip';
 import { cn } from '@utils/cn';
-import { applyValueExpression } from '@utils/evalMath';
-import { defaultAnimation, makeKeyframeId } from '@motion/animation';
-import { runAnimEdit } from '@core/animation/animationCommands';
-import { applyEasingToKeyframes, type EasingPreset } from '@core/animation/keyframeAssistants';
-import { compToKeyframeTime, keyframeToCompTime } from '@core/timeline/TimelineController';
-import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
-import { whipExpression } from '@core/whip/whipTarget';
-import { resolvePropertyMeta } from '@core/inspector/propertyMeta';
-import { buildPropertyMenu } from '@core/inspector/propertyMenu';
-import { isPinnedProp } from '@core/inspector/pinnedProps';
-import { useNodesRevision } from '@core/inspector/nodeRevision';
-import { readModifierStack } from '@core/animation/modifierStack';
-import {
-  aggregateProperty,
-  applyAbsolute,
-  applyRelative,
-  applyValues,
-  navigatorState,
-  readPropertyValue,
-  snapshotStarts,
-  toggleAnimationAll,
-  toggleKeyframeAll,
-  type PropertyAccess,
-} from '@core/inspector/multiSelection';
-import { openContextMenu, type ContextMenuItem } from '@stores/contextMenuStore';
-import { useCurrentTime } from '@stores/playbackClockStore';
-import { useProjectStore } from '@stores/projectStore';
 import { useCompositionStore } from '@stores/compositionStore';
-import { usePreferenceStore } from '@stores/preferenceStore';
 import { ExpressionEditor } from '@layout/Motion/ExpressionEditor';
-import {
-  addExpression,
-  consumeExpressionEditorRequest,
-  onExpressionEditorRequest,
-  setFocusedExpressionRow,
-} from '@core/animation/expressionCommands';
-import { useInspectorSelection } from './inspectorSelection';
+import { type PropertyAccess } from '@core/inspector/multiSelection';
+import { useInspectorHosted } from './inspectorSelection';
 import { ModifierChips } from './ModifierChips';
+import { useMultiPropertyField } from './useMultiPropertyField';
 import styles from './MultiPropertyRow.module.css';
 
 export interface MultiPropertyRowProps {
@@ -95,15 +69,12 @@ export interface MultiPropertyRowProps {
   hint?: string;
   compact?: boolean;
   className?: string;
+  /**
+   * Force a row layout. Omitted → `'inspector'` inside the Properties panel,
+   * else whatever `PropertyRowLayoutContext` says.
+   */
+  layout?: PropertyRowLayout;
 }
-
-const EASINGS: ReadonlyArray<{ id: EasingPreset; label: string }> = [
-  { id: 'Linear', label: 'Linear' },
-  { id: 'Ease', label: 'Easy Ease' },
-  { id: 'EaseIn', label: 'Easy Ease In' },
-  { id: 'EaseOut', label: 'Easy Ease Out' },
-  { id: 'Hold', label: 'Toggle Hold' },
-];
 
 function MultiPropertyRowInner({
   nodeId,
@@ -119,165 +90,35 @@ function MultiPropertyRowInner({
   hint: hintOverride,
   compact = true,
   className,
+  layout: layoutProp,
 }: MultiPropertyRowProps): JSX.Element | null {
-  const nodeIds = useInspectorSelection(nodeId);
-  // The tick is a dependency below: the scene graph can hand back the same
-  // node object after a write, so identity alone cannot invalidate the read.
-  const rev = useNodesRevision(nodeIds);
-  const time = useCurrentTime();
+  const f = useMultiPropertyField(nodeId, prop, { access, linkedProp, label: labelOverride });
+  const hosted = useInspectorHosted();
   const fps = useCompositionStore((c) => c.fps) || 30;
   const duration = useCompositionStore((c) => c.durationSeconds) || 0;
-  const autoKeyframe = usePreferenceStore((s) => s.timelineAutoKeyframe);
-  const showLane = usePreferenceStore((s) => s.inspectorShowLane);
-  const [exprOpen, setExprOpen] = useState(false);
-  const starts = useRef<Map<string, number>>(new Map());
 
-  // Add Expression from the timeline's row menu (or Alt+Shift+=) asks THIS row
-  // to open its editor — including when the row mounts just after the request.
-  useEffect(() => {
-    if (consumeExpressionEditorRequest(nodeId, prop)) setExprOpen(true);
-    return onExpressionEditorRequest((ref) => {
-      if (ref.nodeId === nodeId && ref.prop === prop && consumeExpressionEditorRequest(nodeId, prop)) {
-        setExprOpen(true);
-      }
-    });
-  }, [nodeId, prop]);
+  // Single render guard, AFTER every hook.
+  if (!f.exists) return null;
 
-  const node = defaultSceneGraph.getNode(nodeId);
-  const meta = resolvePropertyMeta(prop, nodeId);
-  const scale = meta.displayScale ?? 1;
-  const agg = useMemo(
-    () => aggregateProperty(nodeIds, prop, time, access),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- revision-driven
-    [nodeIds, prop, time, access, node, rev],
-  );
-
-  const opts = useMemo(
-    () => ({ compTime: time, autoKeyframe, ...access }),
-    [time, autoKeyframe, access],
-  );
-  const mergeKey = `multi:${prop}:${nodeIds.join(',')}:${time}`;
-
-  const writeAll = useCallback((display: number) => {
-    const engine = display / scale;
-    applyAbsolute(nodeIds, prop, engine, { ...opts, mergeKey, label: `Set ${meta.label}` });
-    if (linkedProp) applyAbsolute(nodeIds, linkedProp, engine, { ...opts, mergeKey, label: `Set ${meta.label}` });
-  }, [nodeIds, prop, linkedProp, opts, mergeKey, meta.label, scale]);
-
-  const onScrubStart = useCallback(() => {
-    starts.current = snapshotStarts(nodeIds, prop, time, access);
-  }, [nodeIds, prop, time, access]);
-
-  const onRelative = useCallback((delta: number, cumulative: boolean) => {
-    const from = cumulative ? starts.current : snapshotStarts(nodeIds, prop, time, access);
-    const bounds = { min: meta.min, max: meta.max };
-    applyRelative(prop, from, delta / scale, { ...opts, ...bounds, mergeKey, label: `Offset ${meta.label}` });
-    if (linkedProp) {
-      const linkedFrom = cumulative
-        ? starts.current
-        : snapshotStarts(nodeIds, linkedProp, time, access);
-      applyRelative(linkedProp, linkedFrom, delta / scale, { ...opts, ...bounds, mergeKey, label: `Offset ${meta.label}` });
-    }
-  }, [nodeIds, prop, linkedProp, time, access, opts, mergeKey, meta, scale]);
-
-  const onCommitText = useCallback((raw: string): boolean => {
-    const writes: Array<{ nodeId: string; value: number }> = [];
-    for (const id of nodeIds) {
-      const cur = readPropertyValue(id, prop, time, access);
-      if (cur === undefined) continue;
-      const next = applyValueExpression(cur * scale, raw);
-      if (next === null) return false;
-      const clamped = Math.min(meta.max ?? Infinity, Math.max(meta.min ?? -Infinity, next));
-      writes.push({ nodeId: id, value: clamped / scale });
-    }
-    if (writes.length === 0) return false;
-    applyValues(prop, writes, { ...opts, label: `Set ${meta.label}` });
-    if (linkedProp) applyValues(linkedProp, writes, { ...opts, label: `Set ${meta.label}` });
-    return true;
-  }, [nodeIds, prop, linkedProp, time, access, opts, meta, scale]);
-
-  if (!node) return null;
-
-  const label = labelOverride ?? meta.label;
+  const { label } = f;
+  const layout = layoutProp ?? (hosted ? 'inspector' : undefined);
   const displayLabel = shortLabel ? (label.replace(/(Position|Scale|Rotation|Anchor Point)\s*/i, '') || label) : label;
-  const nav = navigatorState(nodeIds, prop, time);
-  const seek = (t: number): void => {
-    useProjectStore.getState().actions.setTime(t, Math.round(t * fps));
-  };
-  const hasExpr = defaultAnimation.hasExpression(nodeId, prop);
-  const exprEnabled = defaultAnimation.isExpressionEnabled(nodeId, prop);
-  const exprError = exprEnabled ? defaultAnimation.getExpressionError(nodeId, prop) : null;
-  const hasStack = readModifierStack(node, prop) !== null;
-  const pinned = isPinnedProp(nodeId, prop);
-  const resetVal = !noReset && meta.resettable && typeof meta.defaultValue === 'number' ? meta.defaultValue : undefined;
-  const layerT = compToKeyframeTime(nodeId, time, prop);
-
-  const hint = hintOverride ?? (nodeIds.length > 1 && agg.present < nodeIds.length
-    ? `${agg.present} of ${nodeIds.length}`
-    : undefined);
-
-  // The lane draws the PRIMARY layer's keyframes on the comp axis.
-  const laneTimes = showLane && agg.animated
-    ? (defaultAnimation.getTrackKeyframes(nodeId, prop) ?? []).map((k) => keyframeToCompTime(nodeId, k.t, prop))
-    : null;
-
-  const onLaneRetime = (fromC: number, toC: number): void => {
-    const fromT = compToKeyframeTime(nodeId, fromC, prop);
-    const toT = compToKeyframeTime(nodeId, toC, prop);
-    runAnimEdit(`Move ${label} keyframe`, () => defaultAnimation.moveKeyframe(nodeId, prop, fromT, toT));
-  };
-
-  const onLaneContext = (e: React.MouseEvent, compT: number): void => {
-    const t = compToKeyframeTime(nodeId, compT, prop);
-    const id = makeKeyframeId(nodeId, prop, t);
-    const items: ContextMenuItem[] = [
-      {
-        id: 'lane-easing',
-        label: 'Keyframe Interpolation',
-        children: EASINGS.map((p) => ({ id: `lane-ease-${p.id}`, label: p.label, onSelect: () => applyEasingToKeyframes([id], p.id) })),
-      },
-      { id: 'lane-sep', separator: true },
-      {
-        id: 'lane-remove',
-        label: 'Remove Keyframe',
-        danger: true,
-        onSelect: () => runAnimEdit(`Remove ${label} keyframe`, () => defaultAnimation.removeKeyframe(nodeId, prop, t)),
-      },
-    ];
-    openContextMenu(e.clientX, e.clientY, items);
-  };
-
-  const onWhip = (target: { nodeId: string; prop?: string }): void => {
-    const name = defaultSceneGraph.getNode(target.nodeId)?.name;
-    if (!name) return;
-    const src = whipExpression(name, target.prop ?? prop);
-    runAnimEdit(`Link ${label}`, () => defaultAnimation.batch(() => {
-      for (const id of nodeIds) {
-        defaultAnimation.setExpression(id, prop, src);
-        defaultAnimation.setExpressionEnabled(id, prop, true);
-      }
-    }));
-    setExprOpen(true);
-  };
+  const hint = hintOverride ?? f.hint;
+  const resetVal = noReset ? undefined : f.resetValue;
 
   const trailing = (
     <>
       <button
         type="button"
-        className={cn(styles.exprToggle, hasExpr && styles.exprOn, exprError && styles.exprErr)}
-        aria-pressed={exprOpen}
-        aria-label={`${exprOpen ? 'Hide' : 'Show'} ${label} expression`}
-        title={exprError ?? (hasExpr ? (exprEnabled ? 'Expression on — click to edit' : 'Expression off — click to edit') : 'Add an expression')}
+        className={cn(styles.exprToggle, f.hasExpr && styles.exprOn, f.exprError && styles.exprErr)}
+        // An attached (or open) expression is the row's expression MARK at rest.
+        data-persist={f.hasExpr || f.exprOpen || undefined}
+        aria-pressed={f.exprOpen}
+        aria-label={`${f.exprOpen ? 'Hide' : 'Show'} ${label} expression`}
+        title={f.exprError ?? (f.hasExpr ? (f.exprEnabled ? 'Expression on — click to edit' : 'Expression off — click to edit') : 'Add an expression')}
         onClick={(e) => {
           e.stopPropagation();
-          // No expression yet: ADD one — AE's default `value`, one undo step, the
-          // same helper the timeline row menu and Alt+Shift+= use — and open it.
-          if (!hasExpr) {
-            addExpression(nodeIds.map((id) => ({ nodeId: id, prop })), { openEditor: false });
-            setExprOpen(true);
-            return;
-          }
-          setExprOpen((v) => !v);
+          f.toggleExpression();
         }}
       >
         =
@@ -286,29 +127,29 @@ function MultiPropertyRowInner({
         label={`${label} pick-whip — drag onto a layer or property to link`}
         className={styles.whip}
         accept={(target) => !(target.nodeId === nodeId && (target.prop ?? prop) === prop)}
-        onPick={onWhip}
+        onPick={f.onWhip}
       />
       {extraTrailing}
     </>
   );
 
-  const below = (exprOpen || hasStack || laneTimes) ? (
+  const below = (f.exprOpen || f.hasStack || f.laneTimes) ? (
     <div className={styles.below}>
-      {hasStack && <ModifierChips nodeId={nodeId} prop={prop} />}
-      {exprOpen && (
+      {f.hasStack && <ModifierChips nodeId={nodeId} prop={prop} />}
+      {f.exprOpen && (
         <div className={styles.expr}>
           <ExpressionEditor nodeId={nodeId} prop={prop} />
         </div>
       )}
-      {laneTimes && (
+      {f.laneTimes && (
         <KeyframeLane
-          times={laneTimes}
+          times={f.laneTimes}
           duration={duration}
           fps={fps}
           label={label}
-          onSeek={seek}
-          onRetime={onLaneRetime}
-          onKeyframeContextMenu={onLaneContext}
+          onSeek={f.seek}
+          onRetime={f.onLaneRetime}
+          onKeyframeContextMenu={f.onLaneContext}
         />
       )}
     </div>
@@ -318,61 +159,26 @@ function MultiPropertyRowInner({
     <PropertyRow
       label={displayLabel}
       srLabel={label}
-      animated={agg.animated}
-      mixed={agg.mixed}
+      layout={layout}
+      animated={f.agg.animated}
+      mixed={f.agg.mixed}
       hint={hint}
-      pinned={pinned}
-      error={exprError}
+      pinned={f.pinned}
+      error={f.exprError}
       compact={compact}
-      className={cn(styles.row, exprOpen && styles.rowExprOpen, className)}
-      onStopwatch={() => toggleAnimationAll(nodeIds, prop, time, access)}
-      navigator={{
-        hasPrev: nav.hasPrev,
-        hasNext: nav.hasNext,
-        atKeyframe: nav.atKeyframe,
-        onPrev: () => nav.prevT !== null && seek(nav.prevT),
-        onNext: () => nav.nextT !== null && seek(nav.nextT),
-        onToggleKeyframe: () => toggleKeyframeAll(nodeIds, prop, time, access),
-      }}
-      onReset={resetVal !== undefined ? () => writeAll(resetVal * scale) : undefined}
-      // "The focused property" for Alt+Shift+= (Add Expression).
-      onFocusCapture={() => setFocusedExpressionRow({ nodeId, prop })}
-      onBlurCapture={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocusedExpressionRow(null);
-      }}
-      onContextMenu={(e) => {
-        e.preventDefault();
-        openContextMenu(
-          e.clientX,
-          e.clientY,
-          buildPropertyMenu({
-            nodeId,
-            prop,
-            layerT,
-            value: agg.value,
-            setValue: (v) => writeAll(v * scale),
-          }),
-        );
-      }}
+      className={cn(styles.row, f.exprOpen && styles.rowExprOpen, className)}
+      onStopwatch={f.toggleAnimation}
+      navigator={f.navigator}
+      onReset={resetVal !== undefined ? () => f.writeAll(resetVal * f.scale) : undefined}
+      onFocusCapture={f.onFocusCapture}
+      onBlurCapture={f.onBlurCapture}
+      onContextMenu={f.openMenu}
       trailing={trailing}
       below={below}
     >
       {before}
-      {renderBefore?.({ value: agg.value * scale, mixed: agg.mixed, setValue: writeAll })}
-      <ValueField
-        value={agg.value * scale}
-        mixed={agg.mixed}
-        unit={meta.unit}
-        min={meta.min !== undefined ? meta.min * scale : undefined}
-        max={meta.max !== undefined ? meta.max * scale : undefined}
-        step={meta.step * scale}
-        precision={meta.precision}
-        onChange={writeAll}
-        onScrubStart={onScrubStart}
-        onRelative={onRelative}
-        onCommitText={onCommitText}
-        aria-label={label}
-      />
+      {renderBefore?.({ value: f.fieldProps.value, mixed: f.agg.mixed, setValue: f.writeAll })}
+      <ValueField {...f.fieldProps} />
     </PropertyRow>
   );
 }

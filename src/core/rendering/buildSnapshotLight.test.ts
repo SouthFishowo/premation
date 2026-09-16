@@ -245,6 +245,38 @@ describe('lights', () => {
   });
 });
 
+describe('a switched-off light does nothing', () => {
+  function lit3d(id: string): SceneNode {
+    return {
+      id, name: id, parent: null, children: [], visible: true, locked: false,
+      transform: { position: { x: 400, y: 300 }, rotation: 0, scale: { x: 1, y: 1 } },
+      components: [
+        { id: `${id}_t`, type: 'Transform', props: { [SCENE_KIND_PROP]: 'shape', x: 400, y: 300, z: 0, rotation: 0, width: 80, height: 80, acceptsLights: true } },
+        { id: `${id}_s`, type: 'Style', props: { opacity: 100, fill: '#3aa' } },
+      ],
+    } as unknown as SceneNode;
+  }
+
+  it('an eye-off light neither glows NOR shades 3D layers (lights3d) — AE: a disabled light does nothing', () => {
+    const on = new SceneGraph();
+    const L = light('L');
+    (L.components[0]!.props as Record<string, unknown>).z = -300;
+    on.addNode(L);
+    on.addNode(lit3d('S'));
+    const lit = buildSnapshot(on, new AnimationEngine(), 0, undefined, undefined, undefined, undefined, COMP);
+    expect((lit.lights3d ?? []).length).toBeGreaterThan(0);
+
+    const off = new SceneGraph();
+    const hidden = light('L');
+    (hidden.components[0]!.props as Record<string, unknown>).z = -300;
+    (hidden as { visible: boolean }).visible = false;
+    off.addNode(hidden);
+    off.addNode(lit3d('S'));
+    const dark = buildSnapshot(off, new AnimationEngine(), 0, undefined, undefined, undefined, undefined, COMP);
+    expect(dark.lights3d ?? []).toHaveLength(0);
+  });
+});
+
 describe('environment light', () => {
   function envLight(id: string, preset = 'sky'): SceneNode {
     const n = light(id);

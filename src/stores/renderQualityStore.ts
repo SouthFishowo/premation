@@ -12,6 +12,7 @@
  */
 
 import { create } from 'zustand';
+import { playbackBlitPolicy } from '@core/rendering/previewCacheGate';
 
 /** 1 = Full, 2 = Half, 3 = Third, 4 = Quarter. */
 export type PreviewResolution = 1 | 2 | 3 | 4;
@@ -151,6 +152,9 @@ export const useRenderQualityStore = create<RenderQualityStore>((set, get) => ({
     set((s) => (s.slowPlayback === v ? s : { slowPlayback: v }));
   },
   reportPlaybackFrame: (ms, budgetMs) => {
+    // The preview cache's blit gate weighs this same measurement against its
+    // blit cost, adaptive resolution on or off (see PlaybackBlitPolicy).
+    playbackBlitPolicy.noteLiveRender(ms, budgetMs);
     const s = get();
     if (!s.adaptive) return;
     // A frame is "slow" when it alone eats more than the whole frame period —

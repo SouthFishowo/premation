@@ -1,0 +1,59 @@
+.pairRow {
+  min-width: 0;
+}
+
+/* One field cell. The ValueField inside fills it, so two slots are two equal
+   halves of the values cell whatever their numbers' widths. */
+.slot {
+  display: flex;
+  min-width: 0;
+}
+
+.slot > [data-numeric] {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+}
+
+/* Linked Scale, between the two fields — where Figma and Framer put it, and
+   where the eye already is when it decides whether W and H move together. */
+.link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  opacity: 0.6;
+  transition: color var(--motion-duration-fast) var(--motion-ease-standard),
+              opacity var(--motion-duration-fast) var(--motion-ease-standard);
+}
+
+.link:hover {
+  color: var(--color-text-primary);
+  background: var(--color-surface-2);
+  opacity: 1;
+}
+
+.link[data-on] {
+  color: var(--color-primary);
+  opacity: 1;
+}
+
+.link:focus-visible {
+  outline: 1px solid var(--color-primary);
+  outline-offset: 1px;
+}
+
+/* Which member an editor belongs to, when more than one is open. */
+.exprCaption {
+  display: block;
+  margin-bottom: var(--space-1);
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+}

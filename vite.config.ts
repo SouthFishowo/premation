@@ -70,6 +70,11 @@ function serveOrtGlue(): Plugin {
 export default defineConfig(({ mode }) => ({
   plugins: [react(), motionCsp(mode), serveOrtGlue()],
   base: './',
+  // `PREMATION_UI_*` joins the default `VITE_` so ONE dev line in `.env.local`
+  // (`PREMATION_UI_PLATFORM=mac`) reaches both the renderer and the Electron
+  // main process, which reads the same files (electron/uiPlatform.ts). Narrow
+  // on purpose: every var matching a prefix is baked into the client bundle.
+  envPrefix: ['VITE_', 'PREMATION_UI_'],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, 'src'),

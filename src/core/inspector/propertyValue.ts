@@ -60,6 +60,9 @@ import {
 import { parseAxisPropPath, readFontAxesProp } from '@core/text/fontAxes';
 import { resolvePropertyMeta } from './propertyMeta';
 import { parseMaskPropPath, getNodeMask, updateMaskPath } from '@core/effects/mask';
+import { parsePaintColorPath, parsePaintPropPath } from '@core/paint/paintProps';
+import { readNodePaint, updatePaintStroke } from '@core/paint/paintStrokes';
+import { paintStrokePatch, readPaintStrokeValue } from '@core/paint/paintValues';
 import { isGradientGeometryProp, readGradientGeometryProp, writeGradientGeometryProp } from './gradientGeometryProps';
 
 /** `#rrggbb` (or `#rgb`) → the normalized channel a colour track carries. */
@@ -234,6 +237,18 @@ export function readStaticPropertyValue(nodeId: string, prop: string): number | 
   const effect = parseEffectPath(prop);
   if (effect) return readEffectValue(nodeId, effect);
 
+  // Paint ▸ Brush N Stroke Options / Transform, and its colour channels.
+  const pp = parsePaintPropPath(prop);
+  if (pp) {
+    const s = readNodePaint(node)?.strokes.find((x) => x.id === pp.strokeId);
+    return s ? readPaintStrokeValue(s, pp.key) : undefined;
+  }
+  const pc = parsePaintColorPath(prop);
+  if (pc) {
+    const s = readNodePaint(node)?.strokes.find((x) => x.id === pc.strokeId);
+    return s ? channelOf(s.color, `_${pc.channel}`) : undefined;
+  }
+
   const mk = parseMaskPropPath(prop);
   if (mk) {
     const path = getNodeMask(nodeId).paths.find((p) => p.id === mk.pathId);
@@ -312,6 +327,14 @@ export function writeStaticPropertyValue(nodeId: string, prop: string, value: nu
 
   const effect = parseEffectPath(prop);
   if (effect) return writeEffectValue(nodeId, effect, value);
+
+  const pp = parsePaintPropPath(prop);
+  if (pp) {
+    const s = readNodePaint(node)?.strokes.find((x) => x.id === pp.strokeId);
+    if (!s) return false;
+    updatePaintStroke(nodeId, s.id, paintStrokePatch(s, pp.key, value));
+    return true;
+  }
 
   const mk = parseMaskPropPath(prop);
   if (mk) {
@@ -400,6 +423,11 @@ export function canWriteStaticPropertyValue(nodeId: string, prop: string): boole
     const param = effectDefFor(stored.type)?.params.find((p) => p.key === effect.key);
     return !param || param.type === 'number' || param.type === 'checkbox' || param.type === 'enum';
   }
+
+  const pp = parsePaintPropPath(prop);
+  if (pp) return readNodePaint(node)?.strokes.some((x) => x.id === pp.strokeId) ?? false;
+  // A colour channel has no single scrubbable value, as for effect colours.
+  if (parsePaintColorPath(prop)) return false;
 
   const mk = parseMaskPropPath(prop);
   if (mk) return getNodeMask(nodeId).paths.some((p) => p.id === mk.pathId);

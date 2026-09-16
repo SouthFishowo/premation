@@ -62,17 +62,46 @@ export const STATIC_CAPABILITIES = Object.freeze([
   'presets',
   'panels',
   'wasm',
+  /** `motion.effects.describe(type)` — an effect's param ids, types and ranges. */
+  'effects.describe',
+  /** Colour (`'#rrggbb'`, `{ r, g, b, a }`) and point (`{ x, y }`) keyframe values. */
+  'animation.typed',
+  /** `render: "generator"` layer kinds — per-frame `generate()` producing
+   *  instanced geometry. A plugin whose whole point is a particle system should
+   *  `require` this rather than install inert. */
+  'layerkinds.generator',
+  /** `render: "shader"` kinds that NAME their effect (`shader: "<effectId>"`)
+   *  and are drawn with it. The strategy parsed before this capability existed;
+   *  what the capability promises is that the host actually draws one. */
+  'layerkinds.shader',
+  /*
+    The four UI surfaces (API 7). Separate names rather than one `ui`, because
+    they are absent independently and an author asking for one should not be
+    refused for another: a plugin whose whole point is a viewport gizmo cannot
+    run without `ui.canvas` and does not care about `ui.expressions`.
+  */
+  /** `contributes.inspector` — parameter sections on layers it does not own. */
+  'ui.inspector',
+  /** `motion.ui.draw(...)` — a retained draw list in the viewport, with events. */
+  'ui.canvas',
+  /** `contributes.tools` — a tool on the toolbar, holding the viewport while active. */
+  'ui.tools',
+  /** `contributes.shortcuts` — a chord for one of the plugin's own commands. */
+  'ui.shortcuts',
+  /** `contributes.expressions` — named functions callable from expressions. */
+  'ui.expressions',
 ] as const);
 
 /**
  * Capabilities that depend on the machine, not the build.
  *
  * `webgpu` is the only one so far and it is the reason this concept exists at
- * all. A plugin effect is WGSL; on the WebGL2 tier it renders its input
- * unchanged, so an effect plugin installed there is not degraded, it is inert.
- * Listing `webgpu` in `requires` is how an author says "there is no point
- * installing me here", and it is a far better answer than a plugin that appears
- * to work and quietly does nothing.
+ * all. An effect ships WGSL, GLSL or both: on the WebGL2 tier a WGSL-only
+ * effect now reports `unsupported` with a reason and emits no pass, rather
+ * than passing its input through and looking installed-but-dead. Listing
+ * `webgpu` in `requires` is how an author says "there is no point installing
+ * me here" before any of that, which is still the better answer for a plugin
+ * that has nothing to offer the WebGL2 tier at all.
  *
  * Resolved per call rather than captured, because the renderer tier is decided
  * during boot — after this module is first imported.

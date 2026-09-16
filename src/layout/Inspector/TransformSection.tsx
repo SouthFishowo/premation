@@ -1,14 +1,26 @@
 /**
- * TransformSection — anchor, position, scale, size, rotation, opacity and the
- * advanced 3D tail, as an AE-style flat property list.
+ * TransformSection — position, scale, size, rotation, opacity, anchor and a
+ * collapsed "More" (skew, fill opacity, 3D), as a compact property list.
  *
- * Every numeric row is a `MultiPropertyRow` (2026-09-04): the row reads the
- * property across the WHOLE selection, shows `—` where the layers disagree,
- * writes every layer on a typed value, offsets every layer on a drag, and
- * records one undo entry per gesture. The section itself keeps only what is
- * not a row — the group subheads with their group stopwatches, the anchor
- * snap matrix, the Linked Scale switch, the advanced disclosure and the
- * preset menu.
+ * Every numeric row reads the property across the WHOLE selection, shows `—`
+ * where the layers disagree, writes every layer on a typed value, offsets every
+ * layer on a drag, and records one undo entry per gesture (2026-09-04).
+ *
+ * LAYOUT (2026-09-15). Two-axis properties are ONE row — `Position [X][Y]` —
+ * through `MultiPropertyPairRow`, whose group stopwatch replaced the uppercase
+ * subheads and their per-group stopwatch buttons. The old section spent five
+ * controls per property on seven groups plus an always-visible 3×3 anchor
+ * matrix, truncated "X"/"Y" at the default panel width and scrolled before it
+ * reached Rotation; users called it "too many buttons". Order follows use:
+ * the properties people touch constantly first, anchor after them, and the
+ * rarely-touched ones behind "More".
+ *
+ * Units: the px / % switch for Position and Anchor sits in the row's hover
+ * tray (label cell), not as a button beside the label. At rest the field's own
+ * unit suffix already says which unit is live, so a permanent switch would be
+ * one more control on every glance for a choice made once; the right-click
+ * menu was the other candidate, but a unit is a view setting of the ROW, not
+ * of one of its properties, and the menu is per property.
  *
  * Reads are per NODE revision, so a scrub on an unselected layer does not
  * touch this section, and the section is memoised by its host so a keystroke
@@ -18,6 +30,8 @@
 import { memo, useCallback, useMemo, useState, type ReactNode } from 'react';
 import { Icon } from '@components/Icon';
 import { AngleDial } from '@components/AngleDial';
+import { Popover } from '@components/Popover';
+import { PropertyRowLayoutContext } from '@components/PropertyRow';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { is3DEnabled, canBe3D } from '@core/scene/threeD';
 import { setAnchor, estimateNodeBounds } from '@core/scene/anchor';
@@ -25,16 +39,16 @@ import { readNodeKind } from '@core/scene/sceneDerive';
 import { defaultAnimation } from '@motion/animation';
 import { useNodeRevision } from '@core/inspector/nodeRevision';
 import { staticOrDefaultValue } from '@core/inspector/propertyValue';
-import { toggleAnimationGroup, type PropertyAccess } from '@core/inspector/multiSelection';
+import { type PropertyAccess } from '@core/inspector/multiSelection';
 import { applyTransformPreset, captureTransformPreset } from '@core/inspector/sectionPresets';
-import { useCurrentTime } from '@stores/playbackClockStore';
+import { useThrottledTime } from '@stores/playbackClockStore';
 import { usePreferenceStore } from '@stores/preferenceStore';
 import { batchHistory } from '@stores/historyStore';
 import { MultiPropertyRow } from './MultiPropertyRow';
+import { MultiPropertyPairRow, type PairFieldSpec } from './MultiPropertyPairRow';
 import { SectionPresetMenu } from './SectionPresetMenu';
 import { ThreeDControl } from './ThreeDControl';
 import { useInspectorSelection } from './inspectorSelection';
-import { ValueFieldDisplayContext } from '@components/ValueField/ValueField';
 import { useCompositionStore } from '@stores/compositionStore';
 import {
   anchorPercentDisplay,
@@ -47,11 +61,6 @@ import {
 
 import styles from './TransformSection.module.css';
 
-/** Show the rows below in a display unit (AE "Edit Value…" units) — or as-is. */
-function withUnit(display: UnitDisplay | null, el: JSX.Element): JSX.Element {
-  return display ? <ValueFieldDisplayContext.Provider value={display}>{el}</ValueFieldDisplayContext.Provider> : el;
-}
-
 /** Rotation-flavored props get a purpose-built dial next to their number —
  *  the dial writes through the SAME path as the ValueField, so keyframing,
  *  auto-key and multi-selection behaviour are identical. */
@@ -59,9 +68,6 @@ const ROTATION_PROPS = new Set([
   'rotation',
   'rotationX',
   'rotationY',
-  'orientationX',
-  'orientationY',
-  'orientationZ',
 ]);
 
 const ANCHOR_PRESETS: Array<{ id: string; label: string; getOffset: (w: number, h: number) => { x: number; y: number } }> = [
@@ -78,6 +84,14 @@ const ANCHOR_PRESETS: Array<{ id: string; label: string; getOffset: (w: number, 
 
 /** Props that live on the Style/Text component rather than the Transform. */
 const STYLE_PROPS = new Set(['opacity', 'fillOpacity']);
+
+/**
+ * The "More" disclosure's remembered state. Kept in the accordion's own
+ * open/closed map rather than component state: this section remounts on every
+ * selection change, so component state would snap shut each time a layer is
+ * clicked.
+ */
+const MORE_KEY = 'transform.more';
 
 function hasTransform(nodeId: string): boolean {
   return defaultSceneGraph.getNode(nodeId)?.components.some((c) => c.type === 'Transform') === true;
@@ -120,6 +134,11 @@ function accessFor(prop: string): PropertyAccess {
   return a;
 }
 
+/** One field of a pair row, with the section's reader and an optional unit. */
+function field(prop: string, prefix: string, display?: UnitDisplay | null): PairFieldSpec {
+  return { prop, prefix, access: accessFor(prop), displayContext: display ?? null };
+}
+
 export function TransformPresetAction({
   nodeId,
   nodeIds,
@@ -127,7 +146,7 @@ export function TransformPresetAction({
   nodeId: string;
   nodeIds?: ReadonlyArray<string>;
 }): JSX.Element {
-  const time = useCurrentTime();
+  const time = useThrottledTime();
   const autoKeyframe = usePreferenceStore((s) => s.timelineAutoKeyframe);
   const targetIds = useInspectorSelection(nodeId);
   const effectiveNodeIds = nodeIds && nodeIds.length > 0 ? nodeIds : targetIds;
@@ -152,13 +171,15 @@ export function TransformPresetAction({
 function TransformSectionInner({ nodeId }: { nodeId: string }): JSX.Element | null {
   useNodeRevision(nodeId);
   const nodeIds = useInspectorSelection(nodeId);
-  const time = useCurrentTime();
   const node = defaultSceneGraph.getNode(nodeId);
   const [linkedScale, setLinkedScale] = useState(true);
+  const [anchorMenuOpen, setAnchorMenuOpen] = useState(false);
   // Position / Anchor units (px | %), remembered across mounts.
   const [units, setUnits] = useState<TransformUnits>(loadTransformUnits);
   const compW = useCompositionStore((s) => s.width);
   const compH = useCompositionStore((s) => s.height);
+  const moreRemembered = usePreferenceStore((s) => s.inspectorSections[MORE_KEY]);
+  const setPref = usePreferenceStore((s) => s.set);
 
   // NO early return before the hooks below — the hook count must not depend
   // on whether the node exists (deleting a selected layer with this panel open
@@ -181,42 +202,22 @@ function TransformSectionInner({ nodeId }: { nodeId: string }): JSX.Element | nu
   const heightVal = tComp.props.height;
   const hasSize = typeof widthVal === 'number' && typeof heightVal === 'number';
 
-  const row = (prop: string, extra?: { linkedProp?: string }): JSX.Element => (
+  const row = (prop: string): JSX.Element => (
     <MultiPropertyRow
       key={prop}
       nodeId={nodeId}
       prop={prop}
-      shortLabel
       access={accessFor(prop)}
-      linkedProp={extra?.linkedProp}
       renderBefore={ROTATION_PROPS.has(prop) ? rotationDial(prop) : undefined}
     />
   );
-
-  /** The GROUP stopwatch on a subhead: every prop of the group, every layer. */
-  const groupStopwatch = (label: string, props: string[]): JSX.Element => {
-    const animated = nodeIds.some((id) => props.some((p) => defaultAnimation.isAnimated(id, p)));
-    return (
-      <button
-        type="button"
-        className={`${styles.stopwatch} ${animated ? styles.stopwatchOn : ''}`}
-        title={animated ? 'Remove animation (delete keyframes)' : 'Enable animation (create first keyframe)'}
-        onClick={(e) => {
-          e.stopPropagation();
-          toggleAnimationGroup(nodeIds, props, time, label, accessFor(props[0] ?? ''));
-        }}
-        aria-label={animated ? `Disable ${label} animation` : `Enable ${label} animation`}
-      >
-        <Icon name="stopwatch" size="sm" />
-      </button>
-    );
-  };
 
   const kind = readNodeKind(node);
   const is3D = is3DEnabled(node);
   const isCamera = kind === 'camera';
   const isLight = kind === 'light';
   const hasDepth = isCamera || isLight || is3D;
+  const threeDEligible = kind !== 'group' && kind !== 'null' && canBe3D(node);
 
   const anyAnimated = (props: string[]): boolean => props.some((p) => defaultAnimation.isAnimated(nodeId, p));
 
@@ -246,8 +247,8 @@ function TransformSectionInner({ nodeId }: { nodeId: string }): JSX.Element | nu
     return Math.abs(anchorX - target.x) < 1.5 && Math.abs(anchorY - target.y) < 1.5;
   };
 
-  // Units menu on Position (px | % of composition) and Anchor Point (px | % of
-  // layer). Scale has none — it is already a percentage.
+  // Units switch on Position (px | % of composition) and Anchor Point (px | %
+  // of layer). Scale has none — it is already a percentage.
   const unitToggle = (key: keyof TransformUnits, label: string, ofWhat: string): JSX.Element => {
     const pct = units[key] === '%';
     return (
@@ -273,115 +274,141 @@ function TransformSectionInner({ nodeId }: { nodeId: string }): JSX.Element | nu
   const ancX = units.anchor === '%' ? anchorPercentDisplay(bounds.width) : null;
   const ancY = units.anchor === '%' ? anchorPercentDisplay(bounds.height) : null;
 
-  const positionProps = ['x', 'y', ...(hasDepth ? ['z'] : [])];
-  const rotationProps = ['rotation', ...(is3D ? ['rotationX', 'rotationY'] : [])];
-
-  // AE-style flat property list: a subhead per group (label · animated dot ·
-  // stopwatch), then its rows inline — no popovers, everything one glance away.
-  const subhead = (label: string, animated: boolean, stopwatch: JSX.Element | null, extra?: JSX.Element): JSX.Element => (
-    <div className={styles.subhead}>
-      {label}
-      {animated && <span className={styles.animatedDot} />}
-      {extra}
-      <span style={{ flex: 1 }} />
-      {stopwatch}
-    </div>
+  // The 3×3 snap matrix, one click away instead of always on screen: it is a
+  // set-once control, and at rest it was the tallest thing in the section.
+  const anchorPresets = (
+    <Popover
+      open={anchorMenuOpen}
+      onOpenChange={setAnchorMenuOpen}
+      placement="bottom-end"
+      className={styles.anchorPopover}
+      // A plain button, not `IconButton`: IconButton wraps itself in a Radix
+      // Tooltip that throws without a `TooltipProvider`, and this section is
+      // mounted provider-less by its own suites and the playback render-budget
+      // test. A section must not start requiring an app-root provider just to
+      // draw one trigger.
+      trigger={(
+        <button
+          type="button"
+          className={styles.anchorButton}
+          data-open={anchorMenuOpen || undefined}
+          aria-label="Anchor presets"
+          aria-haspopup="true"
+          aria-expanded={anchorMenuOpen}
+          title="Snap anchor to a corner, edge or the centre"
+        >
+          <Icon name="grid" size="sm" />
+        </button>
+      )}
+    >
+      <div
+        className={styles.anchorOriginBox}
+        title="Quick Snap Anchor Origin (3x3 Matrix)"
+        role="group"
+        aria-label="Anchor Origin Matrix"
+      >
+        {ANCHOR_PRESETS.map((p) => (
+          <button
+            key={p.id}
+            type="button"
+            className={`${styles.anchorDot} ${isPresetActive(p) ? styles.anchorDotActive : ''}`}
+            title={p.label}
+            aria-label={`Snap anchor to ${p.label}`}
+            aria-pressed={isPresetActive(p)}
+            onClick={() => {
+              applyAnchorPreset(p);
+              setAnchorMenuOpen(false);
+            }}
+          />
+        ))}
+      </div>
+    </Popover>
   );
 
+  // Closed by default — unless something in it is live, so an animated skew
+  // or a 3D layer's controls are never hidden on first sight.
+  const moreOpen = moreRemembered ?? (is3D || anyAnimated(['skew', 'skewAxis', 'fillOpacity']));
+  const toggleMore = (): void => {
+    setPref('inspectorSections', { ...usePreferenceStore.getState().inspectorSections, [MORE_KEY]: !moreOpen });
+  };
+
   return (
-    <div className={styles.section}>
-      <div className={styles.inlineRows}>
-        {!isCamera && (
-          <>
-            {subhead('Anchor', anyAnimated(['anchorX', 'anchorY']), groupStopwatch('Anchor', ['anchorX', 'anchorY']), unitToggle('anchor', 'Anchor Point', 'layer'))}
-            <div className={styles.anchorMatrixRow}>
-              <div
-                className={styles.anchorOriginBox}
-                title="Quick Snap Anchor Origin (3x3 Matrix)"
-                role="group"
-                aria-label="Anchor Origin Matrix"
-              >
-                {ANCHOR_PRESETS.map((p) => (
-                  <button
-                    key={p.id}
-                    type="button"
-                    className={`${styles.anchorDot} ${isPresetActive(p) ? styles.anchorDotActive : ''}`}
-                    title={p.label}
-                    aria-label={`Snap anchor to ${p.label}`}
-                    aria-pressed={isPresetActive(p)}
-                    onClick={() => applyAnchorPreset(p)}
-                  />
-                ))}
-              </div>
-            </div>
-            {withUnit(ancX, row('anchorX'))}
-            {withUnit(ancY, row('anchorY'))}
-          </>
-        )}
+    // Every row in this section draws the compact inspector layout, wherever
+    // the section is mounted — a pair row and a single row must share a grid.
+    <PropertyRowLayoutContext.Provider value="inspector">
+      <div className={styles.section}>
+        <div className={styles.rows}>
+          <MultiPropertyPairRow
+            nodeId={nodeId}
+            label="Position"
+            props={[field('x', 'X', posX), field('y', 'Y', posY), ...(hasDepth ? [field('z', 'Z')] : [])]}
+            trailing={unitToggle('position', 'Position', 'composition')}
+          />
 
-        {subhead('Position', anyAnimated(positionProps), groupStopwatch('Position', positionProps), unitToggle('position', 'Position', 'composition'))}
-        {withUnit(posX, row('x'))}
-        {withUnit(posY, row('y'))}
-        {hasDepth && row('z')}
+          <MultiPropertyPairRow
+            nodeId={nodeId}
+            label="Scale"
+            props={[field('scaleX', 'W'), field('scaleY', 'H')]}
+            linked={{ value: linkedScale, onToggle: () => setLinkedScale((v) => !v), label: 'Scale dimensions' }}
+          />
 
-        <div className={styles.subhead}>
-          <span>Scale</span>
+          {hasSize && (
+            <MultiPropertyPairRow
+              nodeId={nodeId}
+              label="Size"
+              props={[field('width', 'W'), field('height', 'H')]}
+            />
+          )}
+
+          {row('rotation')}
+
+          {sComp && row('opacity')}
+
+          {!isCamera && (
+            <MultiPropertyPairRow
+              nodeId={nodeId}
+              label="Anchor"
+              srLabel="Anchor Point"
+              props={[field('anchorX', 'X', ancX), field('anchorY', 'Y', ancY), ...(is3D ? [field('anchorZ', 'Z')] : [])]}
+              trailing={unitToggle('anchor', 'Anchor Point', 'layer')}
+              after={anchorPresets}
+            />
+          )}
+
           <button
             type="button"
-            onClick={() => setLinkedScale(!linkedScale)}
-            className={`${styles.lockToggle} ${linkedScale ? styles.lockToggleActive : ''}`}
-            title={linkedScale ? 'Unlink Scale dimensions' : 'Link Scale dimensions (Uniform Zoom)'}
-            aria-label={linkedScale ? 'Unlink Scale dimensions' : 'Link Scale dimensions (Uniform Zoom)'}
-            aria-pressed={linkedScale}
+            className={styles.moreToggle}
+            aria-expanded={moreOpen}
+            onClick={toggleMore}
           >
-            <Icon name={linkedScale ? 'lock' : 'unlock'} size="sm" />
+            <Icon name={moreOpen ? 'chevron-down' : 'chevron-right'} size="sm" />
+            More
           </button>
-          {anyAnimated(['scaleX', 'scaleY']) && <span className={styles.animatedDot} />}
-          <span style={{ flex: 1 }} />
-          {groupStopwatch('Scale', ['scaleX', 'scaleY'])}
+          {moreOpen && (
+            <div className={styles.moreBody}>
+              {row('skew')}
+              {row('skewAxis')}
+              {sComp && row('fillOpacity')}
+              {threeDEligible && (
+                <ThreeDControl nodeId={nodeId}>
+                  {is3D && (
+                    <>
+                      {row('rotationX')}
+                      {row('rotationY')}
+                      <MultiPropertyPairRow
+                        nodeId={nodeId}
+                        label="Orientation"
+                        props={[field('orientationX', 'X'), field('orientationY', 'Y'), field('orientationZ', 'Z')]}
+                      />
+                    </>
+                  )}
+                </ThreeDControl>
+              )}
+            </div>
+          )}
         </div>
-        {row('scaleX', { linkedProp: linkedScale ? 'scaleY' : undefined })}
-        {row('scaleY', { linkedProp: linkedScale ? 'scaleX' : undefined })}
-
-        {hasSize && (
-          <>
-            {subhead('Size', anyAnimated(['width', 'height']), groupStopwatch('Size', ['width', 'height']))}
-            {row('width')}
-            {row('height')}
-          </>
-        )}
-
-        {subhead('Rotation', anyAnimated(rotationProps), groupStopwatch('Rotation', rotationProps))}
-        {row('rotation')}
-
-        {subhead('Skew', anyAnimated(['skew', 'skewAxis']), groupStopwatch('Skew', ['skew']))}
-        {row('skew')}
-        {row('skewAxis')}
-
-        {sComp && (
-          <>
-            {subhead('Opacity', anyAnimated(['opacity']), groupStopwatch('Opacity', ['opacity']))}
-            {row('opacity')}
-            {row('fillOpacity')}
-          </>
-        )}
-
-        {kind !== 'group' && kind !== 'null' && canBe3D(node) && (
-          <ThreeDControl nodeId={nodeId}>
-            {is3D && (
-              <>
-                {row('rotationX')}
-                {row('rotationY')}
-                {row('orientationX')}
-                {row('orientationY')}
-                {row('orientationZ')}
-                {row('anchorZ')}
-              </>
-            )}
-          </ThreeDControl>
-        )}
       </div>
-    </div>
+    </PropertyRowLayoutContext.Provider>
   );
 }
 

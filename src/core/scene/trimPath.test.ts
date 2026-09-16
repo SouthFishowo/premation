@@ -18,9 +18,18 @@ describe('trimSegments', () => {
     expect(segs[1]![0]).toBeCloseTo(0);
     expect(segs[1]![1]).toBeCloseTo(0.25);
   });
-  it('empty when start >= end', () => {
+  it('empty when start == end', () => {
     expect(trimSegments(50, 50, 0)).toEqual([]);
-    expect(trimSegments(80, 20, 0)).toEqual([]);
+  });
+  it('start past end shows the span BETWEEN them, as AE and lottie-web do', () => {
+    // An End animating back past Start must not make the stroke vanish.
+    expect(trimSegments(80, 20, 0)).toEqual(trimSegments(20, 80, 0));
+    const segs = trimSegments(80, 20, 0);
+    expect(segs).toHaveLength(1);
+    expect(segs[0]![0]).toBeCloseTo(0.2);
+    expect(segs[0]![1]).toBeCloseTo(0.8);
+    // And the swapped window still honours Offset, wrap included.
+    expect(trimSegments(50, 0, 75)).toEqual(trimSegments(0, 50, 75));
   });
 });
 

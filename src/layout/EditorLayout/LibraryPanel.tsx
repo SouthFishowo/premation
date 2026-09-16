@@ -16,6 +16,9 @@
  *
  * `ComponentsPanel`, `ShapesPanel` and `TextPanel` are exported as components
  * but are NOT registered panels — they render as sections inside this one.
+ *
+ * Effects, Presets and Plugins follow them: the add-from libraries whose own
+ * panels are on demand, drawn from those panels' bodies (`LibraryAddSections`).
  */
 
 import { useMemo, useState, useRef, useEffect } from 'react';
@@ -645,13 +648,6 @@ const LIBRARY_SECTIONS: ReadonlyArray<{ id: LibrarySection; label: string; icon:
   /*
     Templates is the one library with no other home: it was reachable only
     through a document already using one.
-
-    Presets, Swatches, Materials and Ease were listed here too (2026-09-04)
-    and are gone again (2026-09-05). Each was the SAME component the right
-    rail already shows as its own tab (Presets, Swatches), the Properties
-    panel's Style tab (Materials) or the Graph panel (Ease) — so the rail had
-    twelve tabs, the strip scrolled off the panel, and the same surface
-    answered to two names. One implementation, one place.
   */
   { id: 'templates',   label: 'Templates',   icon: 'layout' },
 ];

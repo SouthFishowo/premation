@@ -66,12 +66,20 @@ export interface Node3D {
    *  `convex` are multi-segment curved profiles (see `extrudeOutline`, which
    *  raises the bevel segment count for them). */
   bevelStyle: BevelStyle;
+  /** AE Hole Bevel Depth: the chamfer on a glyph's counters (the hole of an
+   *  O) as a percentage of Bevel Depth, 0–100. Absent → 100 (holes bevel
+   *  like the rim — the look every existing document already has). */
+  holeBevelDepth: number;
 }
+
+/** Hole Bevel Depth's default — and why it is never written to file. */
+export const DEFAULT_HOLE_BEVEL_DEPTH = 100;
 
 const ZERO_3D: Node3D = {
   z: 0, rotationX: 0, rotationY: 0,
   orientationX: 0, orientationY: 0, orientationZ: 0, anchorZ: 0,
   extrusionDepth: 0, bevelDepth: 0, bevelStyle: DEFAULT_BEVEL_STYLE,
+  holeBevelDepth: DEFAULT_HOLE_BEVEL_DEPTH,
 };
 
 function transformComponent(node: SceneNode): { id: string; props: Record<string, unknown> } | undefined {
@@ -155,6 +163,9 @@ export function readNode3D(node: SceneNode): Node3D {
     bevelStyle: BEVEL_STYLES.includes(t.props.bevelStyle as BevelStyle)
       ? (t.props.bevelStyle as BevelStyle)
       : DEFAULT_BEVEL_STYLE,
+    holeBevelDepth: typeof t.props.holeBevelDepth === 'number'
+      ? Math.max(0, Math.min(100, t.props.holeBevelDepth))
+      : DEFAULT_HOLE_BEVEL_DEPTH,
   };
 }
 
@@ -186,6 +197,21 @@ export function setNodeBevelDepth(nodeId: string, depth: number): void {
   if (!t) return;
   const v = Math.max(0, Math.min(200, depth));
   defaultSceneGraph.writeProp(nodeId, t.id, 'bevelDepth', v > 0 ? v : undefined);
+  bumpScene();
+}
+
+/**
+ * Set a layer's Hole Bevel Depth (% of Bevel Depth, 0–100). Stored only when
+ * it differs from the default 100 so existing layers add nothing to file.
+ * Keyframe tracks on 'holeBevelDepth' beat this static value.
+ */
+export function setNodeHoleBevelDepth(nodeId: string, percent: number): void {
+  const node = defaultSceneGraph.getNode(nodeId);
+  if (!node) return;
+  const t = transformComponent(node);
+  if (!t) return;
+  const v = Math.max(0, Math.min(100, percent));
+  defaultSceneGraph.writeProp(nodeId, t.id, 'holeBevelDepth', v !== DEFAULT_HOLE_BEVEL_DEPTH ? v : undefined);
   bumpScene();
 }
 

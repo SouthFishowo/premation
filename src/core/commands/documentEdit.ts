@@ -13,22 +13,13 @@
  * would buy nothing anyone wants.
  */
 
-import { sceneProjectIO } from '@core/scene/sceneProjectIO';
-import { defaultAnimation, type AnimSnapshot } from '@motion/animation';
 import { StoreSnapshotCommand } from '@stores/historyStore';
 import { getCommandSystem } from '@core/commands/CommandSystem';
 import { bumpScene } from '@stores/sceneStore';
-import type { ProjectFile } from '@core/types';
+import { captureSharedState, statesEqual, type DocState } from '@core/commands/snapshotSharing';
 
-interface DocState {
-  scene: ProjectFile;
-  anim: AnimSnapshot;
-}
-
-const capture = (): DocState => ({
-  scene: structuredClone(sceneProjectIO.capture()),
-  anim: defaultAnimation.snapshot(),
-});
+/** Scene + animation, structurally shared with every other history snapshot. */
+const capture = (): DocState => captureSharedState();
 
 /**
  * Run `mutate` and record it as one undoable entry labelled `label`.
@@ -52,8 +43,9 @@ export function runDocumentEdit<T>(label: string, mutate: () => T): T {
     history.resume();
   }
   const after = capture();
-  // A no-op must not litter the undo stack.
-  if (JSON.stringify(before) !== JSON.stringify(after)) {
+  // A no-op must not litter the undo stack. Same JSON-equality as before, walked
+  // only through what the mutation changed.
+  if (!statesEqual(before, after)) {
     history.push(new StoreSnapshotCommand(label, before, after));
   }
   bumpScene();

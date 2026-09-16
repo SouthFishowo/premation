@@ -8,7 +8,7 @@
  * pen), the same way AE adds them from a tool rather than from Effect Controls.
  */
 
-import { useEffect, useRef, useState, useMemo, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useMemo } from 'react';
 import { Icon, type IconName } from '@components/Icon';
 import { SearchField } from '@components/SearchField';
 import { ValueField } from '@components/ValueField';
@@ -23,12 +23,11 @@ import { useSceneRevision } from '@stores/sceneStore';
 import { useActiveWorkspace } from '@stores/projectStore';
 import { compToKeyframeTime } from '@core/timeline/TimelineController';
 import { useUIStore } from '@stores/uiStore';
-import { usePreferenceStore } from '@stores/preferenceStore';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
-import { EFFECT_DEFS, getNodeEffects, type EffectDef } from '@core/effects/effects';
-import { pluginEffectDefs, pluginEffectsCanRender, PLUGIN_EFFECT_CATEGORY } from '@core/effects/pluginEffectDefs';
-import { subscribeToEffects, pluginEffectRevision } from '@core/plugins/pluginEffects';
-import { addEffectAndReveal, revealEffectControls } from './revealEffectControls';
+import { getNodeEffects, type EffectDef } from '@core/effects/effects';
+import { pluginEffectsCanRender, PLUGIN_EFFECT_CATEGORY } from '@core/effects/pluginEffectDefs';
+import { addEffectAndReveal, revealEffectsInProperties } from './revealEffectControls';
+import { useAllEffectDefs, useEffectFavorites } from './effectCatalog';
 import {
   copyAllEffects,
   pasteEffects,
@@ -80,23 +79,6 @@ import {
 import styles from './EffectsPanel.module.css';
 
 export { EFFECT_CATEGORY };
-
-/** Starred effect type ids — preference, same rationale as library favourites. */
-function useEffectFavorites(): {
-  favorites: ReadonlySet<string>;
-  toggle: (id: string) => void;
-  isFavorite: (id: string) => boolean;
-} {
-  const list = usePreferenceStore((s) => s.effectFavorites);
-  const setPref = usePreferenceStore((s) => s.set);
-  const favorites = useMemo(() => new Set(list), [list]);
-  return {
-    favorites,
-    isFavorite: (id) => favorites.has(id),
-    toggle: (id) =>
-      setPref('effectFavorites', favorites.has(id) ? list.filter((x) => x !== id) : [...list, id]),
-  };
-}
 
 /**
  * Star toggle on an effect browser row. Not a `<button>` — the row is already
@@ -202,14 +184,19 @@ interface FxPreview {
   y: number;
 }
 
-export function EffectsPanel(): JSX.Element {
-  const primary = useSelectionStore((s) => s.primary);
+/**
+ * The effect library tree for one target layer: stack clipboard chips, search,
+ * folders, favourites, effect presets, shape operators and simulation.
+ *
+ * Its own component so the Library's Effects section hosts the SAME browser
+ * this panel does. `nodeId` may be null there — the tree still browses and
+ * still drags onto a layer; a click says a layer is needed.
+ */
+export function EffectBrowser({ nodeId }: { nodeId: string | null }): JSX.Element {
   useSceneRevision((s) => s.rev);
-  // The playhead on the layer's KEYFRAME axis — where the renderer reads the
-  // mask, so the keyframe button and every mask edit below land where the shape
-  // actually changes. Raw comp time was wrong for a moved or trimmed layer.
-  const maskCompTime = useActiveWorkspace()?.time ?? 0;
-  const maskTime = primary ? compToKeyframeTime(primary, maskCompTime) : maskCompTime;
+  // A stale id (the layer deleted under an open Library) browses like no
+  // selection rather than writing to a node that is gone.
+  const primary = nodeId && defaultSceneGraph.getNode(nodeId) ? nodeId : null;
   const [effectQuery, setEffectQuery] = useState('');
   const [starredOnly, setStarredOnly] = useState(false);
   /*
@@ -242,27 +229,9 @@ export function EffectsPanel(): JSX.Element {
     [],
   );
 
-  // NOTE: the empty-state early return must come AFTER every hook — the
-  // browser-accordion useMemos below run on every render, and returning before
-  // them changed the hook count the moment a layer was selected, which is a
-  // Rules-of-Hooks crash that took the whole editor down with it.
-  const hasSelection = !!(primary && defaultSceneGraph.getNode(primary));
-
-  /*
-    Plugin effects are appended to the built-ins, not merged into them.
-
-    `EFFECT_DEFS` is a module-level constant; the plugin set changes while the
-    app runs — a plugin is enabled, disabled, updated, or turned off after a
-    device loss. So it is read through the store's revision, which is what makes
-    this list re-render rather than showing whatever was installed at load.
-  */
-  const pluginRev = useSyncExternalStore(subscribeToEffects, () => pluginEffectRevision());
-  const allDefs = useMemo(
-    () => [...EFFECT_DEFS, ...pluginEffectDefs()],
-    // `pluginRev` is the dependency that matters; `pluginEffectDefs()` reads
-    // module state and would otherwise be memoised against nothing.
-    [pluginRev],
-  );
+  // Built-ins then plugin effects, re-read when the plugin set changes — see
+  // `useAllEffectDefs`.
+  const allDefs = useAllEffectDefs();
 
   const q = effectQuery.trim().toLowerCase();
   const browserDefs = allDefs.filter((d) => {
@@ -280,14 +249,8 @@ export function EffectsPanel(): JSX.Element {
   // a real capability check were still running. Removed rather than kept as a
   // stub; reinstate a real predicate here if a backend ever stops supporting an
   // effect again.
-  const node = hasSelection ? defaultSceneGraph.getNode(primary!) : undefined;
-  const kind = node ? readNodeKind(node) : 'shape';
-  const layerKind = kind === 'text' || kind === 'image' || kind === 'video' ? kind : 'shape';
-  const { w: maskW, h: maskH } = SIZE[layerKind];
-  // The mask the renderer draws at the playhead — an animated mask's
-  // interpolated shape, whose values the edits below patch — not the static
-  // shape it stops reading once keyed (same read as the Layer panel).
-  const masks = node ? (readNodeMaskAt(node, maskTime) ?? getNodeMask(primary!)).paths : [];
+  const node = primary ? defaultSceneGraph.getNode(primary) : undefined;
+  const kind = node ? readNodeKind(node) : null;
   const shapeOps = kind === 'shape'
     ? PATH_OP_CATALOG.filter((op) => !q || op.label.toLowerCase().includes(q))
     : [];
@@ -299,7 +262,7 @@ export function EffectsPanel(): JSX.Element {
       { id: 'cloner' as const, label: 'Cloner', icon: 'grid' as IconName },
       { id: 'physics' as const, label: 'Physics', icon: 'zap' as IconName },
     ] as const
-  ).filter((item) => !q || item.label.toLowerCase().includes(q));
+  ).filter((item) => !!primary && (!q || item.label.toLowerCase().includes(q)));
 
   const clonerOn = !!(node && readNodeCloner(node));
   const physicsOn = !!(node && readNodePhysics(node));
@@ -322,17 +285,6 @@ export function EffectsPanel(): JSX.Element {
     () => Object.entries(effectGroups).filter(([, items]) => items.length > 0),
     [effectGroups],
   );
-
-  // Every hook above has run — returning here is now hook-count-stable.
-  if (!hasSelection || !primary) {
-    return (
-      <EmptyState
-        icon="zap"
-        title="No selection"
-        message="Select a layer to add blurs, colour effects and masks to it."
-      />
-    );
-  }
 
   /*
     The browser, as ONE flat array of rows.
@@ -419,27 +371,34 @@ export function EffectsPanel(): JSX.Element {
   };
 
   const activateRow = (row: FxRow): void => {
+    if (row.kind === 'folder') {
+      toggleFolder(row.id, row.open);
+      return;
+    }
+    // Browsable with nothing selected (the Library hosts this tree), so a
+    // click names what is missing rather than silently doing nothing.
+    if (!primary) {
+      useUIStore.getState().notify({ level: 'warning', message: 'Select a layer to add this to', durationMs: 2000 });
+      return;
+    }
     switch (row.kind) {
-      case 'folder':
-        toggleFolder(row.id, row.open);
-        break;
       case 'effect':
         addEffectAndReveal(primary, row.def.type);
         break;
       case 'preset':
         applyEffectPreset(row.name, [primary]);
         bumpClipboard((n) => n + 1);
-        revealEffectControls();
+        revealEffectsInProperties();
         break;
       case 'shapeOp':
         if (row.taken) return;
         addPathOp(primary, defaultPathOpOf(row.opType as Parameters<typeof defaultPathOpOf>[0]));
-        revealEffectControls();
+        revealEffectsInProperties();
         break;
       case 'sim':
         if (row.id === 'cloner') enableNodeCloner(primary);
         else enableNodePhysics(primary);
-        revealEffectControls();
+        revealEffectsInProperties();
         break;
     }
   };
@@ -505,28 +464,31 @@ export function EffectsPanel(): JSX.Element {
   };
 
   return (
-    <div className={styles.root}>
-      {/* Effects & Presets browser — the AE library tree of effect types. */}
-      <div className={styles.sectionTitle}>Effects &amp; Presets</div>
+    <>
       <div className={styles.addRow}>
         <button
           type="button"
           className={styles.addChip}
-          disabled={getNodeEffects(primary).length === 0}
+          disabled={!primary || getNodeEffects(primary).length === 0}
           title="Copy this layer's whole effect stack"
-          onClick={() => { copyAllEffects(primary); bumpClipboard((n) => n + 1); }}
+          onClick={() => {
+            if (!primary) return;
+            copyAllEffects(primary);
+            bumpClipboard((n) => n + 1);
+          }}
         >
           <Icon name="copy" size="sm" /> Copy Stack
         </button>
         <button
           type="button"
           className={styles.addChip}
-          disabled={!hasEffectClipboard()}
+          disabled={!primary || !hasEffectClipboard()}
           title={hasEffectClipboard() ? `Paste ${effectClipboardSize()} effect(s) onto this layer` : 'Nothing copied yet'}
           onClick={() => {
+            if (!primary) return;
             pasteEffects([primary]);
             bumpClipboard((n) => n + 1);
-            revealEffectControls();
+            revealEffectsInProperties();
           }}
         >
           <Icon name="plus" size="sm" /> Paste
@@ -534,9 +496,10 @@ export function EffectsPanel(): JSX.Element {
         <button
           type="button"
           className={styles.addChip}
-          disabled={getNodeEffects(primary).length === 0}
+          disabled={!primary || getNodeEffects(primary).length === 0}
           title="Save this stack as a reusable preset"
           onClick={() => {
+            if (!primary) return;
             void (async () => {
               const name = await customPrompt(
                 'Save Effect Preset',
@@ -736,6 +699,52 @@ export function EffectsPanel(): JSX.Element {
           </div>
         )}
       </div>
+    </>
+  );
+}
+
+/**
+ * The right-inspector Effects panel: the browser above, the selected layer's
+ * masks below. Needs a layer — with none it says so instead of offering a
+ * search box for a library nothing can be added to.
+ */
+export function EffectsPanel(): JSX.Element {
+  const primary = useSelectionStore((s) => s.primary);
+  useSceneRevision((s) => s.rev);
+  // The playhead on the layer's KEYFRAME axis — where the renderer reads the
+  // mask, so the keyframe button and every mask edit below land where the shape
+  // actually changes. Raw comp time was wrong for a moved or trimmed layer.
+  const maskCompTime = useActiveWorkspace()?.time ?? 0;
+  const maskTime = primary ? compToKeyframeTime(primary, maskCompTime) : maskCompTime;
+  const hasSelection = !!(primary && defaultSceneGraph.getNode(primary));
+
+  // NOTE: the empty-state early return must come AFTER every hook — returning
+  // before one changed the hook count the moment a layer was selected, which
+  // is a Rules-of-Hooks crash that took the whole editor down with it.
+  if (!hasSelection || !primary) {
+    return (
+      <EmptyState
+        icon="zap"
+        title="No selection"
+        message="Select a layer to add blurs, colour effects and masks to it."
+      />
+    );
+  }
+
+  const node = defaultSceneGraph.getNode(primary);
+  const kind = node ? readNodeKind(node) : 'shape';
+  const layerKind = kind === 'text' || kind === 'image' || kind === 'video' ? kind : 'shape';
+  const { w: maskW, h: maskH } = SIZE[layerKind];
+  // The mask the renderer draws at the playhead — an animated mask's
+  // interpolated shape, whose values the edits below patch — not the static
+  // shape it stops reading once keyed (same read as the Layer panel).
+  const masks = node ? (readNodeMaskAt(node, maskTime) ?? getNodeMask(primary)).paths : [];
+
+  return (
+    <div className={styles.root}>
+      {/* Effects & Presets browser — the AE library tree of effect types. */}
+      <div className={styles.sectionTitle}>Effects &amp; Presets</div>
+      <EffectBrowser nodeId={primary} />
 
       <div className={styles.sectionTitle}>Masks</div>
       {!hasSelection && (

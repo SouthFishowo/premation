@@ -80,8 +80,26 @@ export interface DockPanelProps {
 interface TabDescriptor {
   id: string;
   label: string;
+  /** What the rail prints under the glyph — `shortTitle` when the def has one. */
+  railLabel: string;
   icon?: IconName;
   closable: boolean;
+}
+
+/**
+ * Panels offered for THIS side that are not docked anywhere on it.
+ *
+ * Shared by the ⋯ menu's "Open Panel" block and the rail's "+" button, so the
+ * two can never offer different lists. Checks both panes of a split side: a
+ * panel sitting in the bottom pane is open, and offering to "open" it from the
+ * top pane would only move focus, which is not what a "+" promises.
+ */
+export function closedPanelDefsForSide(
+  side: 'leftSidebar' | 'rightInspector',
+  panelOrder: Partial<Record<RegionId, ReadonlyArray<string>>>,
+): ReturnType<typeof availablePanelDefs> {
+  const docked = new Set([...(panelOrder[side] ?? []), ...(panelOrder[`${side}_bottom`] ?? [])]);
+  return availablePanelDefs().filter((def) => def.region === side && !docked.has(def.id));
 }
 
 function spawnPopout(panelId: string): void {
@@ -110,6 +128,9 @@ export function DockPanel({
   const side = railSide ?? (isLeft ? 'left' : 'right');
 
   const panelOrder = useLayoutStore((s) => s.panelOrder[region] ?? []);
+  // The whole map, for "which of this side's panels are closed" — a split side
+  // spans two regions, and the "+" must not offer a panel open in the other pane.
+  const allPanelOrder = useLayoutStore((s) => s.panelOrder);
   const activeTabId = useLayoutStore((s) => s.activePanelByRegion[region]);
   const panels = useLayoutStore((s) => s.panels);
   const isRegionCollapsed = useLayoutStore((s) => s.regions[regionKey]?.collapsed ?? false);
@@ -125,9 +146,11 @@ export function DockPanel({
       .filter((p): p is NonNullable<typeof p> => !!p)
       .map((p) => {
         const def = panelDef(p.id);
+        const label = typeof p.title === 'string' ? p.title : p.id;
         return {
           id: p.id,
-          label: typeof p.title === 'string' ? p.title : p.id,
+          label,
+          railLabel: def?.shortTitle ?? label,
           icon: p.icon as IconName | undefined,
           closable: def ? def.closable : (p.closable ?? false),
         };
@@ -187,6 +210,16 @@ export function DockPanel({
     ...(item.closable ? [{ id: 'close', label: `Close “${item.label}”`, icon: 'close' as IconName, onSelect: () => closePanel(item.id) }] : []),
   ];
 
+  /** This side's closed panels as menu rows — the ⋯ menu's "Open Panel" block and the rail's "+". */
+  const openItems: DropdownItem[] = useMemo(
+    () => closedPanelDefsForSide(regionKey, allPanelOrder).map((def): DropdownItem => ({
+      type: 'item', id: `open-${def.id}`, label: def.title, icon: def.icon, onSelect: () => openPanel(def.id),
+    })),
+    // `openPanel` is a stable store action.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [regionKey, allPanelOrder],
+  );
+
   const menuItems: DropdownItem[] = useMemo(() => {
     const items: DropdownItem[] = [];
     if (activeItem) {
@@ -220,21 +253,15 @@ export function DockPanel({
       });
     }
 
-    // Registered for this side but not docked — the on-demand panels (History,
-    // Render) and anything the user closed. The only place they can be opened
-    // from inside the sidebar itself; the Window menu is the other door.
-    const currentIds = new Set(allItems.map((item) => item.id));
-    const otherDefs = availablePanelDefs().filter((def) => def.region === regionKey && !currentIds.has(def.id));
-    if (otherDefs.length > 0) {
-      items.push({ type: 'separator' }, { type: 'label', label: 'Open Panel' });
-      for (const def of otherDefs) {
-        items.push({ type: 'item', id: `open-${def.id}`, label: def.title, icon: def.icon, onSelect: () => openPanel(def.id) });
-      }
+    // Registered for this side but not docked — the on-demand panels and
+    // anything the user closed. The same list as the rail's "+" (`openItems`).
+    if (openItems.length > 0) {
+      items.push({ type: 'separator' }, { type: 'label', label: 'Open Panel' }, ...openItems);
     }
     return items;
     // `panelVerbs` is a closure over the same inputs listed here.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allItems, activeItem, onToggleSplit, isSplit, isTop, isLeft, side, regionKey, paneDest, paneLabel, otherSide, otherSideLabel, customMenuItems]);
+  }, [allItems, activeItem, onToggleSplit, isSplit, isTop, isLeft, side, regionKey, paneDest, paneLabel, otherSide, otherSideLabel, customMenuItems, openItems]);
 
   // All hooks must run before this guard — bail out only once they have.
   if (allItems.length === 0) return null;
@@ -275,10 +302,9 @@ export function DockPanel({
   };
 
   const tooltipSide = side === 'right' ? 'left' : 'right';
-  // Only the LAST rail in a region carries the collapse toggle: a split region
-  // stacks two DockPanels, and two toggles for one action is one too many. The
-  // collapsed region renders a single DockPanel, which is therefore also last.
-  const showCollapseToggle = !isSplit || splitPosition === 'bottom';
+  // Only the LAST rail in a region carries the add button: a split region
+  // stacks two DockPanels, and one "+" per side is clean and unambiguous.
+  const showRailAdd = !isSplit || splitPosition === 'bottom';
 
   /**
    * Keyboard traversal of the rail — the tablist pattern.
@@ -368,28 +394,39 @@ export function DockPanel({
                 }}
               >
                 <Icon name={item.icon ?? 'layers'} size="md" />
+                <span className={styles.railLabel} aria-hidden="true">{item.railLabel}</span>
               </button>
             </Tooltip>
           </div>
         );
       })}
-      <div className={styles.railSpacer} />
-      {showCollapseToggle && (
-        <Tooltip label={isCollapsed ? 'Expand' : 'Collapse to rail'} placement={tooltipSide}>
-          <button
-            type="button"
-            className={styles.railToggle}
-            aria-label={isCollapsed ? (isLeft ? 'Expand sidebar' : 'Expand inspector') : (isLeft ? 'Collapse sidebar' : 'Collapse inspector')}
-            aria-expanded={!isCollapsed}
-            onClick={() => useLayoutStore.getState().setCollapsed(regionKey, !isCollapsed)}
-          >
-            <Icon
-              name={(isCollapsed ? (side === 'left' ? 'chevron-right' : 'chevron-left') : (side === 'left' ? 'chevron-left' : 'chevron-right')) as IconName}
-              size="sm"
-            />
-          </button>
-        </Tooltip>
+      {/* Positioned directly under the tabs: visible, intuitive and accessible */}
+      {showRailAdd && openItems.length > 0 && (
+        <div className={styles.railAddSlot}>
+          <div className={styles.railDivider} aria-hidden />
+          <Tooltip label={isLeft ? 'Open a sidebar panel' : 'Open an inspector panel'} placement={tooltipSide}>
+            <div className={styles.railAddWrap}>
+              <Dropdown
+                placement={side === 'right' ? 'left-start' : 'right-start'}
+                offset={{ x: 6, y: 0 }}
+                noScroll
+                trigger={
+                  <button
+                    type="button"
+                    className={styles.railAdd}
+                    aria-label={isLeft ? 'Open a sidebar panel' : 'Open an inspector panel'}
+                    title="Open panel"
+                  >
+                    <Icon name="plus" size="md" />
+                  </button>
+                }
+                items={[{ type: 'label', label: 'Open Panel' }, ...openItems]}
+              />
+            </div>
+          </Tooltip>
+        </div>
       )}
+      <div className={styles.railSpacer} />
     </div>
   );
 

@@ -63,7 +63,10 @@ describe('setEffectOpacity', () => {
   it('stores 0, which is a real setting and not a clear', () => {
     setEffectOpacity('layer', 'fx_blur', 0);
     expect(fx().opacity).toBe(0);
-    expect(effectsNeedCpuBake([fx()])).toBe(true);
+    expect('opacity' in fx()).toBe(true);
+    // Blur is one GPU chain entry, so its opacity — 0 included — is blended on
+    // the GPU (effectOpacityGpu.test.ts) rather than forcing the bake.
+    expect(effectsNeedCpuBake([fx()])).toBe(false);
   });
 
   it('clears on undefined and clamps out-of-range input', () => {

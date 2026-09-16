@@ -1,12 +1,13 @@
 /**
- * InspectorContent — the property sections for the selected layer, as one
- * ordered accordion, scoped to ONE Properties sub-tab (or to a search).
+ * InspectorContent — the property sections for the selection, as ONE ordered
+ * accordion; with nothing selected, the composition summary.
  *
  * This file is only the MECHANISM: which sections apply comes from
- * `inspectorSections.ts`, which sub-tab they belong to comes from the same
- * registry, which section is open comes from the preference store, and what a
- * section draws comes from the section. What is left here is the search
- * filter, the remembered open/closed state, and the empty states.
+ * `inspectorSections.ts` (per layer through `appliesTo`, per selection through
+ * `appliesToSelection`), their order is that registry's array order, which
+ * section is open comes from the preference store, and what a section draws
+ * comes from the section. What is left here is the search filter, the
+ * remembered open/closed state, the coverage badges and the empty states.
  *
  * Section headers carry no icons. Five of the registry's sections shared the
  * same `sparkles` glyph and three shared `shape`, so the column of icons the
@@ -25,13 +26,12 @@ import { EmptyState } from '@components/EmptyState';
 import { usePreferenceStore } from '@stores/preferenceStore';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { InspectorSection } from './InspectorSection';
+import { CompositionSummary } from './CompositionSummary';
 import {
-  categoryLabel,
-  inspectorSectionsFor,
+  inspectorSectionsForSelection,
   resolve,
   sectionCoverage,
   type InspectorSectionDef,
-  type InspectorCategory,
 } from './inspectorSections';
 import styles from '@layout/EditorLayout/panels.module.css';
 
@@ -39,7 +39,7 @@ import styles from '@layout/EditorLayout/panels.module.css';
  * Filter sections by a search query; matches are forced open.
  *
  * The title alone is not enough — searching "color" has to reach Appearance and
- * "shadow" has to reach Layer Styles — so each section carries `keywords`.
+ * "shadow" has to reach Layer styles — so each section carries `keywords`.
  * Those used to live in a `SECTION_KEYWORDS` map in another file entirely,
  * which meant a new section was searchable only if someone remembered to edit
  * two places.
@@ -53,11 +53,11 @@ function matchesQuery(def: InspectorSectionDef, nodeId: string, q: string): bool
  * The shell around ONE section, memoised on (component, node).
  *
  * The panel re-renders for reasons that are none of a section's business — a
- * keystroke in the search box, a switch in the selection header, the tab strip
- * — and every re-render used to rebuild every section's element tree and run
- * every section's render. With the host memoised, a section renders again only
- * when its own node's revision moves (`useNodeRevision` inside it) or when the
- * node it is drawn for changes.
+ * keystroke in the search box, a rename in the selection header, the ⋯ menu
+ * hand-off — and every re-render used to rebuild every section's element tree
+ * and run every section's render. With the host memoised, a section renders
+ * again only when its own node's revision moves (`useNodeRevision` inside it)
+ * or when the node it is drawn for changes.
  */
 const SectionHost = memo(function SectionHost({
   Component,
@@ -76,10 +76,6 @@ const SectionHost = memo(function SectionHost({
 /**
  * One registry row → one accordion item, drawn in the shared section shell.
  *
- * A search result carries its sub-tab's name as the header badge, so a hit
- * found from the search box also tells you where it lives once you stop
- * searching. That badge is the answer to "which tab owns this property".
- *
  * With several layers selected, a section that only some of them have is
  * badged "2 of 3" — the rows inside edit every layer that has the property,
  * and the badge says how many that is.
@@ -92,10 +88,7 @@ function toAccordionItem(
 ): AccordionItem {
   const { Component, actions: ActionsComponent } = def;
   const coverage = nodeIds.length > 1 ? sectionCoverage(def, nodeIds) : nodeIds.length;
-  const partial = nodeIds.length > 1 && coverage < nodeIds.length ? `${coverage} of ${nodeIds.length}` : null;
-  const badge = searching
-    ? (partial ? `${categoryLabel(def.category)} · ${partial}` : categoryLabel(def.category))
-    : partial ?? undefined;
+  const badge = nodeIds.length > 1 && coverage < nodeIds.length ? `${coverage} of ${nodeIds.length}` : undefined;
   return {
     id: def.id,
     title: resolve(def.title, nodeId),
@@ -116,9 +109,9 @@ function toAccordionItem(
  */
 export function InspectorAccordion({ items }: { items: AccordionItem[] }): JSX.Element {
   // Remembered per section id and persisted, so the Inspector reopens the way
-  // you left it. Local `useState` could not do this: the panel unmounts on
-  // every tab switch and whenever the selection is cleared, which is why
-  // Transform sprang back open however often you collapsed it.
+  // you left it. Local `useState` could not do this: the panel unmounts
+  // whenever the selection is cleared, which is why Transform sprang back open
+  // however often you collapsed it.
   const sections = usePreferenceStore((s) => s.inspectorSections);
   const setPref = usePreferenceStore((s) => s.set);
   const onToggle = useCallback(
@@ -152,47 +145,36 @@ export function renderInspector(items: AccordionItem[], query: string): JSX.Elem
 }
 
 export interface InspectorContentProps {
+  /** The primary selected layer; `null` draws the composition summary. */
   nodeId: string | null;
-  /** A non-empty query searches EVERY sub-tab; `category` is then ignored. */
+  /** A non-empty query filters the sections by title and keywords. */
   query?: string;
-  /** The sub-tab to draw. `'all'` draws every section — the search view. */
-  category?: InspectorCategory | 'all';
   /**
-   * The whole selection, primary first. Only the coverage badges read it here;
-   * the rows reach it through `InspectorSelectionProvider`.
+   * The whole selection, primary first. Read for `appliesToSelection` and the
+   * coverage badges; the rows reach it through `InspectorSelectionProvider`.
    */
   nodeIds?: ReadonlyArray<string>;
 }
 
-export function InspectorContent({ nodeId, query = '', category = 'all', nodeIds }: InspectorContentProps): JSX.Element {
-  if (!nodeId) {
-    return (
-      <EmptyState
-        icon="mouse-pointer"
-        title="No selection"
-        message="Select a layer to edit its transform, style, layer settings and animation."
-      />
-    );
-  }
+export function InspectorContent({ nodeId, query = '', nodeIds }: InspectorContentProps): JSX.Element {
+  if (!nodeId) return <CompositionSummary />;
 
   if (!defaultSceneGraph.getNode(nodeId)) return <div className={styles.empty}>No node data</div>;
 
-  const q = query.trim().toLowerCase();
-  const scope = q ? 'all' : category;
-  const all = inspectorSectionsFor(nodeId, scope);
+  // Primary first whatever order the caller passed — the registry reads the
+  // first id as the layer the sections are drawn for.
+  const selection = [nodeId, ...(nodeIds ?? []).filter((id) => id !== nodeId)];
+  const all = inspectorSectionsForSelection(selection);
   if (all.length === 0) {
-    if (scope !== 'all') {
-      return <EmptyState compact icon="info" message={`No ${categoryLabel(scope).toLowerCase()} properties for this layer.`} />;
-    }
     return <EmptyState icon="info" message="This layer type has no editable properties." />;
   }
 
+  const q = query.trim().toLowerCase();
   const matched = q ? all.filter((def) => matchesQuery(def, nodeId, q)) : all;
   if (q && matched.length === 0) {
     return <EmptyState compact icon="search" message={`No properties match “${query.trim()}”.`} />;
   }
 
-  const selection = nodeIds && nodeIds.length > 0 ? nodeIds : [nodeId];
   return <InspectorAccordion items={matched.map((def) => toAccordionItem(def, nodeId, q.length > 0, selection))} />;
 }
 

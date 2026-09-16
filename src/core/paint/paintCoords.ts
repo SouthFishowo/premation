@@ -8,11 +8,18 @@ import type { SceneNode } from '@core/types';
 import { readNodeKind } from '@core/scene/sceneDerive';
 import { readNodeAnchor } from '@core/scene/anchor';
 
-/** Layer kinds the Brush tool can paint onto (everything with raster content;
- *  cameras/lights/audio have no surface). */
+/**
+ * Layer kinds the Paint/Eraser tools can paint onto: exactly the kinds whose
+ * raster runs the paint pass — shapes (path raster), text (text raster), and
+ * images, SVGs and video (the image/frame bake). It was "everything but
+ * cameras, lights and audio", which let a comp, null, adjustment or particle
+ * layer record strokes and an undo entry that nothing ever drew; those now get
+ * the "cannot be painted on" message instead of a silent no-op.
+ */
+const PAINTABLE_KINDS: ReadonlySet<string> = new Set(['shape', 'text', 'image', 'svg', 'video']);
+
 export function isPaintableKind(node: SceneNode): boolean {
-  const k = readNodeKind(node);
-  return k !== 'camera' && k !== 'light' && k !== 'audio';
+  return PAINTABLE_KINDS.has(readNodeKind(node));
 }
 
 function num(v: unknown): number | undefined {

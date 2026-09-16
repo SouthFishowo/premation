@@ -22,6 +22,7 @@ import { useEffect, useRef } from 'react';
 import { useWorkspaceStore } from '@stores/projectStore';
 import { getTimelineController } from '@core/timeline/TimelineController';
 import { videoDiag, playbackHealth } from '@core/rendering/videoPlaybackDiag';
+import { flushRenderNow } from '@core/perf/framePump';
 
 /** Element lag (ms behind the playhead) where the timeline starts slowing to
  *  meet the decoder. Under this, the rate trim absorbs it invisibly. */
@@ -107,15 +108,16 @@ export function usePlaybackClock(): void {
     let cancelled = false;
     const handle: { raf?: number; timer?: ReturnType<typeof setTimeout> } = {};
 
-    const schedule = (fn: () => void): void => {
+    const schedule = (fn: (frameTs?: number) => void): void => {
       if (typeof document !== 'undefined' && document.hidden) {
-        handle.timer = setTimeout(fn, 1000 / 60);
+        handle.timer = setTimeout(() => fn(), 1000 / 60);
       } else {
         handle.raf = requestAnimationFrame(fn);
       }
     };
 
-    const tick = (): void => {
+    // `frameTs` is the rAF timestamp (undefined from the hidden-window timer).
+    const tick = (frameTs?: number): void => {
       if (cancelled) return;
       const now = performance.now();
       const last = lastRef.current ?? now;
@@ -146,6 +148,10 @@ export function usePlaybackClock(): void {
 
       // The engine advances its playhead and mirrors seconds into the store.
       const stillPlaying = controller.tick(advance);
+      // The clock write above asked the viewport for a redraw (through its
+      // clock subscription, no React in between). Draw it in THIS frame rather
+      // than the next one — one vsync less latency on every played frame.
+      flushRenderNow(frameTs);
       if (!stillPlaying) return; // engine auto-paused (and cleared the store flag)
       schedule(tick);
     };

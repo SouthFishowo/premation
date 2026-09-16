@@ -36,7 +36,15 @@ export type RenderDiagnosticCode =
   /** A track matte's source could not be resolved or isolated; layer drew unmatted. */
   | 'matte-source-unavailable'
   /** An image/video source failed to decode; preview shows colour bars. */
-  | 'media-unavailable';
+  | 'media-unavailable'
+  /**
+   * A render pass threw and was skipped so the rest of the frame could still
+   * present. Everything that pass would have drawn is missing from this frame,
+   * which is exactly the "looks finished and is wrong" case export must refuse.
+   */
+  | 'pass-failed'
+  /** A layer threw while being built or mapped and was left out of the frame. */
+  | 'layer-error';
 
 export interface RenderDiagnostic {
   code: RenderDiagnosticCode;

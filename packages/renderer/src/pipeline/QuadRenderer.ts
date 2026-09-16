@@ -69,6 +69,26 @@ export class QuadRenderer {
         // generator emits that number unconditionally — sliding it down would
         // need this side to reproduce the same condition and agree.
         if (item.originTexture) entries.push({ binding: 4, texture: item.originTexture });
+        /*
+          Bindings 5/6/7: a plugin effect's layer inputs past the first.
+
+          After `originTexture` in ENTRY order, which is the order the WebGL2
+          backend hands out texture units in — so the names the plugin
+          material declares (`src`, `pluginLayer0`, `pluginOrigin`, then
+          `pluginLayer1…`) line up with the units by construction. Pushing
+          them before `origin` would shift every unit after it and point a
+          sampler at the wrong texture, silently.
+
+          These slots overlap by NUMBER with the mesh PBR set below, and that
+          is safe for the same reason `originTexture` already overlapped with
+          it: no material declares both. A plugin effect is a 2D full-screen
+          pass with no PBR maps, and a mesh has no plugin inputs.
+        */
+        if (item.pluginLayerTextures) {
+          for (let i = 0; i < item.pluginLayerTextures.length; i++) {
+            entries.push({ binding: 5 + i, texture: item.pluginLayerTextures[i]! });
+          }
+        }
         // Bindings 3–6 for the mesh PBR set. Pushed in binding order because
         // the WebGL2 backend hands out texture units in ENTRY order and matches
         // them against the material's declared sampler names.
@@ -131,18 +151,39 @@ export class QuadRenderer {
           // And for the LUT strip — appended only when bound, so every key a
           // draw without one produced before is produced unchanged.
           + (item.lutTexture ? `:lut${item.lutTexture.id}` : '')
+          // And for a plugin effect's extra layer inputs, by the rule
+          // `originTexture` established: two draws of one shader differing only
+          // in what sits at 5/6/7 must not share a cached bind group. Appended
+          // only when present, so every existing key is byte-identical.
+          + (item.pluginLayerTextures
+            ? `:px${item.pluginLayerTextures.map((t) => t.id).join('.')}`
+            : '')
           + `:${idx}`,
           { pipeline, entries },
         );
         encoder.setBindGroup(0, bg);
 
+        /*
+          Instanced: the geometry in slot 0 is drawn `instanceCount` times, with
+          slot 1 advancing once per instance. One draw call for fifty thousand
+          sprites — which is the entire reason a generator layer can be a
+          particle system rather than a slideshow.
+
+          Both fields are required together. A count with no buffer would make
+          the instance attributes read the unit quad; a buffer with no count
+          would draw one instance of a buffer holding thousands. Neither is a
+          state worth having a fallback for.
+        */
+        const instanced = item.instanceBuffer && item.instanceCount !== undefined;
         if (item.vertexBuffer && item.indexBuffer && item.indexCount !== undefined) {
           encoder.setVertexBuffer(0, item.vertexBuffer);
+          if (instanced) encoder.setVertexBuffer(1, item.instanceBuffer!);
           encoder.setIndexBuffer(item.indexBuffer, item.indexFormat ?? 'uint16');
-          encoder.drawIndexed(item.indexCount, 1, item.firstIndex ?? 0);
+          encoder.drawIndexed(item.indexCount, instanced ? item.instanceCount! : 1, item.firstIndex ?? 0);
         } else {
           encoder.setVertexBuffer(0, quad);
-          encoder.draw(QUAD_VERTEX_COUNT);
+          if (instanced) encoder.setVertexBuffer(1, item.instanceBuffer!);
+          encoder.draw(QUAD_VERTEX_COUNT, instanced ? item.instanceCount! : 1);
         }
         draws += 1;
       }

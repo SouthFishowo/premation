@@ -201,17 +201,35 @@ export class Renderer {
 
   endFrame(): number {
     if (!this.inFrame) throw new Error('endFrame called outside a frame');
-    this.backend.endFrame();
-    this.backend.present();
-    const collected = this.resources.collectGarbage();
-    this.inFrame = false;
-    return collected;
+    // `inFrame` is cleared in a finally: if submit/present throws (a lost
+    // device, an invalid encoder) and the flag stayed set, every later
+    // `beginFrame` would throw "already in a frame" and the renderer would be
+    // dead for the rest of the session instead of for one frame.
+    try {
+      this.backend.endFrame();
+      this.backend.present();
+      return this.resources.collectGarbage();
+    } finally {
+      this.inFrame = false;
+    }
   }
 
   /** Convenience: render a single viewport as a complete frame. */
   render(viewport: Viewport, scene: FrameScene, timeMs?: number): FrameResult {
     const frame = this.beginFrame(timeMs);
-    this.renderViewport(viewport, scene, frame);
+    // RenderGraph already isolates each pass; this catches what happens outside
+    // any pass (graph compilation, target resolution). Without it a throw here
+    // skipped `endFrame`, left `inFrame` set, and wedged the renderer. The frame
+    // still presents whatever was drawn and says what it could not do.
+    try {
+      this.renderViewport(viewport, scene, frame);
+    } catch (err) {
+      this.backend.abortOpenPass?.();
+      this.diagnostics.push({
+        code: 'pass-failed',
+        detail: `Frame composition failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
     const collected = this.endFrame();
     return { frame, resources: this.resources.stats(), collected, diagnostics: this.diagnostics.drain() };
   }

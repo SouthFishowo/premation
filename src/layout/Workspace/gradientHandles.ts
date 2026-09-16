@@ -62,6 +62,7 @@ import {
   type LinearFill,
   type RadialFill,
 } from '@core/paint/fill';
+import type { StrokeGradientGeometry } from '@core/paint/stroke';
 
 export interface Pt {
   x: number;
@@ -186,6 +187,42 @@ export function paintFromGripDrag(
   const cx = (paint.cx - 0.5) * w;
   const cy = (paint.cy - 0.5) * h;
   return { ...paint, radius: Math.max(0.01, Math.hypot(local.x - cx, local.y - cy) / half) };
+}
+
+// ── Shape-stroke gradients: free Start / End points ──────────────────
+
+/**
+ * A shape stroke's gradient axis from its AE Start/End points
+ * (`StrokeGradientGeometry`, relative box units) — the geometry
+ * `vectorDraw.strokeGradientFor` renders, in the same centred local px.
+ *
+ * Unlike the fill's model, nothing here is derived: both ends are free, so a
+ * grip drag moves exactly the point it holds.
+ */
+export function strokeGradientAxisLocal(g: StrokeGradientGeometry, w: number, h: number): GradientAxis {
+  return {
+    start: { x: (g.startX - 0.5) * w, y: (g.startY - 0.5) * h },
+    end: { x: (g.endX - 0.5) * w, y: (g.endY - 0.5) * h },
+  };
+}
+
+/**
+ * The points a grip drag produces — `strokeGradientAxisLocal`'s inverse for the
+ * dragged end. Unclamped (a point may leave the layer, as an AE handle may); a
+ * zero-sized box returns the points unchanged rather than dividing by zero. The
+ * radial highlight rides along untouched: it is measured from the axis.
+ */
+export function strokeGradientFromGripDrag(
+  g: StrokeGradientGeometry,
+  grip: GradientGripKind,
+  local: Pt,
+  w: number,
+  h: number,
+): StrokeGradientGeometry {
+  if (w <= 0 || h <= 0) return g;
+  const x = local.x / w + 0.5;
+  const y = local.y / h + 0.5;
+  return grip === 'start' ? { ...g, startX: x, startY: y } : { ...g, endX: x, endY: y };
 }
 
 // ── Screen-space grips and hit testing ───────────────────────────────

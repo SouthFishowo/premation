@@ -25,27 +25,55 @@ import {
   type RenderBackend as GpuBackend,
 } from '@motion/renderer';
 import type { RenderBackend, RenderLayer, RenderSnapshot } from './RenderBackend';
-import { snapshotToFrameScene, viewToCamera, needsShapeRaster } from './snapshotToFrameScene';
+import { snapshotToFrameScene, takeSceneLayerErrors, viewToCamera, needsShapeRaster } from './snapshotToFrameScene';
+import { perfBegin, perfEnd, PerfStage } from '@core/perf/framePerf';
 import { viewportVideoFrames } from './videoFrameCache';
 import { renderPixelMotion } from './pixelMotion';
-import { exactVideoFrames, ExactVideoFrameCache } from './exactVideoFrames';
+import { exactVideoFrames, ExactVideoFrameCache, frameImageSize, type ExactFrameImage } from './exactVideoFrames';
 import { requestMediaRepaint } from './repaintScheduler';
 import { isLutEffect, buildChannelLut } from '@core/effects/colorLut';
 import { readCubeLutParam, cubeLutSignature } from '@core/effects/cubeLut';
 import { layerIsBaked } from '@core/effects/effectBake';
+import { hasPaintStrokes } from '@core/paint/paintRaster';
 import { useTextEditStore } from '@stores/textEditStore';
-import { AppTextureProvider } from './AppTextureProvider';
+import { AppTextureProvider, type ImageBakeSpec } from './AppTextureProvider';
 import { getFloatExrForAsset } from '@core/media/floatExr';
 import { getEventBus } from '@core/events/EventBus';
 import { noteDeviceLoss } from '@core/plugins/pluginEffects';
+import {
+  pluginAssetFailure,
+  pluginAssetTextureKey,
+  pluginAssetWaits,
+  requestPluginAssetTexture,
+} from '@core/plugins/pluginAssetTextures';
 import { setWebgpuAvailable } from '@core/plugins/capabilities';
 import { markGpuOwned } from './canvasOwnership';
 import { attachPluginEffects } from './pluginEffectBridge';
 import { useColorManagementStore } from '@stores/colorManagementStore';
 import { useViewerLutStore, VIEWER_LUT_TEXTURE_KEY } from '@stores/viewerLutStore';
 import { createRasterScaleSettle } from './rasterScaleSettle';
+import { describeLayerError, type LayerError } from './layerErrors';
+import { reportFrameDiagnostics, notifyGpuRecovered, notifyGpuRecoveryFailed } from './engineDiagnostics';
 
 export type RendererBackendKind = 'webgl2' | 'webgpu' | 'null';
+
+/**
+ * The bake a PAINTED image or video needs when nothing else sends it down the
+ * bake path: its Brush / Eraser / Clone strokes alone, drawn over the source
+ * pixels. No effects, mask or fill opacity — the layer is not `layerIsBaked`,
+ * so the GPU still applies all three to the painted texture, exactly as it did
+ * to the bare one.
+ *
+ * Without it paint never reached an image, SVG or video at all: only the shape
+ * rasterizer drew strokes, so painting footage recorded an undo entry and
+ * changed nothing, in the viewport or in an export (both feed through here).
+ * Undefined for an unpainted layer, which keeps every such layer on its
+ * original feed — plain decode, exact video frames, Frame Mix — untouched.
+ */
+function paintOnlyBake(layer: RenderLayer): ImageBakeSpec | undefined {
+  if (!hasPaintStrokes(layer.paint)) return undefined;
+  return { effects: [], width: layer.width, height: layer.height, paint: layer.paint };
+}
 
 /** Minimal structural shapes for the WebGPU probe — the DOM lib in this repo
  *  does not ship @webgpu/types, and the probe needs only these members. */
@@ -61,6 +89,24 @@ interface GpuCanvasLike {
 /** Void color behind the composition — transparent so the workspace shows
  *  through, matching Canvas2DBackend which clears the canvas to transparent. */
 const VOID: Color = { r: 0, g: 0, b: 0, a: 0 };
+
+type FrameDiagnosticList = ReadonlyArray<{ code: string; detail: string; layerId?: string }>;
+
+/** What a frame requested while the GPU was being rebuilt reports — see renderFrame. */
+const DEVICE_LOST_DIAGNOSTICS: FrameDiagnosticList = [{
+  code: 'device-lost',
+  detail: 'The GPU was reset while this frame was requested, so it was not drawn.',
+}];
+
+/** Layer errors from both build stages, as frame diagnostics. Error path only. */
+function layerErrorDiagnostics(...lists: ReadonlyArray<ReadonlyArray<LayerError> | null | undefined>): FrameDiagnosticList {
+  const out: Array<{ code: string; detail: string; layerId?: string }> = [];
+  for (const list of lists) {
+    if (!list) continue;
+    for (const e of list) out.push({ code: 'layer-error', detail: describeLayerError(e), layerId: e.layerId });
+  }
+  return out;
+}
 
 /**
  * Ceiling on a single init attempt. `adapter.requestDevice` has no timeout of
@@ -98,10 +144,40 @@ export class MotionRendererBackend implements RenderBackend {
    */
   resolvedKind: RendererBackendKind | null = null;
   /** Diagnostics from the most recent renderFrame (M8a). */
-  private frameDiagnostics: ReadonlyArray<{ code: string; detail: string; layerId?: string }> = [];
-  /** Details already surfaced, so a 60fps viewport reports each once. */
-  private readonly reportedDiagnostics = new Set<string>();
+  private frameDiagnostics: FrameDiagnosticList = [];
   readonly readyPromise: Promise<void>;
+
+  /**
+   * GPU loss recovery policy. Static so tests can shorten the waits; these
+   * values are the product's.
+   *
+   *  • `maxRecoveriesPerMinute` — past this, a loss is a LOOP (a driver that
+   *    resets every few seconds, a shader that hangs the device on every frame),
+   *    and rebuilding again would only restart it. Recovery stops and says so.
+   *  • `baseDelayMs` doubles per recovery in the window (capped): an immediate
+   *    rebuild after a TDR often lands while the GPU process is still resetting.
+   *  • `restoreTimeoutMs` — WebGL2 rebuilds on `webglcontextrestored`; if the
+   *    browser never sends it, rebuild anyway after this long.
+   */
+  static gpuLossPolicy = { maxRecoveriesPerMinute: 3, baseDelayMs: 250, maxDelayMs: 4000, restoreTimeoutMs: 3000 };
+  /**
+   * Set when a WebGPU device kept dying. Every backend created afterwards
+   * (export, thumbnails, a remounted viewport on a fresh canvas) starts on
+   * WebGL2 instead. A canvas ALREADY bound to WebGPU cannot change tier —
+   * `getContext` binds an element permanently — so it keeps its tier.
+   */
+  private static webgpuDisabledByLossLoop = false;
+  /** The last snapshot actually drawn — what a rebuilt renderer repaints first. */
+  private lastSnapshot: RenderSnapshot | null = null;
+  /** True from a detected loss until the rebuild finishes (success or not). */
+  private recovering = false;
+  /** The backend whose loss is being handled, so a repeated signal is ignored. */
+  private lostBackend: GpuBackend | null = null;
+  /** Wall-clock times of recent recoveries — the loop detector's window. */
+  private readonly recoveryTimes: number[] = [];
+  /** Unsubscribes the WebGL2 context-loss listener of the current backend. */
+  private detachContextLoss: (() => void) | null = null;
+  private restoreTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * True when EVERY init attempt (preferred tier + fallbacks + retry) failed.
    * readyPromise still resolves — so awaiting callers never hang — but the
@@ -140,6 +216,17 @@ export class MotionRendererBackend implements RenderBackend {
   /** True when the last renderFrame reached the draw call — see
    *  {@link lastFrameDidRender}. */
   private frameDidRender = false;
+  /**
+   * The repaint an async decode asks for when it lands, as ONE bound function.
+   *
+   * The same channel `AppTextureProvider.onChange` uses. Held as a field rather
+   * than written inline at the call site because the texture feed runs per
+   * layer per frame, and a fresh closure there would be an allocation per
+   * generator layer per frame for a callback that never varies.
+   */
+  private readonly onMediaSettled = (): void => {
+    requestMediaRepaint('__texture__');
+  };
 
   /** Whether the last renderFrame's media was settled — see frameMediaExact. */
   lastFrameMediaExact(): boolean {
@@ -351,7 +438,14 @@ export class MotionRendererBackend implements RenderBackend {
         with nothing plugin-owned drawing blames nobody, which is the common
         case: driver updates, other applications, waking from sleep.
       */
-      backend.onDeviceLost((reason) => { noteDeviceLoss(reason); });
+      //
+      // The same signal drives RECOVERY (handleGpuLoss): before, a device reset
+      // only invalidated plugin pipelines and the viewport stayed dead until
+      // the project was reopened.
+      backend.onDeviceLost((reason) => {
+        noteDeviceLoss(reason);
+        this.handleGpuLoss(backend, reason);
+      });
       return backend;
     }
     return new WebGL2Backend();
@@ -410,8 +504,14 @@ export class MotionRendererBackend implements RenderBackend {
     // Only offer WebGPU once the throwaway-canvas probe has proven the whole
     // adapter → device → configure path works. `'gpu' in navigator` alone is not
     // evidence of that, and being wrong there poisons the real canvas.
+    // After a WebGPU loss loop, only a canvas already bound to WebGPU (which can
+    // be nothing else) is offered it again — see webgpuDisabledByLossLoop.
+    const webgpuAllowed =
+      !MotionRendererBackend.webgpuDisabledByLossLoop
+      || (!!this.canvas && MotionRendererBackend.boundKind.get(this.canvas) === 'webgpu');
     if (
       this.preferred === 'webgpu' &&
+      webgpuAllowed &&
       typeof navigator !== 'undefined' &&
       'gpu' in navigator &&
       (await MotionRendererBackend.probeWebGpu())
@@ -561,13 +661,30 @@ export class MotionRendererBackend implements RenderBackend {
         backlog. Attaching syncs the backlog and then follows every later
         change, so neither order is the special case.
 
-        Not gated on the tier. On WebGL2 a plugin effect compiles to a
-        passthrough and draws its input unchanged — inert, but the effect still
-        has to reach `ready` for the layer to render at all, and refusing to
-        attach here would turn "does nothing" into "the layer disappears".
+        Not gated on the tier, and now doing real work on both. An effect
+        shipping a GLSL ES 3.0 kernel compiles and draws HERE, on WebGL2; one
+        shipping only WGSL reaches `unsupported` rather than `ready`, which
+        emits no pass at all — so the layer draws as if the effect were not
+        there instead of through a passthrough that pretended to work.
       */
       this.detachPluginEffects?.();
       this.detachPluginEffects = attachPluginEffects(renderer, gpuBackend);
+
+      /*
+        WebGL2 context loss → recovery. `onContextChange` existed on the backend
+        with no caller, so a lost context froze the viewport silently (every GL
+        call a no-op, the renderer still "ready"). WebGPU's equivalent is wired
+        in createGpuBackendFor, where the device is acquired.
+      */
+      this.detachContextLoss?.();
+      this.detachContextLoss = null;
+      const glBackend = gpuBackend as Partial<Pick<WebGL2Backend, 'onContextChange'>>;
+      if (attempt.kind === 'webgl2' && typeof glBackend.onContextChange === 'function') {
+        this.detachContextLoss = glBackend.onContextChange(
+          () => this.handleGpuLoss(gpuBackend, 'webglcontextlost'),
+          () => this.handleContextRestored(gpuBackend),
+        );
+      }
 
       this.viewport = renderer.createViewport({
         width: this.cssW,
@@ -653,15 +770,20 @@ export class MotionRendererBackend implements RenderBackend {
       // nothing at all), which is how blank and duplicated frames got cached.
       this.frameDidRender = false;
       this.frameMediaExact = false;
+      // A frame requested mid-recovery says WHY it was not drawn, so an export
+      // loop reading the diagnostics refuses it with the real reason.
+      if (this.recovering) this.frameDiagnostics = DEVICE_LOST_DIAGNOSTICS;
       this.pending = snapshot;
       return;
     }
     this.frameDidRender = true;
+    this.lastSnapshot = snapshot;
     const vp = this.viewport;
 
     // Feed image asset sources for this frame (keyed to match snapshotToFrameScene's
     // `asset:<id>` or `path:<id>` textureKey), and forget layers that left the scene.
     if (this.textures) {
+      perfBegin(PerfStage.textureFeed);
       // Assume media-exact until a feed proves otherwise (a video element
       // mid-seek, an inexact nearest-neighbour frame, a decode still warming).
       // The RAM preview cache reads this to decide whether the frame it just
@@ -743,6 +865,56 @@ export class MotionRendererBackend implements RenderBackend {
               feedMap('o', modelMaps.occlusionSrc);
               feedMap('e', modelMaps.emissiveSrc);
             }
+            /*
+              0c. A plugin GENERATOR's sprite atlas — a file inside the plugin's
+              own package, named by the frame it produced.
+
+              Decoded once per (plugin, path) and shared by every layer and
+              every frame that names it, so a field of fifty thousand sprites
+              costs one decode and one upload for its whole life. The upload
+              rides `setFrame`, the same seam an externally decoded video frame
+              takes: one pooled texture per key, rewritten in place, freed by
+              `retain` the moment nothing names it. A decode still in flight
+              leaves the key registered but unfed, which resolves to the
+              provider's placeholder — and the generator pass reads its
+              `ready: false` and draws its untextured fallback rather than a
+              layer of transparent sprites.
+
+              The whole branch is behind an `undefined` check on a field only a
+              textured generator carries, so a project with no plugin layers
+              never reaches it.
+            */
+            const genFrame = layer.generator;
+            if (genFrame?.textureAssetKey !== undefined && genFrame.pluginId !== undefined) {
+              const key = pluginAssetTextureKey(genFrame.pluginId, genFrame.textureAssetKey);
+              activeKeys.add(key);
+              const asset = requestPluginAssetTexture(
+                genFrame.pluginId,
+                genFrame.textureAssetKey,
+                this.onMediaSettled,
+              );
+              if (asset) {
+                // The REVISION, not the path: a developer-mode folder reload
+                // re-reads the package and decodes again, and a signature that
+                // did not move would keep the pre-edit atlas on the GPU.
+                this.textures!.setFrame(key, asset.bitmap, `pluginasset:${asset.revision}`);
+              } else if (pluginAssetFailure(genFrame.pluginId, genFrame.textureAssetKey) === null) {
+                /*
+                  Still decoding: not the pixels the plugin asked for, so keep
+                  this frame out of the RAM preview and out of a deliverable
+                  until it lands.
+
+                  A PERMANENT failure is deliberately not marked. It will never
+                  settle, and the export's exactness gate refuses a frame that
+                  did not converge — so a plugin shipping a missing or corrupt
+                  atlas would block every export for ever, with a message about
+                  video decoding. The documented answer to a texture that cannot
+                  load is a named log line and an untextured field, and that is
+                  a frame worth encoding.
+                */
+                this.frameMediaExact = false;
+              }
+            }
             // 1. Base layer rasterization
             if (layer.particles) {
               // Particle emitter: rasterize the deterministic field for this
@@ -768,7 +940,9 @@ export class MotionRendererBackend implements RenderBackend {
               activeKeys.add(key);
               // Prefer linear float EXR when the import cached working-space planes.
               const floatImg = layer.assetId ? getFloatExrForAsset(layer.assetId) : undefined;
-              if (floatImg && !layerIsBaked(layer)) {
+              // Paint is drawn into the bitmap and the float upload has no
+              // canvas to draw it on, so a painted EXR takes the 8-bit bake.
+              if (floatImg && !layerIsBaked(layer) && !hasPaintStrokes(layer.paint)) {
                 this.textures!.setFloatImage(key, floatImg, {
                   fallbackSrc: layer.src,
                   fillColor: layer.fill,
@@ -792,8 +966,9 @@ export class MotionRendererBackend implements RenderBackend {
                       // Baked into the bitmap, so the GPU must not mask it again
                       // — the adapter drops maskTextureKey for a baked image.
                       ...(layer.mask && layer.mask.paths.length > 0 ? { mask: layer.mask } : {}),
+                      ...(hasPaintStrokes(layer.paint) ? { paint: layer.paint } : {}),
                     }
-                  : undefined;
+                  : paintOnlyBake(layer);
                 // A decode / live-SVG raster / re-bake still in flight means
                 // this frame shows a stand-in — keep it out of the RAM preview.
                 const settledImg = this.textures!.setImage(
@@ -809,28 +984,36 @@ export class MotionRendererBackend implements RenderBackend {
             } else if (layer.kind === 'video' && layer.contentAwareFillSrc) {
               const key = `asset:${layer.id}`;
               activeKeys.add(key);
-              if (!this.textures!.setImage(key, layer.contentAwareFillSrc, layer.fill, layer.premultipliedSource)) {
+              // A painted fill result keeps its paint: strokes only, the same
+              // bake a painted still takes.
+              if (!this.textures!.setImage(key, layer.contentAwareFillSrc, layer.fill, layer.premultipliedSource, paintOnlyBake(layer))) {
                 this.frameMediaExact = false;
               }
             } else if (layer.kind === 'video' && layer.src) {
-              const bakeVid = layerIsBaked(layer)
+              // Device px per layer unit this frame — the view's raster
+              // scale (which already folds in Preview Quality) times the
+              // layer's own scale — so the bake runs at the size that
+              // will be shown, not the footage's native size. At export
+              // the raster scale is 1:1 at comp resolution, so a
+              // full-frame clip still bakes at native there.
+              const vidTargetScale =
+                (snapshot.view?.scale ?? 1) * this.dpr
+                * Math.max(Math.abs(layer.scaleX ?? 1), Math.abs(layer.scaleY ?? 1));
+              // Paint rides the same per-frame bake as a CPU-only style: the
+              // strokes are drawn onto each decoded frame. Only a styled or
+              // painted clip pays for that; every other clip keeps its feed below.
+              const vidPaint = paintOnlyBake(layer);
+              const bakeVid: ImageBakeSpec | undefined = layerIsBaked(layer)
                 ? {
                     effects: layer.effects!,
                     width: layer.width,
                     height: layer.height,
                     fillOpacity: layer.fillOpacity,
                     ...(layer.mask && layer.mask.paths.length > 0 ? { mask: layer.mask } : {}),
-                    // Device px per layer unit this frame — the view's raster
-                    // scale (which already folds in Preview Quality) times the
-                    // layer's own scale — so the bake runs at the size that
-                    // will be shown, not the footage's native size. At export
-                    // the raster scale is 1:1 at comp resolution, so a
-                    // full-frame clip still bakes at native there.
-                    targetScale:
-                      (snapshot.view?.scale ?? 1) * this.dpr
-                      * Math.max(Math.abs(layer.scaleX ?? 1), Math.abs(layer.scaleY ?? 1)),
+                    ...(vidPaint ? { paint: vidPaint.paint } : {}),
+                    targetScale: vidTargetScale,
                   }
-                : undefined;
+                : vidPaint ? { ...vidPaint, targetScale: vidTargetScale } : undefined;
               if (bakeVid) {
                 // Canvas2D-only styles on footage: bake the current frame so
                 // interior styles / warps are not silent no-ops. Frame Mix is
@@ -843,7 +1026,9 @@ export class MotionRendererBackend implements RenderBackend {
                 // weave — bob a pulldown source so the baked frame is at
                 // least comb-free (same trade as feedVideoFrame's fallback).
                 const bakeFields = layer.fieldsSource ?? (layer.pulldownSource !== undefined ? 'lower' : undefined);
-                this.textures!.setVideoBaked(key, layer.src, targetTime, bakeVid, bakeFields);
+                // Unsettled (seeking, or the bake still in the worker pool) keeps
+                // the stand-in frame out of the preview cache, like setVideo.
+                if (!this.textures!.setVideoBaked(key, layer.src, targetTime, bakeVid, bakeFields)) this.frameMediaExact = false;
               } else if (layer.frameBlend?.mode === 'pixelMotion') {
                 const key = `vfm:${layer.id}`;
                 activeKeys.add(key);
@@ -913,7 +1098,10 @@ export class MotionRendererBackend implements RenderBackend {
                 // nothing double-applies.
                 effects: layer.effects,
                 mask: layer.mask,
-              });
+                // Paint strokes on text were recorded and never drawn — only the
+                // shape raster ran the paint pass. Absent when unpainted.
+                ...(hasPaintStrokes(layer.paint) ? { paint: layer.paint } : {}),
+              }, layer.contentHash);
             } else if (!(layer.precompLayers && layer.precompLayers.length > 0) && needsShapeRaster(layer)) {
               // (Precomp containers draw their offscreen subtree texture, never
               // their own shape — skipping the raster avoids uploading a
@@ -1010,6 +1198,7 @@ export class MotionRendererBackend implements RenderBackend {
       }
 
       this.textures.retain(activeKeys);
+      perfEnd(PerfStage.textureFeed);
     }
 
     // Camera from the app's comp→canvas view (pan/zoom) or a centered fit.
@@ -1097,29 +1286,175 @@ export class MotionRendererBackend implements RenderBackend {
       setActiveViewerLut(null);
     }
 
-    const result = this.renderer.render(vp, snapshotToFrameScene(snapshot));
+    perfBegin(PerfStage.flatten);
+    const frameScene = snapshotToFrameScene(snapshot);
+    // Read immediately: the collector is module state and the next adapter call
+    // (another backend, a thumbnail) resets it.
+    const sceneLayerErrors = takeSceneLayerErrors();
+    perfEnd(PerfStage.flatten);
+    perfBegin(PerfStage.gpuSubmit);
+    const result = this.renderer.render(vp, frameScene);
+    perfEnd(PerfStage.gpuSubmit);
 
     // Preview half of the M8a split: keep the frame, but say what it is not.
-    // Deduped by detail — a 60fps viewport would otherwise emit the same notice
-    // every frame for as long as the layer is on screen.
     //
-    // App-side media offline (decode failed → colour bars) joins the same list
-    // so export refuses via the existing lastFrameDiagnostics gate.
+    // App-side media offline (decode failed → colour bars) and layers the
+    // snapshot / adapter had to skip (layerErrors.ts) join the same list, so
+    // export refuses all of them via the existing lastFrameDiagnostics gate —
+    // a skipped layer can never silently drop out of a delivered file.
     const mediaOffline = (this.textures as AppTextureProvider | null)?.offlineMediaReports?.() ?? [];
     const mediaDiags = mediaOffline.map((m) => ({
       code: 'media-unavailable' as const,
       detail: m.detail,
       layerId: m.layerId,
     }));
-    this.frameDiagnostics = [...result.diagnostics, ...mediaDiags];
-    for (const d of this.frameDiagnostics) {
-      if (this.reportedDiagnostics.has(d.detail)) continue;
-      this.reportedDiagnostics.add(d.detail);
-      getEventBus().emit('EngineError', {
-        engine: `motion-${this.resolvedKind ?? this.preferred}`,
-        role: this.role,
-        error: new Error(d.detail),
-      });
+    const layerDiags = snapshot.layerErrors || sceneLayerErrors
+      ? layerErrorDiagnostics(snapshot.layerErrors, sceneLayerErrors)
+      : [];
+    this.frameDiagnostics = [...layerDiags, ...result.diagnostics, ...mediaDiags];
+    // Surfaced once per distinct detail, toasts rate-limited, viewport only.
+    // NOT as `EngineError`: that event means "a GPU tier failed to start" to
+    // renderBackendStore, and re-emitting frame problems through it flipped
+    // the viewport badge to "Software rendering" over one offline image.
+    reportFrameDiagnostics(this.frameDiagnostics, this.role, `motion-${this.resolvedKind ?? this.preferred}`);
+  }
+
+  /**
+   * A GPU device (WebGPU `device.lost`) or context (WebGL2
+   * `webglcontextlost`) went away under a live renderer.
+   *
+   * Everything uploaded died with it — textures, pipelines, mesh buffers, the
+   * environment atlas, LUT strips, shadow maps, the rasterizer's texture LRU —
+   * and every one of those lives under the Renderer (its ResourceManager) or
+   * the AppTextureProvider built with it. So recovery is a REBUILD, not a
+   * repair: tear both down, run the same init ladder a fresh attach runs (the
+   * WebGPU → WebGL2 fallback chain), and let textures re-upload lazily as the
+   * first frames feed them. CPU-side caches (decoded video frames, raster
+   * canvases in the decoders) are GPU-independent and survive.
+   *
+   * Ignored when it is not about the CURRENT backend (a failed init rung, one
+   * already replaced) or when it is our own teardown (`destroyed`).
+   */
+  private handleGpuLoss(lost: GpuBackend, reason: string): void {
+    if (this.disposed || !this.renderer || this.renderer.backend !== lost) return;
+    if (/^destroyed\b/i.test(reason)) return;
+    if (this.lostBackend === lost) return;
+    this.lostBackend = lost;
+    this.recovering = true;
+    // Frames coalesce into `pending` from here until the rebuild lands.
+    this.ready = false;
+    if (this.resolvedKind === 'webgl2') {
+      // A preventDefault-ed WebGL loss is followed by `webglcontextrestored`;
+      // rebuilding before it would create objects on a context that is still
+      // gone. Browsers do not always send it, hence the timeout.
+      this.restoreTimer = setTimeout(() => {
+        this.restoreTimer = null;
+        void this.rebuildAfterLoss(reason);
+      }, MotionRendererBackend.gpuLossPolicy.restoreTimeoutMs);
+      return;
+    }
+    void this.rebuildAfterLoss(reason);
+  }
+
+  private handleContextRestored(backend: GpuBackend): void {
+    if (this.lostBackend !== backend || this.restoreTimer === null) return;
+    clearTimeout(this.restoreTimer);
+    this.restoreTimer = null;
+    void this.rebuildAfterLoss('webglcontextlost');
+  }
+
+  /** Tear the renderer and everything uploaded through it down, for a rebuild. */
+  private teardownForRecovery(): void {
+    this.ready = false;
+    this.detachContextLoss?.();
+    this.detachContextLoss = null;
+    this.detachPluginEffects?.();
+    this.detachPluginEffects = null;
+    const renderer = this.renderer;
+    this.renderer = null;
+    this.viewport = null;
+    try {
+      this.textures?.dispose();
+    } catch {
+      /* releasing handles on a dead device is best-effort */
+    }
+    this.textures = null;
+    if (renderer) {
+      // A restored WebGL2 context is about to be adopted by the replacement on
+      // the same canvas; the normal dispose would lose it again.
+      const gl = renderer.backend as { retainContextOnDispose?: boolean };
+      if ('retainContextOnDispose' in gl) gl.retainContextOnDispose = true;
+      try {
+        renderer.dispose();
+      } catch {
+        /* the device is already gone */
+      }
+    }
+    this.resolvedKind = null;
+  }
+
+  private async rebuildAfterLoss(reason: string): Promise<void> {
+    const canvas = this.canvas;
+    if (this.disposed || !canvas) {
+      this.recovering = false;
+      return;
+    }
+    const policy = MotionRendererBackend.gpuLossPolicy;
+    const lostKind = this.resolvedKind;
+    const engine = `motion-${lostKind ?? this.preferred}`;
+    const now = Date.now();
+    while (this.recoveryTimes.length > 0 && now - this.recoveryTimes[0]! > 60_000) this.recoveryTimes.shift();
+    this.recoveryTimes.push(now);
+    const attempt = this.recoveryTimes.length;
+
+    // The frame that was on screen is repainted first by the rebuilt renderer.
+    if (!this.pending) this.pending = this.lastSnapshot;
+    this.teardownForRecovery();
+    this.lostBackend = null;
+
+    if (attempt > policy.maxRecoveriesPerMinute) {
+      // A loop. Rebuilding again would only restart it.
+      if (lostKind === 'webgpu') MotionRendererBackend.webgpuDisabledByLossLoop = true;
+      const message = lostKind === 'webgpu'
+        ? `The GPU device was reset ${attempt} times in a minute, so the preview has stopped. WebGPU is off for the rest of this session: save, then reopen the project to continue on WebGL2.`
+        : `The graphics context was reset ${attempt} times in a minute, so the preview has stopped. Save your work and restart the app.`;
+      this.recovering = false;
+      this.initFailed = true;
+      this.initErrorMessage = message;
+      notifyGpuRecoveryFailed(this.role, engine, message);
+      return;
+    }
+
+    const delay = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (attempt - 1));
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    if (this.disposed) {
+      this.recovering = false;
+      return;
+    }
+    this.initFailed = false;
+    this.initErrorMessage = null;
+    try {
+      // The same ladder attach runs: WebGPU → retry → WebGL2 → retry, skipping
+      // rungs this canvas can no longer produce. On success it flushes
+      // `pending`, which repaints the current frame.
+      await this.initLadder(canvas);
+    } catch (err) {
+      this.initFailed = true;
+      this.initErrorMessage = err instanceof Error ? err.message : String(err);
+    }
+    this.recovering = false;
+    if (this.disposed) return;
+    if (this.ready) {
+      notifyGpuRecovered(this.role, engine, reason);
+      // Textures re-upload lazily; ask the host for a fresh frame so async
+      // decodes that land now repaint instead of waiting for the next edit.
+      requestMediaRepaint('__texture__');
+    } else {
+      notifyGpuRecoveryFailed(
+        this.role,
+        engine,
+        this.initErrorMessage ?? 'No GPU tier could be re-initialized after the reset. Reopening the project rebuilds the preview.',
+      );
     }
   }
 
@@ -1155,7 +1490,14 @@ export class MotionRendererBackend implements RenderBackend {
     // repaint would have corrected a tick later.
     const legacy = this.textures?.takeMediaWaits ? this.textures.takeMediaWaits() : [];
     const exact = this.exactFrames.waits();
-    return exact.length > 0 ? [...legacy, ...exact] : legacy;
+    // And the plugin package textures still decoding. Same argument one tier
+    // up: an export that shipped untextured sprites because a packaged PNG had
+    // not finished decoding would be wrong in a file, silently. Empty for every
+    // project without a textured generator, so this costs a map walk over
+    // nothing.
+    const assets = pluginAssetWaits();
+    if (exact.length === 0 && assets.length === 0) return legacy;
+    return [...legacy, ...exact, ...assets];
   }
 
   /**
@@ -1219,10 +1561,14 @@ export class MotionRendererBackend implements RenderBackend {
    * (`fields`) skip the scale — field weaving needs original row parity.
    * Export renders at view scale 1 → bucket 1 → always source resolution.
    */
-  private feedScaledFrame(key: string, canvas: HTMLCanvasElement, baseSig: string, fields?: 'upper' | 'lower'): void {
+  private feedScaledFrame(key: string, image: ExactFrameImage, baseSig: string, fields?: 'upper' | 'lower'): void {
     const bucket = this.feedBucket();
-    if (bucket >= 1 || fields !== undefined || canvas.width < 64 || canvas.height < 64) {
-      this.textures!.setFrame(key, canvas, baseSig, fields);
+    // The exact tier hands over canvases, ImageBitmaps or VideoFrames (see
+    // exactVideoFrames); each uploads as itself, and a bucket downscale draws
+    // straight from it rather than from a full-size canvas copy first.
+    const { width, height } = frameImageSize(image);
+    if (bucket >= 1 || fields !== undefined || width < 64 || height < 64) {
+      this.textures!.setFrame(key, image, baseSig, fields);
       return;
     }
     const sig = `${baseSig}:b${bucket}`;
@@ -1232,18 +1578,18 @@ export class MotionRendererBackend implements RenderBackend {
       this.scaledFeed.set(key, entry);
     }
     if (entry.sig !== sig) {
-      const w = Math.max(1, Math.round(canvas.width * bucket));
-      const h = Math.max(1, Math.round(canvas.height * bucket));
+      const w = Math.max(1, Math.round(width * bucket));
+      const h = Math.max(1, Math.round(height * bucket));
       entry.canvas.width = w;
       entry.canvas.height = h;
       const ctx = entry.canvas.getContext('2d');
       if (!ctx) {
-        this.textures!.setFrame(key, canvas, baseSig, fields);
+        this.textures!.setFrame(key, image, baseSig, fields);
         return;
       }
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(canvas, 0, 0, w, h);
+      ctx.drawImage(image, 0, 0, w, h);
       entry.sig = sig;
     }
     this.textures!.setFrame(key, entry.canvas, sig, fields);
@@ -1283,7 +1629,7 @@ export class MotionRendererBackend implements RenderBackend {
       // the SAME frame with the other treatment instead of being skipped.
       // (Pulldown removal needs no marker of its own — it changes the
       // presentation index, which is already the signature.)
-      this.feedScaledFrame(key, exact.canvas, `xv:${exact.presIndex}:f${fields ?? ''}`, fields);
+      this.feedScaledFrame(key, exact.image, `xv:${exact.presIndex}:f${fields ?? ''}`, fields);
       return;
     }
     // The exact tier is still warming — whatever shows now is a stand-in.
@@ -1366,6 +1712,15 @@ export class MotionRendererBackend implements RenderBackend {
     this.disposed = true;
     this.ready = false;
     this.pending = null;
+    this.lastSnapshot = null;
+    if (this.restoreTimer !== null) {
+      clearTimeout(this.restoreTimer);
+      this.restoreTimer = null;
+    }
+    // Off before the renderer goes: WebGL2's own dispose detaches its canvas
+    // listeners, but this subscription must not outlive the backend either way.
+    this.detachContextLoss?.();
+    this.detachContextLoss = null;
     this.rasterSettle.dispose();
     // Nothing is rendering any more, so "which tier rendered" has no answer.
     this.resolvedKind = null;

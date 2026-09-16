@@ -44,6 +44,43 @@ describe('normalizeStroke', () => {
   });
 });
 
+describe('normalizeStroke — AE stroke options', () => {
+  const linear = { type: 'linear' as const, angle: 0, stops: [{ id: 'a', offset: 0, color: '#000' }, { id: 'b', offset: 1, color: '#fff' }] };
+
+  test('composite / blend: omitted at their defaults (cache-key contract), kept otherwise', () => {
+    const plain = normalizeStroke({ width: 2, composite: 'below', blendMode: 'normal' });
+    expect('composite' in plain || 'blendMode' in plain).toBe(false);
+    expect(normalizeStroke({ width: 2, composite: 'above', blendMode: 'multiply' })).toMatchObject({ composite: 'above', blendMode: 'multiply' });
+    // A mode Canvas2D cannot draw is not stored as if it could.
+    expect('blendMode' in normalizeStroke({ width: 2, blendMode: 'linear-burn' as never })).toBe(false);
+  });
+
+  test('gradient points: kept on a GRADIENT paint with finite coordinates; highlight clamped, zeros omitted', () => {
+    const g = { startX: 0, startY: 0.1, endX: 1, endY: 0.9, highlightLength: 3, highlightAngle: 0 };
+    expect(normalizeStroke({ width: 2, paint: linear, gradient: g }).gradient)
+      .toEqual({ startX: 0, startY: 0.1, endX: 1, endY: 0.9, highlightLength: 1 });
+    expect('gradient' in normalizeStroke({ width: 2, gradient: g })).toBe(false);
+    expect('gradient' in normalizeStroke({ width: 2, paint: linear, gradient: { ...g, endY: NaN } })).toBe(false);
+  });
+
+  test('taper: pixel lengths are NOT clamped to 1, eases keep AE’s −1..1, percent units are not written', () => {
+    const px = normalizeStroke({ width: 2, taper: { startWidth: 0.2, endWidth: 1, startLength: 80, endLength: 0, startEase: -3, endEase: 0.5, lengthUnits: 'pixels' } });
+    expect(px.taper).toEqual({ startWidth: 0.2, endWidth: 1, startLength: 80, endLength: 0, startEase: -1, endEase: 0.5, lengthUnits: 'pixels' });
+    const pct = normalizeStroke({ width: 2, taper: { startWidth: 0.2, endWidth: 1, startLength: 80, endLength: 0, startEase: 0, endEase: 0, lengthUnits: 'percent' } });
+    expect(pct.taper).toEqual({ startWidth: 0.2, endWidth: 1, startLength: 1, endLength: 0, startEase: 0, endEase: 0 });
+  });
+
+  test('wave: Cycles is kept, Pixels (the default) is not written', () => {
+    expect(normalizeStroke({ width: 2, wave: { amount: 5, wavelength: 6, phase: 0, units: 'cycles' } }).wave).toEqual({ amount: 5, wavelength: 6, phase: 0, units: 'cycles' });
+    expect(normalizeStroke({ width: 2, wave: { amount: 5, wavelength: 60, phase: 0, units: 'pixels' } }).wave).toEqual({ amount: 5, wavelength: 60, phase: 0 });
+  });
+
+  test('a stroke using none of them normalises to exactly the old shape', () => {
+    expect(Object.keys(normalizeStroke({ width: 3, color: '#123456' })))
+      .toEqual(['enabled', 'color', 'width', 'opacity', 'align', 'dash', 'cap', 'join']);
+  });
+});
+
 describe('readNodeStroke', () => {
   test('returns a normalized stroke when enabled with width > 0', () => {
     const s = readNodeStroke(node({ stroke: { width: 6, color: '#ff0000' } }));

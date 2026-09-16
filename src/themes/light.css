@@ -6,6 +6,7 @@
  */
 
 [data-theme="light"] {
+  color-scheme: light;
   /* ── Surface contract (see dark.css) — each level one step DARKER ── */
   --surface-0:        var(--color-slate-0);     /* #ffffff */
   --surface-1:        var(--color-slate-50);    /* #f5f6f9 */

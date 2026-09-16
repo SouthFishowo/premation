@@ -2,14 +2,20 @@
 
 **Status:** shipped.
 
-> **Plugins are a hosted-build feature.** The UI is hidden in a local
-> (`VITE_EDITION=local`) build and a local build never contacts the registry —
-> `pluginsEnabled()` gates the feature, `pluginRegistryEnabled()` gates the
-> marketplace, and a self-hosted editor fails both. A project containing plugin
-> content still opens, edits and saves losslessly there: custom layers, plugin
-> effects and proxy subtrees round-trip byte-for-byte with the plugin absent,
-> including the `plugins[]` block naming id and version. It simply has nothing
-> to run them with.
+> **Plugins run in both editions.** A local (`VITE_EDITION=local`) build
+> installs plugins from local files — a `.zip`, a `.mplugin` or a folder, from
+> the Plugins panel's **Add plugin** menu or by dropping the package on it —
+> through the same manifest check, consent screen, signature verification and
+> Worker sandbox as the hosted build. What needs motion-back stays server-only:
+> browsing and downloading from the registry, update checks, the revocation
+> list, account sync of the installed set, and publishing.
+> `pluginsEnabled()` gates the feature (true in both), `pluginRegistryEnabled()`
+> gates everything that talks to the registry (server only), and the main
+> process registers the publish channels only when `pluginPublishEnabled()`.
+> A project containing plugin content opens, edits and saves losslessly
+> without the plugin: custom layers, plugin effects and proxy subtrees
+> round-trip byte-for-byte, including the `plugins[]` block naming id and
+> version.
 >
 > The cross-repo system reference is
 > [`PLUGIN_SYSTEM_REFERENCE.md`](PLUGIN_SYSTEM_REFERENCE.md). When it and this
@@ -161,6 +167,16 @@ and rate. `noHostRealmEval.test.ts` refuses the change.
 | Panel host document (its own CSP) | `public/plugin-panel.html` |
 | Plugins menu, built from what is installed | `src/layout/Menu/pluginMenu.ts` |
 | Starter template generator | `src/layout/Plugins/starterPlugin.ts` |
+| Native ABI + version check (renderer) | `src/core/plugins/native/nativeAbi.ts` |
+| Which binary, per platform-arch | `src/core/plugins/native/nativePlatforms.ts` |
+| Native trust gate + pinned-hash consent | `src/core/plugins/native/nativeTrust.ts` |
+| Native call scheduling, budget, export settle | `src/core/plugins/native/nativeScheduler.ts` |
+| Native buffer ownership | `src/core/plugins/native/nativeBuffers.ts` |
+| The seam the app calls | `src/core/plugins/native/nativeClient.ts` |
+| Native process supervisor (main) | `electron/pluginNativeHost.ts` |
+| Native IPC: containment, hashing, staging | `electron/pluginNativeIpc.ts` |
+| Inside a plugin's process | `electron/pluginNativeChild.ts`, `electron/pluginNativeChildCore.ts` |
+| The ABI as a C header + example addon | `packages/plugin-native-sdk/` |
 
 **Tests:** `pluginPackage.test.ts` (format), `pluginHost.test.ts` (lifecycle,
 permission gate, argument validation, command namespacing),
@@ -180,6 +196,73 @@ my-plugin/
 ```
 
 Zipping the folder is fine — one wrapping directory is stripped automatically.
+`node scripts/pack-plugin.mjs ./my-plugin` produces the `.mplugin` archive and
+tells you at pack time about the things the editor would otherwise refuse at
+install time.
+
+### More than one file
+
+A package is a module **graph**, not one file. Import your own files with
+ordinary relative specifiers:
+
+```js
+// main.js
+import { solve } from './lib/solver.js';
+import './lib/register.js';
+const heavy = await import('./lib/heavy.js');   // works too
+```
+
+Resolution is what a bundler does, not what a browser does: `./lib/solver` finds
+`lib/solver.js`, and `./lib` finds `lib/index.js`. Three things are refused, each
+with the fix in the message:
+
+| You wrote | Why it cannot work | Do this instead |
+|---|---|---|
+| `import { mat4 } from 'gl-matrix'` | there is no `node_modules` and no network | bundle your dependencies into the package |
+| `import x from 'https://cdn…/x.js'` | a plugin has no network of its own | ship the file |
+| `a.js` ↔ `b.js` importing each other | files load in dependency order, so a cycle has none | move the shared code into a third file |
+| `import look from './look.cube'` | only `.js` / `.mjs` are modules | `await motion.package.read('look.cube')` |
+
+The cycle restriction is real — ES modules themselves permit cycles. Each file
+becomes its own blob URL inside the sandbox, and a blob URL is minted from its
+content, so a module cannot be given a URL until every module it imports already
+has one. Two files that import each other have no such order.
+
+Stack traces name your files, not the blob URLs: the sandbox substitutes each
+URL for the package path it came from before the line reaches the log.
+
+### Files that are not code
+
+```js
+const weights = await motion.package.read('models/seg.onnx');   // ArrayBuffer
+const wgsl    = await motion.package.read('shaders/blur.wgsl', 'text');
+```
+
+`package.read` reads out of **your own package** — the one the user installed.
+It needs no permission, because the bytes arrived under the same signature as
+your JavaScript and your entry module could already have carried them as base64;
+what it replaces is exactly that base64, which is a third more bytes, decoded on
+every boot, and invisible to every size check.
+
+Extensions a package may contain, beyond source and markup:
+
+`.png .jpg .jpeg .webp .wasm .bin .onnx .glb .gltf .ttf .otf .woff2 .cube .exr
+.hdr .mp3 .wav`
+
+Native modules — `.node`, `.dll`, `.so`, `.dylib`, `.exe` — are **not** in that
+list and will not be. A compiled library would run in the application's own
+process, which is a separate tier with its own consent and its own signing gate.
+
+| | Registry install | Folder / `.mplugin` on this machine |
+|---|---|---|
+| One file | 2 MB | 64 MB |
+| Whole package | 8 MB | 512 MB |
+| File count | 200 | 5000 |
+
+The registry numbers bound what an anonymous publisher can push into a user's
+browser storage over the network. The local ones bound a directory the user or
+their administrator put on their own disk, which is where a model, a LUT set or
+a font actually fits.
 
 ```jsonc
 {
@@ -204,13 +287,38 @@ Two numbers, separate from 5 onward:
 
 | Constant | Now | Answers |
 |---|---|---|
-| `MANIFEST_VERSION` | 5 | what grammar the host can read — `apiVersion` is checked against this |
+| `MANIFEST_VERSION` | 7 | what grammar the host can read — `apiVersion` is checked against this |
 | `HOST_API_VERSION` | 5 | what the host can do; reported to you at runtime |
 
 They were one number and it made every host-method addition look like a manifest
 change, telling authors their manifests were out of date when nothing about them
 was. Bump `apiVersion` when you use a newer manifest **field**; use `requires`
 to say what the host must be able to **do**.
+
+#### Which version each newer field arrived in
+
+The parser does not refuse keys it has never heard of, so on an older host a
+newer field is **silently ignored** — an `expand` that is ignored is an effect
+clipped at the layer edge, a `cpu` that is ignored is an effect that vanishes
+from every baked layer and from export. Every field below is therefore gated,
+and declaring one on too low an `apiVersion` is refused by name.
+
+| Version | Fields that need it |
+|---|---|
+| 3 | `contributes.layerKinds`, `render: "none"` / `"proxy"` |
+| 4 | `contributes.effects`, `contributes.net`, `render: "shader"` |
+| 6 | `contributes.presets` · `importers` · `exporters`, `render: "generator"` |
+| 7 | an effect's `glsl` · `cpu` · `expand` · `identity` · `threadSafety` · `frames` · `limits`, a **second** `layer` parameter, a pass's `glsl`, and `contributes.inspector` · `tools` · `shortcuts` · `expressions` |
+
+The trade is deliberate and it is worth knowing before you declare 7: a host
+older than the version you name refuses the **whole** package. There is no way
+to ship these fields and also install on an older host — and that is the point,
+because the alternative is a plugin that installs and half works, with nothing
+on screen to say which half.
+
+One `layer` parameter is as old as effects are and still installs on API 4; the
+second through fourth need 7, because the extra bindings only exist in the
+layout this version generates.
 
 ### `requires` and `optional`
 
@@ -219,10 +327,19 @@ never repurposed, because your manifest is signed and a string that changed
 meaning would silently change what you asked for.
 
 `scene.read` · `scene.write` · `scene.proxy` · `scene.batch` ·
-`animation.read` · `animation.write` · `assets.read` · `assets.write` ·
-`timeline` · `net.fetch` · `storage.global` · `storage.project` ·
-`effects.single` · `effects.multipass` · `layerkinds` · `panels` · `wasm` ·
+`scene.structured` · `animation.read` · `animation.write` · `animation.typed` ·
+`assets.read` · `assets.write` · `timeline` · `composition.manage` ·
+`audio.analyse` · `net.fetch` · `storage.global` · `storage.project` ·
+`effects.single` · `effects.multipass` · `effects.describe` ·
+`layerkinds` · `layerkinds.generator` · `layerkinds.shader` ·
+`exporters` · `importers` · `presets` · `panels` · `wasm` ·
+`ui.inspector` · `ui.canvas` · `ui.tools` · `ui.shortcuts` · `ui.expressions` ·
 `webgpu` *(runtime — depends on the machine)*
+
+`effects.describe` and `animation.typed` arrived together with argument
+validation (see *Names are checked* below). They are capabilities, not a
+`HOST_API_VERSION` bump, per the rule above: a plugin that needs either says so
+in `requires` and an older host refuses the install by name.
 
 `requires` is checked at **install**, and a refusal names the reason: a
 capability the host knows but this machine lacks ("needs WebGPU") reads
@@ -363,10 +480,11 @@ disable a feature instead of throwing.
 
 ## 5. Writing a plugin
 
-**Installing happens on the dashboard's Plugins page**, not in the editor's
-Plugins panel — it lives beside publishing, since both are about getting a
-plugin into the world. The editor's panel finds and runs what is already
-installed.
+**Installing happens on the dashboard's Plugins page** in the hosted build, not
+in the editor's Plugins panel — it lives beside publishing, since both are about
+getting a plugin into the world. The editor's panel finds and runs what is
+already installed. **The local edition has no dashboard**, so there the editor's
+Plugins panel carries the **Add plugin** menu and accepts a dropped package.
 
 **Download starter template** there produces a working package. Install it with
 **Choose folder…**, and from then on iterate with the row's **Reload**, which
@@ -422,7 +540,7 @@ motion.composition.open(id) / rename(id, name) / delete(id)
 motion.scene.getSelection() / setSelection(ids)
 motion.scene.getLayers() / getLayer(id)
 motion.scene.createLayer({ kind, name, x, y })   // shape | text | group | null | image
-motion.scene.setProperty(id, prop, value)         // scalar, or a structured value (below)
+motion.scene.setProperty(id, prop, value)         // scalar, or a structured value (below); unknown names refused
 motion.scene.renameLayer(id, name) / deleteLayer(id)
 motion.scene.setParent(id, parentId | null)      // null → composition root
 motion.scene.setVisible(id, bool) / setLocked(id, bool)
@@ -430,10 +548,11 @@ motion.scene.setVisible(id, bool) / setLocked(id, bool)
 motion.effects.list(layerId)                     // [{ id, type, enabled, params }]
 motion.effects.add(layerId, type)                // → the new effect's id
 motion.effects.remove(layerId, effectId)
-motion.effects.setParam(layerId, effectId, key, value)
+motion.effects.setParam(layerId, effectId, key, value)   // key + range checked against the effect
+motion.effects.describe(type)                    // { type, label, params: [{ id, label, type, default, min, max, … }] }
 
 motion.animation.getTracks(id) / sample(id, prop, time)
-motion.animation.setKeyframe(id, prop, time, value, easing)
+motion.animation.setKeyframe(id, prop, time, value, easing)       // value: number | colour | point
 motion.animation.setKeyframes(id, prop, [{ t, value, easing }])   // prefer this
 motion.animation.removeKeyframe(id, prop, time)
 motion.animation.setExpression(id, prop, source)
@@ -448,8 +567,8 @@ motion.exporters.register(id, handlers)    // provide an output format (API 6)
 motion.importers.register(id, handlers)    // read an input format (API 6)
 
 motion.scene.apply(ops)                          // many mutations, ONE undo entry
-motion.storage.get(key, scope) / set(key, value, scope)
-motion.storage.delete(key, scope) / list(scope)  // scope: 'global' | 'project'
+motion.storage.get(key, scope?) / set(key, value, scope?)
+motion.storage.delete(key, scope?) / list(scope?, prefix?)  // scope: 'global' (default) | 'project'
 ```
 
 Prefer `setKeyframes` over a loop of `setKeyframe`: the bulk API sorts once and
@@ -698,6 +817,70 @@ one you built with no way to notice.
 Validation completes before anything is written, so a refused call has changed
 nothing — including inside a `scene.apply` batch.
 
+**`fill` means `fillPaint`.** Setting `fill` to a gradient object routes it to
+`fillPaint`, and setting it to a hex colour makes a solid `fillPaint` (on a text
+layer, whose `fill` is a plain colour string, the colour is written as before).
+`'linear-gradient'` and `'radial-gradient'` are accepted as the `type`. A CSS
+gradient **string** — `'linear-gradient(90deg, #f00, #00f)'` — is refused with
+the object form in the message; CSS is not parsed.
+
+### Names are checked
+
+`scene.setProperty`, `animation.setKeyframe(s)` and `effects.setParam` refuse a
+name the layer or effect does not have, and the error names the closest real
+one:
+
+```
+"opactiy" is not a property of "Shape 1". Did you mean "opacity"?
+"blur" is not a parameter of Drop Shadow ("drop-shadow"). Its parameters:
+  distance, angle, softness, spread, color, opacity.
+  effects.describe("drop-shadow") lists their types and ranges.
+```
+
+These calls used to succeed: an unknown prop was written onto the layer's
+Transform, an unknown track was created, an unknown effect param was stored
+beside the real one — none of which renders. A name counts as known when the
+layer already holds it or has a track for it, the property registry describes
+it, or it is a structured prop; an effect param must be in the effect's
+definition. `effects.setParam` also checks the value against the param's type
+and `min`/`max` — a refusal, not a clamp, matching the Effect Controls field.
+Ask `motion.effects.describe(type)` for the ids and ranges rather than guessing:
+
+```js
+const { params } = await motion.effects.describe('glow');
+// [{ id: 'radius', type: 'number', min: 0, max: 60, default: 16, … },
+//  { id: 'color', type: 'color', … }, …, { id: 'fx.opacity', min: 0, max: 100, … }]
+```
+
+`describe` needs no permission — it reads the host's effect catalogue, not the
+project.
+
+### Colour and point keyframes
+
+A keyframe `value` may be a number, a **colour** or a **point**:
+
+```js
+await motion.animation.setKeyframes(id, 'fill', [
+  { t: 0, value: '#ff0055' },
+  { t: 1, value: { r: 0, g: 85, b: 255, a: 0.5 } },   // r/g/b 0–255, a 0–1
+]);
+await motion.animation.setKeyframes(id, 'position', [
+  { t: 0, value: { x: 0, y: 0 } },
+  { t: 1, value: { x: 200, y: 80 } },
+]);
+```
+
+A colour is written as the four channel tracks the renderer reads —
+`fill_r`, `fill_g`, `fill_b`, `fill_a`, each 0–1 — exactly what keying the colour
+in the inspector writes. It works on `fill`, `stroke`, `color`, a later stroke's
+`stroke.<n>.color`, and an effect's colour param (`effect.<effectId>.<param>`).
+A point writes axis tracks: `x`/`y`/`z` for `position`, `anchorX/Y/Z` for
+`anchor`, `scaleX/Y/Z` for `scale`, `poiX/Y/Z` for `pointOfInterest`, and
+`<prop>X`/`<prop>Y` for any property that has those tracks. Colour strings are
+hex only (`#rgb`, `#rrggbb`, `#rrggbbaa`); every keyframe in one call must be
+the same kind. Anything else is refused by name. `animation.sample` still
+returns one number — sample a channel track to read a colour back.
+
 ### `scene.apply` — many mutations, one undo entry
 
 **One host call is one undo entry.** Twelve calls are twelve entries, and a user
@@ -732,7 +915,21 @@ const [rowId] = await motion.scene.apply([
 await motion.storage.set('lastPreset', 'wobble');            // scope defaults to 'global'
 await motion.storage.set('seed', 42, 'project');
 const seed = await motion.storage.get('seed', 'project');
+await motion.storage.delete('seed', 'project');
+const keys = await motion.storage.list('project', 'ui.');     // (scope?, prefix?)
 ```
+
+**Key first, scope last and optional.** That is the canonical form. Hosts before
+this change only accepted the older **scope-first** order —
+`storage.set('global', 'lastPreset', 'wobble')` — and it still works: a call
+whose first argument is exactly `'global'` or `'project'` *and* carries the
+scope-first arity (2 arguments for `get`/`delete`, 3 for `set`) is read that
+way; everything else is key-first. The one ambiguity that rule leaves: a key
+literally named `global` or `project` passed together with a scope. Name your
+keys something else. A call that fits neither form rejects with the expected
+signature in the message. Plugins that must also run on older hosts should use
+the scope-first order, or declare `requires` on a host new enough to accept
+both.
 
 Two scopes, and picking the wrong one is the mistake worth avoiding:
 
@@ -984,6 +1181,12 @@ These are settled decisions, written down so they stop being re-proposed.
   entry predicted: a separate class with a synchronous, deterministic contract
   (WGSL as data, never JS in the frame loop) rather than an extension of the
   command API.
+- ~~**Native code.**~~ **Shipped — see §19.** This said a plugin is JavaScript
+  and WebAssembly and nothing else. The constraint it was protecting (a bad
+  plugin must not be able to take the editor down) is still absolute; what
+  changed is how it is kept. A native module runs in a `utilityProcess` of its
+  own, behind a signature AND a separately-worded consent step naming the
+  binary by hash, and a crash costs one process and one frame.
 - ~~**Documents referencing plugins.**~~ **No longer true as of API 3** — see §9.
   A document containing a plugin-defined layer names the plugin that defines it.
   The guarantee it replaced is spelled out there in full.
@@ -1026,11 +1229,21 @@ against its own constraints at install time, for the same reason.
 - **`"proxy"`** — you maintain a subtree of native layers as children and the
   host renders those. The custom layer is the authored, animatable interface;
   the children are its output.
-- **`"shader"`** — reserved, refused with a version message. Not a typo on your
-  part.
+- **`"shader"`** (API 4, drawn from API 6) — the kind draws itself, with one of
+  your own effects. Add `"shader": "<effectId>"` naming an id from
+  `contributes.effects` and the host renders the layer as a transparent surface
+  carrying that effect, with its time / comp-size / frame inputs filled in. The
+  kind's declared props are passed to the effect by NAME, so `focal` on the kind
+  drives `focal` on the shader with no wiring. Without the field the kind parses
+  and draws nothing, which is what it did before the field existed.
+- **`"generator"`** (API 6) — the kind produces geometry every frame from real
+  plugin code: particles, sprites, meshes. See §17.
 
 `proxy` ships first because it is the one whose documents survive your plugin
-being uninstalled: the children are ordinary layers and keep rendering.
+being uninstalled: the children are ordinary layers and keep rendering. A
+`shader` or `generator` kind does not draw at all without the plugin that
+provides it — a real cost, and the reason to pick `proxy` whenever your output
+can be expressed as native layers.
 
 ### The one thing to get right: authored versus animated
 
@@ -1446,8 +1659,9 @@ If the editor's key-change prompt is unavailable for any reason, the update is
 
 ## 12. Effects (API 4)
 
-A plugin can draw pixels. It ships **WGSL and a typed parameter schema**; it
-does not ship a callback.
+A plugin can draw pixels. It ships **kernels and a typed parameter schema** —
+WGSL for WebGPU, GLSL ES 3.0 for WebGL2, a WASM or JS kernel for the CPU raster
+and export path, in any combination — and it does not ship a callback.
 
 ### Shaders as data, never JS in the frame loop
 
@@ -1485,10 +1699,12 @@ code. An `animatable` parameter becomes a keyframe track keyed exactly like
 every other property — no new machinery in the animation engine, nothing
 special in the timeline or the graph editor.
 
-Only `number`, `color` and `boolean` are accepted. `string` has no bytes in a
-uniform block, `asset` is a reference rather than a value, and `enum` would need
-an index mapping you had to keep in your head and in step with your schema. All
-three are refused at install rather than discovered from a black frame.
+Only `number`, `color`, `boolean` and `point` are accepted as values, plus
+`layer` as a texture input. `string` has no bytes in a uniform block, `asset` is
+a reference rather than a value, and `enum` would need an index mapping you had
+to keep in your head and in step with your schema. All three are refused at
+install rather than discovered from a black frame — as is a parameter whose name
+collides with one the host fills in (see *Host-filled inputs*).
 
 ### You write one function. The host writes everything else.
 
@@ -1511,8 +1727,9 @@ Three reasons, and none of them is tidiness:
 - **Hand-written uniform layout is a padding bug** that surfaces as wrong
   colours rather than as an error.
 
-You also get a **host pass block** at offset 64, and one field in it is worth
-knowing about even for a single-pass effect:
+You also get a **host block** at offset 64 — 80 bytes of values the host fills
+in, listed under *Host-filled inputs* below. One of them matters even for the
+simplest single-pass effect:
 
 ```wgsl
 params.texelSize   // vec2 — one over the target's dimensions
@@ -1525,15 +1742,39 @@ is one pixel to the right, at whatever resolution the host allocated. Hardcoding
 a resolution is correct on your composition and wrong on everyone else's, by an
 amount that reads as a bad kernel rather than a bad assumption.
 
+**`uv` spans the pass's target, not your layer.** The quad is full-target, so
+`uv` is always inside `[0, 1]`: on a 2D layer that is the whole viewport, on a 3D
+layer it is the layer plus the margin your `expand` reserved, and on WebGL2 it
+runs bottom-up. Sample textures at `uv`. To find your *layer*, use `layerRect`:
+
+```wgsl
+let local = (uv - params.layerRect.xy) / params.layerRect.zw; // 0..1 top-down over the layer
+let px    = local * params.layerSize;                          // layer px; < 0 in the left/top margin
+```
+
+`layerRect.zw` is negative on an axis the backend flips, which is why the
+division above is the form to use: it comes out top-down on both backends, and
+`layerRect.xy + local * layerRect.zw` takes you back to `uv` for sampling. A
+procedural kernel that ignores this paints the whole target, mirrored between
+WebGPU and WebGL2.
+
 After that block, the generated struct orders your parameters by **alignment,
-descending** — every `vec4` first — starting at offset **96**. A scalar before a
-`vec4` would leave a 12-byte hole the struct does not describe, and every member
-after it would read shifted bytes: no compile error, no exception, just wrong
-colours that look like your maths.
+descending** — every `vec4` first — starting at offset **144**. A scalar before
+a `vec4` would leave a 12-byte hole the struct does not describe, and every
+member after it would read shifted bytes: no compile error, no exception, just
+wrong colours that look like your maths.
+
+> The parameter base moved from 96 to 128 when the host block grew to carry the
+> time, the sizes and a seed, and from 128 to 144 when it grew again for
+> `layerRect`. Nothing you ship is invalidated by that: a plugin ships *source*,
+> and both sides of this layout — the struct you compile against and the bytes
+> the host packs — are generated from one description, so your effect is simply
+> recompiled against the new one.
 
 ### More than one pass
 
-Declare `passes` instead of `shader` — up to four, each with its own WGSL:
+Declare `passes` instead of `shader`/`glsl` — up to eight (sixteen on the
+extended tier), each with its own `wgsl`, `glsl`, or both:
 
 ```jsonc
 {
@@ -1685,24 +1926,268 @@ rendering after an uninstall, and a shader kind does not draw at all without the
 plugin that provides its shader. Prefer `"proxy"` when your output can be
 expressed as native layers.
 
+### Three kinds of kernel: WGSL, GLSL, and CPU
+
+An effect declares one or more of:
+
+| Field | Runs on | Language |
+|---|---|---|
+| `shader` | WebGPU | WGSL, one `@fragment fn fs` |
+| `glsl` | WebGL2 | GLSL ES 3.0, one `vec4 fs(vec2 uv)` |
+| `cpu` | anywhere | WASM or JS, `render(input, output, w, h, params, host)` |
+
+`shader` is API 4; `glsl` and `cpu` need `"apiVersion": 7`.
+
+**An effect with no kernel at all is refused at install.** It would appear in
+the browser, show its parameters, and change no pixels on any machine — which
+reads as a broken plugin rather than as an incomplete manifest.
+
+**A kernel missing for the LIVE backend is reported, not passed through.** The
+effect reaches the state `unsupported` and emits no pass, so the layer renders
+as if the effect were not there, and the reason names what to ship:
+
+> “Bloom” ships WGSL, and this frame needs GLSL ES 3.0. Add a "glsl" kernel to
+> the effect, or a "cpu" kernel, which stands in for any missing backend.
+
+That is a change from the old behaviour, which drew a generated *passthrough* on
+WebGL2 and said so only in the UI. Passthrough is still what a failed compile
+falls back to; it is no longer what a missing kernel does.
+
+```jsonc
+{
+  "id": "tint",
+  "label": "Tint",
+  "shader": "@fragment\nfn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { … }",
+  "glsl":   "vec4 fs(vec2 uv) { return texture(src, uv) * amount; }",
+  "cpu":    { "module": "kernels/tint.wasm" }
+}
+```
+
+**The GLSL contract mirrors the WGSL one.** You write `vec4 fs(vec2 uv)`; the
+host writes `#version 300 es`, the std140 `Object` block (the *same* layout, so
+both languages read the same bytes), `uniform sampler2D src`, the varyings, and
+`main`. You must not write `#version`, `#extension`, `uniform`, `layout(...)`,
+`main`, `discard` or `gl_FragColor` — each is refused at install with the reason,
+because each either collides with generated code or does not exist under
+`#version 300 es`. In GLSL your parameters are **bare names** (`amount`), not
+`params.amount`; a layer input keeps the name you gave it, via a generated
+`#define`.
+
+Compile errors from a driver are re-pointed at **your** line numbers before they
+are reported — the preamble is generated, and a log that named a line inside it
+would send you looking for code you did not write.
+
+A **chain must declare a language on every pass or on none**. A four-pass bloom
+missing GLSL on its third pass would run three passes and stop, leaving the
+layer holding an intermediate step, so the manifest is refused and the passes
+missing it are named.
+
+### CPU kernels
+
+```jsonc
+{ "cpu": { "module": "kernels/bloom.wasm", "entry": "render" } }
+```
+
+The module is read out of your package (so it carries the same integrity check
+as everything else in it) and run by the host — never in your plugin's worker,
+which is not woken. A kernel is a pure function over pixels: no host API, no
+document, no network, no storage. That is the same structural constraint effects
+have everywhere else, not a sandbox claim.
+
+Where it runs depends on who is asking. **Inside an effect chain** — the bake —
+it runs on the calling thread, in order with the built-in effects around it,
+because effects composite and an effect lifted out of its order is a wrong
+picture rather than a slow one. A caller that can *wait* for a whole-layer pass
+instead hands the job to a **pool of host-owned workers**, which serialises it
+according to your `threadSafety` and keeps only the newest request per lane
+while the user scrubs.
+
+```js
+exports.render = function (input, output, width, height, params, host) {
+  // input/output: Float32Array, RGBA, PREMULTIPLIED, 0..1, display sRGB
+  for (var i = 0; i < input.length; i++) output[i] = input[i];
+};
+```
+
+Two buffers, because an effect that reads a neighbourhood would otherwise read
+pixels it has already written. Float32 because that is what the GPU path works
+in — a kernel and its shader twin are then the same arithmetic. Premultiplied
+because compositing is only linear in that form; the conversion from the raster
+path's 8-bit straight-alpha bytes happens at the worker boundary, off the main
+thread.
+
+A **WASM** kernel exports `memory` and `render(inPtr, outPtr, width, height, time, seed)`,
+and optionally `alloc`; without an allocator the host places the buffers at
+`__heap_base` and grows the memory to fit.
+
+`host` carries everything the shaders read out of the uniform block (below),
+plus two things only a CPU kernel has:
+
+- `host.cache` — `get(key)` / `set(key, value, bytes?)`, scoped to the effect
+  **instance**, least-recently-used inside a byte budget. For the work that does
+  not depend on the pixels: a LUT, a noise field, a weight kernel. Per worker,
+  not global; an entry larger than the whole budget is not stored.
+- `host.frames` — neighbouring frames, when you declared `frames` (below).
+
+**The one-frame warm-up.** Instantiating a module is asynchronous; calling one
+is not. The first frame an effect appears on, the host loads the module and
+leaves the layer unchanged; every frame after that runs the kernel in place, in
+order with the built-in effects around it. Blocking the render thread on a WASM
+compile instead would be a stall on the frame the user adds the effect.
+
+### Host-filled inputs
+
+Every effect's parameter block carries these, whether or not it declares
+anything. They are **not** parameters: you read them, you never declare them,
+and a parameter that collides with one of these names is refused at install.
+
+| WGSL / GLSL | |
+|---|---|
+| `texelSize` | `vec2`, one over the target's dimensions |
+| `passScale`, `passIndex` | this pass's downsample and 0-based index |
+| `compSize`, `layerSize` | `vec2`, composition and layer size in px |
+| `time` | **this layer's** time in seconds — a retimed layer does not share the comp's |
+| `compTime` | the playhead, in composition seconds |
+| `frame`, `fps` | frame index at the comp's rate, and the rate |
+| `pixelScale` | raster px per composition px (device ratio × zoom) |
+| `downsample` | 1 at full quality, 2 at half, 4 at quarter |
+| `seed` | stable per effect instance, across frames, sessions and machines |
+| `layerRect` | `vec4`, your layer's box in `uv` units — `(uv - layerRect.xy) / layerRect.zw` is 0..1 top-down over the layer (GPU kernels; a CPU kernel's buffer is its layer canvas) |
+
+`seed` is stable on purpose: a noise field reseeded per frame boils, and one
+seeded from the clock is a different picture in preview and in export.
+
+A CPU kernel reads the same values as named fields on `host`.
+
+### Layer inputs, and frames either side
+
+Up to **four** `layer` parameters. The first is bound at 3, the rest at 5, 6 and
+7 — 4 is `origin` whether or not your effect has one, because a binding number
+that moved with an unrelated part of your manifest would be one three separate
+places had to re-derive and agree on. The second onwards need
+`"apiVersion": 7`; one has always been allowed.
+
+```jsonc
+"params": {
+  "depth":  { "type": "layer" },
+  "normal": { "type": "layer" }
+}
+```
+
+An input you have not pointed at anything **self-samples** rather than being
+skipped: a declared binding with nothing bound is an invalid pipeline, so a
+missing input draws something visibly wrong instead of nothing at all.
+
+`frames: [-2, 2]` declares a temporal window over your own layer, handed to a
+**CPU kernel** as `host.frames[-1]` and so on. Honest limits, because this is
+the part most likely to disappoint:
+
+- **±2 frames**, and only for a `cpu` kernel, and only under `"apiVersion": 7`.
+  The GPU path has no binding for neighbouring frames, so declaring the window
+  without a kernel to receive it is refused rather than accepted and ignored.
+- **An offset the provider could not supply is ABSENT**, not zero-filled. Handle
+  the miss — a kernel differencing against a black frame flashes at exactly the
+  moments (the first frame, a seek) where a miss is likeliest.
+- For an image or video layer the frames are its own **source** frames. For a
+  **composited** layer — a precomp, a shape layer with effects beneath yours —
+  the provider generally cannot supply them, because producing one would mean
+  rendering another frame of the whole composition inside this one. Design for
+  the window being empty.
+
+### Region: `expand`, and `isIdentity`
+
+Two declarations the host evaluates **per frame**, from your live parameter
+values, in the same place After Effects' pre-render phase asks the same
+questions. Both need `"apiVersion": 7`.
+
+```jsonc
+"expand":   { "right": { "param": "distance" }, "bottom": { "param": "distance" } },
+"identity": [{ "param": "amount", "equals": 0 }]
+```
+
+`expand` is AE's max result rect, per side: how far outside the layer box you
+draw, so the host reserves margin instead of clipping you. Each side is a number
+or a `{ param, factor, plus }` formula over one of your own parameters, because
+reach is animatable and a constant would have to be the worst case on every
+frame. `spread` (one number for all four sides) still works; declaring both
+takes the larger per side, which is the only reading that cannot clip.
+
+`identity` skips the effect's passes **entirely** when every rule holds — an
+effect stack is full of effects sitting at zero, each otherwise costing a
+full-screen pass, a target and a pipeline bind every frame. It is data rather
+than a callback for the reason at the top of this section: asking your worker
+would be an async hop inside a synchronous render. A parameter nobody has
+touched reads its declared **default**, not zero.
+
+### Thread safety
+
+```jsonc
+"threadSafety": "instance"
+```
+
+| | |
+|---|---|
+| `unsafe` | one kernel call at a time across the whole plugin |
+| `instance` | **default** — concurrent across effect instances, in order within one |
+| `full` | no constraint; frames of one instance may overlap |
+
+Needs `"apiVersion": 7`.
+
+The default is strict deliberately: a wrong `full` is a race that shows up as
+one corrupt frame in a hundred, which is unreportable, while an over-strict
+default costs throughput and nothing else.
+
+### Limits: `standard` and `extended`
+
+```jsonc
+"limits": "extended"
+```
+
+Needs `"apiVersion": 7`, including to name `standard` explicitly.
+
+Every **rule** is identical in both tiers — no unbounded loop, no author
+bindings, a `fs` entry. Only the **numbers** move:
+
+| | standard | extended |
+|---|---|---|
+| Kernel source | 64 KB | 256 KB |
+| Statements | 2000 | 8000 |
+| Literal loop bound | 256 | 1024 |
+| Passes / fill budget | 8 / 6 | 16 / 12 |
+
+`extended` is a **request**, granted only for a plugin the user installed
+themselves — a local folder or Developer Mode. A published plugin is refused it
+with the reason. A manifest field that raised its own ceiling would be a ceiling
+that does not exist, since every plugin would simply declare it.
+
+What never moves is the refusal of an *unbounded* loop: trust raises a ceiling,
+it does not make an uncostable loop costable.
+
 ### Known limits, stated
 
-- **WGSL only, so WebGPU only.** The renderer falls back to WebGL2, which needs
-  GLSL. A plugin effect does not render on that tier. Requiring both languages
-  from every author to serve a fallback was judged the worse trade — but this is
-  a real gap, not a detail, and it is now *said out loud* rather than left to be
-  discovered:
+- **A missing kernel is now an error, not a passthrough.** The tiers a plugin
+  can reach are its author's decision, and the surfaces still say what the
+  machine can do:
 
   | Where | What the user or author sees |
   |---|---|
-  | `effects.add` | `{ id, active: false, reason: 'webgpu-unavailable' }` |
+  | `effects.add` | `{ id, active: false, reason: 'webgpu-unavailable' }` on a tier this effect cannot use |
   | The plugin's row in the manager | a muted line saying its effects cannot draw on this renderer |
   | `requires: ["webgpu"]` | the install is refused, with the reason |
-  | The project file | the effect is **saved** and draws on a WebGPU machine |
+  | The project file | the effect is **saved** and draws wherever a kernel exists |
 
   Muted rather than red, deliberately: the plugin is fine and the work is not
-  lost. This is a fact about the machine, not a fault in the plugin.
+  lost. This is a fact about the machine and about which kernels were shipped.
 
+- **A CPU kernel bakes the layer.** An effect with no kernel for the live
+  backend routes its layer through the CPU raster path, which is where the
+  kernel runs. That is slower than the GPU path and it is the only way the
+  effect draws at all; an effect that *does* have a kernel for the live backend
+  is left on the GPU.
+- **A kernel cannot be interrupted.** JavaScript has no preemption and a WASM
+  instance has no fuel unless it opted in, so a runaway kernel is recovered by
+  terminating its worker (8 s), not by asking it to stop. The frame goes out
+  with the layer unchanged.
 - **The statement ceiling is a proxy for cost, not a cost model.** A real one
   would mean writing a WGSL front end, and a hand-written parser fed hostile
   input is a worse liability than the thing it would protect.
@@ -1720,8 +2205,15 @@ expressed as native layers.
   hardware is a render-time decision, not a manifest one.
 - **A chain gets one `origin`, not one per pass.** It is the image entering the
   whole chain, captured before pass 0 — not "the pass before the previous one".
-- **One `layer` parameter per effect**, and it is shared by every pass rather
-  than being per-pass.
+- **Four `layer` parameters per effect**, shared by every pass rather than
+  being per-pass.
+- **A CPU kernel on the bake path gets the COMP's time as `host.time`.** The
+  bake is handed pixels and a chain with no layer beside them, so a retimed
+  layer's kernel differs between the GPU and CPU paths until the bake carries a
+  layer time. Stated rather than left to be discovered.
+- **The compute cache is per worker.** Two workers running the same effect
+  instance each build their own copy once; there is no shared memory here, and
+  copying an entry between workers would cost more than rebuilding it.
 
 ### Gaps found rebuilding the depth plugin on shaders
 
@@ -1730,25 +2222,23 @@ found a real gap each time — it is the only exercise here written from the
 *outside*. `depthPluginRebuild.test.ts` is the report, executable: each gap is
 an assertion that pins the current limitation and fails when it is lifted.
 
-1. **An effect cannot sample a second texture.** A depth plugin displaces one
-   image by another, and the generated bind group has exactly one texture. The
-   renderer already models this — `DISPLACEMENT_MAP_MATERIAL` carries a second
-   texture at binding 3, and `FrameScene` has `mapLayerId` for naming the layer
-   that supplies it — so the capability exists and the plugin contract cannot
-   reach it. A `layer`-typed parameter plus a fourth binding is the obvious
-   shape; note that `layer` is not in the prop vocabulary at all, so the fix is
-   not only in `EFFECT_PARAM_TYPES`.
+1. **CLOSED — an effect can sample up to four other layers.** The gap was that a
+   depth plugin displaces one image by another and the generated bind group had
+   exactly one texture. A `layer`-typed parameter closed it for one input;
+   round C2 raised the ceiling to four, at bindings 3, 5, 6 and 7.
 
 2. **A `render: "shader"` layer kind is not connected to an effect.** The
    strategy says a kind draws itself; nothing says *with what*. A plugin
    declaring both a kind and an effect has no way to state the relationship, so
    such a manifest is accepted and means less than it appears to.
 
-3. **An effect cannot read time or composition size.** Both would need a
-   host-filled parameter — the concept the built-in effects already have as
-   `EffectParamDef`'s `'resolved'` type, with no plugin-facing equivalent. The
-   workaround is an animatable number the user keyframes by hand, which is
-   per-document rather than per-effect and breaks when the frame rate changes.
+3. **CLOSED — an effect reads the time, the sizes, the rate and a seed.** Not
+   as the `'resolved'` parameter type this report proposed, and the difference
+   is the interesting part: a host-filled *parameter* would be a row in the
+   author's list that they cannot set, must not name twice, and would have to
+   declare in every effect to reach values the host knows unconditionally. They
+   are members of the block instead — every effect has them, no effect declares
+   them, and a parameter that collides with one of their names is refused.
 
 4. **A shader kind is forced to declare properties it does not have.**
    `parseLayerKinds` refuses a kind with no props — correct for `none` and
@@ -1758,9 +2248,11 @@ an assertion that pins the current limitation and fails when it is lifted.
    it unread: a control that does nothing, which is what the rule exists to
    prevent.
 
-None is fixed here. A gap report that quietly patches what it finds stops being
-a report, and three of these are contract changes both validators would have to
-agree on.
+Gaps 1 and 3 are now **closed** (round C2), and the assertions that pinned them
+have been rewritten to pin the new contract rather than deleted — a gap report
+whose fixed entries vanish cannot be read back as a history. Gaps 2 and 4 stand:
+both are validator changes the registry's copy of the corpus would have to agree
+on, and a gap report that quietly patches what it finds stops being a report.
 
 ---
 
@@ -2076,3 +2568,670 @@ attacker can sign. Block every affected version, then require rotation — the
 publisher re-authorises with their account **password**, not just a session, and
 every installed copy prompts its own user before accepting the new key. Three
 gates, and a stolen account clears only one.
+
+## 16. Installing from a folder on this machine
+
+Every host a professional already uses ships plugins as files in a known
+directory. After Effects scans `…/Common/Plug-ins/7.0/MediaCore` and its own
+`Plug-ins` folder; an OFX host scans `…/Common Files/OFX/Plugins` plus whatever
+`OFX_PLUGIN_PATH` names; Resolve loads Fuses from a Fusion directory. A vendor
+installer writes files there and the host picks them up at launch. Nobody drags
+a zip onto a panel — and an author REALLY does not want to, once per edit.
+
+### Where it looks
+
+| | Path |
+|---|---|
+| Yours | `<userData>/Plugins` — the folder button in the Plugins panel opens it |
+| Machine-wide | Windows `%ProgramData%\<App>\Plugins` · macOS `/Library/Application Support/<App>/Plugins` · Linux `/usr/share/<app>/plugins` |
+| Override | `MOTION_PLUGIN_PATH`, `;`-separated on Windows and `:`-separated elsewhere |
+
+Each root is scanned four levels deep. A directory holding `plugin.json` **is**
+a plugin and is not descended into, so a package's own `lib/` cannot register a
+second one. Folders whose name ends in `()` or starts with `~` are skipped —
+AE's convention, kept because vendors already follow it, so "rename it to turn
+it off" works here the way it does there. Both an unpacked folder and a
+`.mplugin` archive are accepted.
+
+Two copies of the same plugin id resolve by **version**, highest wins, and the
+panel names the copy it ignored. Not by which directory was scanned first:
+search-path order is an implementation detail nobody can predict from outside,
+while "drop a newer build in your own folder and it takes over" is a rule an
+author can act on.
+
+### Signed, or Developer Mode
+
+A registry package is signed, and the signature is checked on the user's machine
+over the exact bytes about to be installed. A folder cannot be: its author is
+editing the files. So the folder tier has two ways to be allowed to run, and
+exactly two.
+
+**Sign it.** `node scripts/pack-plugin.mjs ./my-plugin --key ./plugin-key.json`
+writes `my-plugin-1.0.0.mplugin` and `my-plugin-1.0.0.mplugin.sig` beside it.
+The sidecar holds a detached ECDSA P-256 / SHA-256 signature over the archive's
+exact bytes — the same form `scripts/sign-plugin.mjs sign` produces for the
+registry, verified by the same code. A signed package loads with no switch.
+
+**Or turn on Developer Mode**, in the Plugins panel. Unsigned packages in these
+folders then load, and a change on disk reloads them. It is persisted, it warns
+before it turns on, and it changes nothing else: a plugin loaded this way runs in
+the same Worker, behind the same permission gate, through the same consent
+screen. What it changes is whose code is allowed to get that far. It does not
+reach the native tier either — `runtime: "native"` has its own trust record.
+
+Revocation still applies to both. A withdrawn plugin does not become
+installable by putting it in a folder.
+
+### The edit/run loop
+
+1. Put your folder in the plugins directory — the folder button in the Plugins
+   panel opens it, creating it if it is not there yet.
+2. Turn on Developer Mode. Press **Load**, grant permissions once.
+3. Edit. The folders are watched while Developer Mode is on, so the panel
+   re-scans on save; press **Reload** to restart the plugin with the new files.
+4. **Log** shows everything the plugin printed, plus any error it threw, with
+   stack frames named after your files.
+
+You are asked to grant permissions again only when something about what the
+plugin may do has changed: a manifest that grew a permission, a package that
+turned `runtime: "native"`, or a signed package arriving under a different
+publisher key than the one this machine pinned. A reload that asks for the same
+things reloads silently — an author saving a file twenty times must not answer
+twenty consent screens, and nothing has changed to consent to.
+
+### What the main process will and will not do
+
+Scanning and reading happen in Electron's main process, because the renderer has
+no filesystem and that is a property worth keeping. The renderer can ask for the
+list of roots, for the candidates in them, for the bytes of **one package inside
+a root**, and for the user's own folder to be opened. It cannot name a path
+outside those roots: `plugins:read` resolves the path and refuses anything that
+is not contained in one, which is what keeps it from being "read any file on
+this machine". There is no write verb at all.
+
+---
+
+## 17. Generator layers (API 6)
+
+A `render: "generator"` layer kind produces **geometry**, once per frame, from
+real JavaScript you write. It is the strategy for output the other two cannot
+express: fifty thousand particles is not fifty thousand native layers, and a
+simulation is not a function of screen position.
+
+```jsonc
+"apiVersion": 6,
+"contributes": {
+  "layerKinds": [{
+    "id": "sparks",
+    "label": "Sparks",
+    "render": "generator",
+    "schemaVersion": 1,
+    "props": {
+      "rate":    { "type": "number", "default": 400, "min": 0, "max": 5000, "animatable": true },
+      "gravity": { "type": "number", "default": 240, "animatable": true },
+      "tint":    { "type": "color",  "default": "#ff8a2a", "animatable": true }
+    }
+  }]
+}
+```
+
+```js
+motion.generators.register('sparks', (req) => {
+  const sim = req.state ?? seed(req.seed);
+  step(sim, 1 / req.fps, req.params);
+  return {
+    instances: pack(sim),      // Float32Array, 9 floats per instance
+    count: sim.alive,
+    primitive: 'point',
+    state: sim,                // carried to the next frame, and checkpointed
+  };
+});
+```
+
+### The instance buffer
+
+One `Float32Array`, **nine floats per instance**, in this order:
+
+| offset | field      | meaning |
+|--------|------------|---------|
+| 0,1,2  | `x, y, z`  | layer pixels, origin at the **centre** of the layer box; `z` is depth |
+| 3      | `size`     | the instance's side, in layer px |
+| 4      | `rotation` | **radians** |
+| 5–8    | `r,g,b,a`  | 0..1, **straight** alpha (the host premultiplies) |
+
+With `stride: 11` two more floats follow — `u, v`, the top-left of this
+instance's cell in a texture your package ships (`textureAssetKey`), whose cell
+size you declare once as `cellSize`.
+
+It is one typed array rather than an array of objects because that is the
+difference between a feature that works at 50 000 particles and one that does
+not: a single buffer is one allocation and, with `transfer: true`, a **move**
+rather than a copy across the worker boundary. Return `transfer: true` only if
+you built the buffer fresh — the host will detach a pool you meant to reuse.
+
+`primitive` is `'point'` (soft round falloff), `'quad'` (hard-edged),
+`'sprite'` (your texture, needs stride 11) or `'mesh'` (your triangles, placed
+once per instance; `mesh: { vertices, indices }`, five floats per vertex —
+x, y, z, u, v).
+
+### Your own sprite texture
+
+`textureAssetKey` names a **file inside your own package** — `sprites/atlas.png`
+— not a project asset id, because an asset id means nothing in someone else's
+project while a file you shipped is the same everywhere. It is read out of your
+installed payload through the same resolution `motion.package.read` uses, so it
+can reach exactly what you shipped and nothing else on the machine. `.png`,
+`.jpg` and `.webp` all work.
+
+It is decoded **once per file**, however many layers and frames name it, and the
+decode is asynchronous while your frame is not. So the first frame or two of a
+brand-new sprite field draw as untextured points and upgrade the moment the
+image lands — and an **export waits** for it rather than shipping untextured
+sprites. A file that is missing, corrupt or larger than 4096 px on a side is
+reported once in your plugin's log and the layer keeps drawing untextured.
+
+`cellSize` is the size of one atlas cell in texture UV (`[0.5, 0.5]` for a 2×2
+sheet) and each instance's `u, v` is the **top-left of its cell**, so a sprite
+samples `u,v + corner × cellSize`. Declared once per frame rather than per
+instance, because every sprite in an atlas run is the same size and repeating it
+50 000 times would cost 400 KB a frame to say one thing.
+
+### The frame request
+
+```
+{ layerTime, compTime, frame, fps, compSize, layerSize, params, seed, state }
+```
+
+`layerTime` is the layer's own clock — time stretch, time remap and Speed %
+already applied — and is what a simulation should integrate. `frame` is the
+integer composition frame and is what the host keys its checkpoints on. `seed`
+is stable for the life of the layer and saved with the document, so the same
+project gives the same particles on every machine.
+
+### Determinism, and what the host does for you
+
+**The same frame must give the same instances.** The host guarantees half of it:
+your `state` is checkpointed every few frames, and a seek replays from the
+nearest checkpoint at or before the target, so the `state` you are handed is
+always the state that frame really had — never whatever the playhead happened
+to leave behind. You owe the other half: no `Math.random()`, no wall clock,
+nothing the request did not carry.
+
+One limitation worth knowing: the intermediate frames of a catch-up are
+simulation steps, not frames anyone looks at, and they are given the TARGET
+frame's sampled `params`. A generator whose behaviour swings violently over a
+few animated frames will reproduce those frames slightly differently after a
+long seek than after playing into them.
+
+### When your code runs
+
+Never inside the render loop. The host requests frames ahead of the playhead
+during playback, serves the most recent available frame while the exact one is
+being made (so the viewport never blanks), drops superseded requests during a
+scrub, and **awaits the exact frame during export** — a generator that does not
+answer in time fails the export by name rather than shipping the previous
+frame's particles under this frame's number.
+
+A `generate` that takes longer than two seconds (twenty in export) is reported
+as a plugin error, and three consecutive failures stop the layer asking until
+something about it changes.
+
+### What the layer is, once you have returned
+
+An ordinary layer. The instances are drawn instanced into an offscreen and
+composited like any other content, so blend modes, masks, track mattes, effect
+stacks and motion blur apply to the result with no special cases. `blend: 'add'`
+on the FRAME composites the instances additively against each other inside the
+field; the layer's own blend mode still applies to the finished field.
+
+When the layer is 3D, instance `z` drives a perspective divide through the
+composition's camera — position and size scale by `focal / (focal − z)` — so a
+system flying past the lens parallaxes. It is not a depth test against other
+layers: the field composites as one flat layer, and instances draw in the order
+you packed them.
+
+### Limits
+
+| | |
+|---|---|
+| instances per layer per frame | 200 000 |
+| mesh vertices / indices | 65 536 / 196 608 |
+| `generate` budget | 2 s preview, 20 s export |
+
+Selection, the marquee and raster padding all follow your instances rather than
+the emitter box. Declare `maxBounds` if your particles leave the box and you
+would rather the host did not measure them — it is the one per-instance pass the
+host does on the main thread.
+
+---
+
+## 18. Plugin UI (API 7)
+
+Everything in this section is one idea seen from five sides: a plugin that can be
+**used** rather than only invoked. They landed in one grammar version because
+half of them is not worth shipping — a tool with no way to draw is a cursor that
+does nothing visible, and parameters with no way to act on them are a form.
+
+The rule the whole section obeys is the one §9 states for layer kinds and means
+just as literally here: **you declare, the host draws.** There is no callback
+that returns markup, no handle on a canvas, no DOM. A plugin that could render
+into the inspector or paint into the viewport could draw a convincing permission
+prompt, and every plugin's controls would age differently from the app around
+them. When the vocabulary is missing something, the answer is another entry in
+it — never an escape hatch. Free-form UI lives in your **panel**, in its own
+sandboxed frame (§5).
+
+```json
+"apiVersion": 7,
+"contributes": {
+  "commands": [{ "id": "bake", "label": "Bake pins", "submenu": "Cleanup" }],
+  "inspector": [ ... ],
+  "tools":     [ ... ],
+  "shortcuts": [{ "command": "bake", "chord": "Ctrl+Alt+P" }],
+  "expressions": [{ "name": "pulse", "args": 1, "default": 0 }]
+}
+```
+
+Capabilities: `ui.inspector`, `ui.canvas`, `ui.tools`, `ui.shortcuts`,
+`ui.expressions`. List in `requires` whichever your plugin cannot work without.
+
+### 18.1 Parameters on somebody else's layer
+
+`contributes.inspector` declares a **section in the Properties panel** for layers
+you did not create. §9's `props` describe a layer your plugin invented; these
+describe your controls on an ordinary shape, text or image layer.
+
+```json
+"inspector": [{
+  "id": "lift",
+  "title": "3D Lift",
+  "icon": "cube",
+  "appliesTo": ["shape", "text"],
+  "params": [
+    { "name": "amount",  "type": "slider",  "default": 50, "min": 0, "max": 100,
+      "unit": "%", "animatable": true },
+    { "name": "radius",  "type": "slider",  "default": 4, "min": 0.1, "max": 500,
+      "logarithmic": true, "unit": "px" },
+    { "name": "mode",    "type": "enum",    "default": "soft",
+      "options": [{ "value": "soft", "label": "Soft Light" },
+                  { "value": "hard", "label": "Hard Light" }] },
+    { "name": "tint",    "type": "color",   "default": "#ff8800cc", "alpha": true },
+    { "name": "centre",  "type": "point",   "default": { "x": 0, "y": 0 }, "animatable": true },
+    { "name": "origin",  "type": "point3d", "default": { "x": 0, "y": 0, "z": 0 } },
+    { "name": "spin",    "type": "angle",   "default": 0, "animatable": true },
+    { "name": "soft",    "type": "checkbox","default": false },
+    { "name": "feather", "type": "slider",  "default": 1, "group": "Edges",
+      "showIf": { "param": "soft", "equals": true } },
+    { "name": "bake",    "type": "button",  "label": "Bake pins", "command": "bake" },
+    { "name": "state",   "type": "status",  "label": "State", "text": "Idle" }
+  ]
+}]
+```
+
+| type | control | notes |
+|---|---|---|
+| `slider` / `number` | value field | `unit` is drawn in the field. `logarithmic` (slider only) makes a pixel of drag a constant **ratio** — the step is recomputed from the current value — and needs `min` above zero. |
+| `angle` | dial | Always degrees, unbounded: a revolution is a legitimate value. |
+| `checkbox` | tick | |
+| `enum` | dropdown | `options` carry a **label** each. That is the whole reason this is not a string list. |
+| `color` | swatch | `alpha: true` to edit and store `#rrggbbaa`. A default with alpha on a parameter that did not ask for it is refused — a plugin reading `#ff8800` and handed `#ff8800cc` renders the wrong colour and never finds out. |
+| `point` / `point3d` | one row of X/Y(/Z) fields | Stored as separate numbers per axis, so each axis is an ordinary animatable property. |
+| `button` | button | Runs one of **your own** `contributes.commands`, named by `command`. A button wired to a command the manifest does not declare is an install error. |
+| `status` | read-only line | You write it with `motion.ui.setStatus(...)`. Never saved with the document — it is what your plugin currently believes, and a belief from last Tuesday restored with the project is worse than no line. |
+
+`group` is a flat heading (never nested — see §9), `showIf` names a **sibling**
+parameter, `label` falls back to a humanised `name`, and `animatable` is only for
+the numeric and point types.
+
+`appliesTo` lists layer kinds; omit it for every layer. The section appears with
+one plugin's title, and when several plugins contribute to the same layer it is
+titled "Plugin parameters" with each panel attributed to its plugin by name.
+
+**Animatable means animatable.** A parameter with `"animatable": true` is a real
+property: it keyframes, eases, takes an expression, appears in the graph editor
+and aggregates over a multi-selection with a dash for mixed values, because the
+row is the same row `Position` uses. Nothing in the render path reads it — it is
+**your** input. Sample it with `motion.animation.sample(layerId, path)`, exactly
+as for a layer kind's props.
+
+Read and write values from your worker:
+
+```js
+const values = await motion.params.get(layerId);          // every parameter, defaults included
+await motion.params.set(layerId, 'amount', 75);           // one panel
+await motion.params.set(layerId, 'lift', 'amount', 75);   // several panels: name one
+motion.ui.setStatus('state', `${pins.length} pins placed`);
+```
+
+A parameter the user has never touched **stores nothing** and reads as its
+declared default; the values component appears on the layer at the first write.
+They are the user's data, so they survive an uninstall — the section disappears,
+the values do not, and reinstalling finds the work where it was left.
+
+### 18.2 On-canvas UI — a retained draw list
+
+After Effects hands a custom-UI effect a Drawbot context and calls it back on a
+draw event. That works because an AE plugin is native code in the host's process.
+Here you are in a Worker: a callback cannot cross the boundary, and one that
+could would be third-party code running inside the viewport's paint.
+
+So you send **data**. `motion.ui.draw(list)` replaces your whole drawing; the
+host repaints it every frame with the layer's transform applied.
+
+```js
+motion.ui.draw({
+  layerId, space: 'layer',
+  items: [
+    { k: 'line',   from: { x: 0, y: 0 }, to: { x: 100, y: 0 }, color: '#4da3ff', dash: true },
+    { k: 'rect',   x: 0, y: 0, w: 100, h: 60 },
+    { k: 'circle', x: 50, y: 30, r: 20, fill: '#ffffff' },
+    { k: 'path',   points: [{ x: 0, y: 0 }, { x: 40, y: 20 }], close: false },
+    { k: 'text',   x: 0, y: -10, text: 'Lift', size: 11 },
+    { k: 'handle', id: 'p0', x: 100, y: 0, shape: 'circle', hitRadius: 9 }
+  ]
+});
+
+motion.ui.onCanvas((e) => {
+  // e.type: 'down' | 'move' | 'up' | 'hover' | 'key'
+  // e.x / e.y are in the LAYER's space; e.handleId names the grabbed handle.
+  if (e.type === 'move' && e.handleId === 'p0') {
+    motion.scene.setProperty(e.layerId, 'x', e.x);
+  }
+});
+```
+
+- **Coordinates are the layer's own** — the same space its anchor point and mask
+  vertices are in. The host applies parenting, 3D and animation when it paints
+  and un-applies them when it routes an event back, so you never see a zoom
+  level, a pan offset, a device pixel ratio or a window size. `space: "comp"`
+  (with `layerId: null`) is the escape hatch for a gizmo that belongs to the
+  composition rather than to a layer.
+- **Handles are inputs.** Their `radius` and `hitRadius` are in **screen**
+  pixels, so a grab target stays grabbable at 25% zoom. The nearest handle within
+  its radius wins, not the first one you emitted.
+- **Drawing is not a claim on the canvas.** A press on one of your handles is
+  yours; a press anywhere else falls through to Select, so your gizmo can sit on
+  screen while the user keeps working. If you want the whole viewport, contribute
+  a **tool** (§18.3) — a tool also receives `key` events, which a drawing does
+  not.
+- **One gesture is one undo step.** The host opens a history bracket on the press
+  and closes it on the release, so however many `scene.setProperty` calls your
+  drag makes, the user presses Ctrl-Z once.
+- Limits, enforced on arrival: 512 items, 512 points per path, 120 characters of
+  text, colours as **hex literals only**, coordinates finite. A list that breaks
+  them is refused whole rather than drawn in part.
+
+### 18.3 Tools
+
+```json
+"tools": [{ "id": "place", "label": "Place pin", "icon": "crosshair", "cursor": "crosshair" }],
+"activationEvents": ["onTool:place"]
+```
+
+The tool appears in the toolbar (plugins share one flyout — the strip is the most
+contested space in the editor), in the Plugins menu and in the palette. While it
+is active your plugin receives **every** pointer and key event in the composition
+window, in layer space, through the same `motion.ui.onCanvas` handler; picking any
+built-in tool stands it down, and `motion.tools.onChanged` tells you either way.
+
+`icon` is required — the strip is glyphs — and `cursor` comes from a fixed list
+(`default`, `crosshair`, `move`, `grab`, `text`, `rotate`, `pen`), never a URL: an
+arbitrary cursor image is a fake pointer drawn a few pixels from the real one.
+Four tools per plugin.
+
+### 18.4 Shortcuts
+
+```json
+"shortcuts": [{ "command": "bake", "chord": "Ctrl+Alt+P" }]
+```
+
+Write `Mod` for Cmd on macOS and Ctrl elsewhere. A chord needs at least one
+modifier (function keys excepted) — a bare letter takes it from every surface
+that might want it.
+
+A declared chord is a **request**. It is granted when nothing else holds it and
+**refused with a line in your log** when something does, naming the command that
+has it. That is not a failed install: your command stays in the Plugins menu and
+the palette, and the user can bind their own chord in **Customize...**, which
+walks the command registry and therefore already sees plugin commands. The check
+reads the live registry, so a chord the user has moved counts as free where it
+used to be and taken where it now is.
+
+### 18.5 Menu grouping
+
+`commands[].submenu` folds a command under a heading inside your own block of the
+Plugins menu — one level, never a tree. Past the menu's 14-entry ceiling the host
+folds **every** plugin into a submenu of its own name, whether they asked or not:
+a menu that runs off the bottom of the window has entries nobody can reach.
+
+Your panels also appear in **Window ▸ Panels**, which is where a user looks for
+"what else can I dock" — the Plugins menu is where they look when they are
+thinking about plugins, which is a different moment.
+
+### 18.6 Expression functions, and why they are precomputed
+
+```json
+"expressions": [{ "name": "pulse", "args": 1, "default": 0, "description": "beat strength" }]
+```
+
+```js
+// Push values as you compute them — then every call is a cache hit.
+motion.expressions.provide('pulse', [2], 0.75);
+
+// Or answer on demand. The host asks once per argument list it has not seen.
+motion.expressions.handle('pulse', (t) => computePulse(t));
+```
+
+In an expression:
+
+```js
+plugin.studio_acme_lab.pulse(time) * 100
+```
+
+**Why it is not a direct call.** The expression engine is synchronous by
+construction: it interprets an AST and calls your function once per animated
+property per frame, inside the frame budget. You live behind a `postMessage`.
+There is no arrangement of those two facts in which your code runs *during* an
+evaluation — the alternatives are blocking the render thread on a worker (which
+the platform forbids, and which would be a hang if it did not) or making every
+expression async, which would change the meaning of every expression already
+written.
+
+So the contract is a cache, and it is stated rather than hidden:
+
+- a **hit** returns your value immediately, with no round trip;
+- a **miss** returns your declared `default` and asks you once for that argument
+  list; when you answer, the value lands in the cache and the next frame is
+  correct.
+
+A plugin that pushes its values with `provide` never misses. `default` is
+therefore required: a function that returns nothing on its first frame makes
+every expression using it throw on the frame the user adds it. Values are a
+number or a vector of 2 to 4 numbers; the cache holds 256 argument lists per
+function and drops the oldest, because an expression scrubbed over time calls
+with a new argument every frame.
+
+Everything hangs off one name, `plugin.<namespace>`, where the namespace is your
+plugin id with dots and dashes folded to underscores. One name, because the
+expression scope's keys are the **language** — `wiggle` is part of it and your
+function is not — and a scope whose contents appear with what the user has
+installed could be neither documented nor completed. Two plugins whose ids fold
+to the same namespace are a collision: the second is refused and told so, rather
+than shadowing the first.
+
+## 19. Native modules (the compiled tier)
+
+Everything above this section is JavaScript, WebAssembly and shaders. That
+covers almost everything, and where it does not cover it the gap is not small:
+a hardware decoder, an optical-flow tracker, a mesh solver, a pixel kernel with
+twenty years of hand-written SIMD in it. Those arrive as compiled libraries or
+they do not arrive, and an author with one of them cannot port it to
+WebAssembly on request.
+
+So a plugin may ship a **native module** — an N-API addon, or a Rust/C++
+`cdylib` behind an N-API shim — and the editor will call it.
+
+### It runs in a process of its own
+
+One Electron `utilityProcess` per plugin, started on first use, stopped after a
+minute of nothing to do, killed and restarted when it hangs or crashes. After
+Effects loads plugins into its own address space, and a bad one takes the
+application down with the user's unsaved work; that trade made sense for a tool
+whose plugins arrive as vendor installers a professional deliberately bought,
+and it is the wrong one here.
+
+What follows from the process boundary, and what to design around:
+
+- **A crash costs one process and one frame.** The frame still renders, with
+  your effect skipped, and the failure is reported against your plugin by name.
+- **Blocking is fine.** `motion_plugin_render` is synchronous; take the whole
+  core for the length of the call. The host holds a hard timeout (8 s by
+  default) and kills the process when it expires, so do not block on a socket.
+- **There is no editor API in your process.** No document, no scene graph, no
+  GPU device. You are a function over the bytes you are handed.
+- **Three crashes and your module is off for the session**, with a message in
+  your plugin's log rather than an afternoon of process launches.
+
+### The ABI
+
+Five exports, and a version checked before any of the others is called:
+
+```c
+uint32 motion_plugin_abi_version(void);          /* MOTION_PLUGIN_ABI_VERSION */
+object motion_plugin_register(object hostInfo);  /* once per process */
+object motion_plugin_describe(void);             /* what this addon implements */
+object motion_plugin_render(object request);     /* the work — synchronous */
+void   motion_plugin_dispose(void);              /* normal shutdown only */
+```
+
+`motion_plugin_abi_version` returns `major * 1000 + minor`. The host refuses a
+different MAJOR and a NEWER MINOR, naming both versions — it never calls into a
+binary whose contract it does not agree about, because calling a function whose
+stack frame the host disagrees about is not a wrong answer, it is a crash.
+
+`motion_plugin_render` dispatches on `request.call`:
+
+| `call` | What you get | What you return |
+|---|---|---|
+| `"effect"` | `input` and `output` buffers, `params`, `host` (the same values a CPU kernel's `host` carries), optional `neighbours` | the `output` you wrote, or `{ ok: true, identity: true }` |
+| `"generate"` | one generator frame's request — `layerTime`, `frame`, `params`, `seed`, `state` | `instances`, `count`, `primitive`, optional `state` |
+| `"invoke"` | `{ method, payload, buffers? }` | `{ ok: true, result }` |
+
+Answer only what you list in `describe().calls`; the host refuses the rest
+before they reach you. `describe()` also declares `pixelFormat` — premultiplied
+32-bit float RGBA by default, which is what the GPU path and the CPU kernels
+both work in, so a native fast path and its shader twin are the same arithmetic
+— and `threadSafety`, the same three words (`unsafe`, `instance`, `full`) the
+CPU kernels declare, governing whether the host may have two calls in flight.
+
+The contract ships as `packages/plugin-native-sdk`: a C header, the same thing
+as TypeScript types, a working example addon with `binding.gyp` and
+`CMakeLists.txt`, and build instructions. Build against **Electron**, not
+against Node, and build Node-API — N-API insulates you from V8's version, a
+Nan/V8 addon does not.
+
+### The manifest block
+
+```jsonc
+"native": {
+  "abi": 1,
+  "platforms": {
+    "win32-x64":    "bin/win32-x64/fx.node",
+    "darwin-arm64": "bin/darwin-arm64/fx.node",
+    "linux-x64":    "bin/linux-x64/fx.node"
+  },
+  "hashes": { "bin/win32-x64/fx.node": "<sha256, written by the packer>" },
+  "threadSafety": "full",
+  "timeoutMs": 4000,
+  "idleTimeoutMs": 60000
+}
+```
+
+The host picks by `process.platform`-`process.arch` and does nothing cleverer:
+no x64-on-arm64 fallback, because an x64 binary does not run under Rosetta in a
+utility process and a silent fallback would work on your machine and not your
+user's. A package with no entry for the current machine is listed as
+**unavailable on this platform** rather than as broken — ship a JavaScript or
+WebAssembly fallback (`contributes.effects[].cpu`) and that user still gets the
+effect, slowly.
+
+`native` is not `runtime: "native"`. That is the renderer-realm tier, a
+different thing with a different failure mode; declaring one never implies the
+other, because each has a consent question of its own.
+
+### The trust gate
+
+Native code is unsandboxed, so **both** of these are required, every time:
+
+1. **A valid signature** over the package (`pack-plugin --key`, verified on the
+   user's machine over the exact bytes). An unsigned package loads only from a
+   folder, with Developer Mode on.
+2. **A separate consent step**, worded for what it is. It names the binary by
+   path and hash, and says the sentence: this runs outside the plugin sandbox
+   with your full user privileges, and the permission list does not limit it.
+
+Consent is **pinned to the binary's SHA-256**. Version numbers are written by
+the author; a hash is written by the bytes, so pinning it means "you agreed to
+THIS code" survives a swap that keeps the version string. A rebuilt binary
+re-asks. A version bump that ships the identical binary does not — prompting
+for that trains people to click through the prompt that matters.
+
+A revocation kills the process and destroys the consent record. The main process
+re-hashes the file before every load and refuses a mismatch, refuses any path
+outside a plugins folder or the app's staging directory, and refuses a
+package-relative path that resolves outside its own package.
+
+### Packing
+
+```sh
+node scripts/pack-plugin.mjs ./my-plugin --native --key ./plugin-key.json
+```
+
+`--native` is required: without it a compiled file is refused with a sentence
+saying so, which is what keeps a package from containing a program by accident.
+With it, the binaries named in `native.platforms` are packaged and a SHA-256 for
+each is written into the manifest — inside the package, so the signature covers
+them, which lets the editor say "this binary is not the one the package was
+built with" instead of merely "the hash changed".
+
+During development, an unpacked folder works as it does for every other tier:
+edit, rebuild the addon, reload the plugin. A reload terminates the process and
+starts a new one — a native module cannot be unloaded from a process, because
+the OS keeps the library mapped — and the rebuilt binary's new hash asks for
+consent again, which is one click per build rather than a restart.
+
+An archive is different in one way: a file inside a zip cannot be loaded, so the
+binary for this machine is written to `<userData>/PluginNative/<id>/<sha256>/`
+first. The hash names the directory, so identical bytes stage once and a rebuilt
+binary lands somewhere new rather than overwriting a file the OS may still have
+mapped.
+
+### Scheduling, and the budget
+
+Native calls go through a scheduler with the same lane rule as the CPU kernels:
+`unsafe` serialises everything for the plugin, `instance` serialises per effect
+instance, `full` runs concurrently. During preview it is **latest-wins** — a
+call the playhead has moved past resolves as "did not happen" and your layer
+renders unchanged. During export nothing is dropped, every frame is awaited, and
+a call that does not land in time makes the export refuse the frame rather than
+write it with the previous frame's pixels.
+
+There is also a budget: a preview call over ~24 ms benches the plugin for two
+seconds, so the playhead keeps moving and the effect falls back to its
+JavaScript path. Export ignores it — a plugin too slow for a viewport is not too
+slow for a file.
+
+### Buffers
+
+Pixel buffers are **handed over**, not copied: the main process transfers them
+into your process, and your answer transfers them back. A buffer you have
+answered with is no longer yours, and keeping a reference to one reads memory
+that belongs to another process. On the editor's side the same rule is enforced
+— a buffer read after it was handed to a plugin throws a named error rather than
+silently rendering a black frame.
+
+One copy remains and cannot be removed: `ipcRenderer.invoke` structure-clones,
+so the renderer-to-main hop is a copy. `SharedArrayBuffer` would remove it and
+is deliberately not the default — shared memory has no ownership at all, and the
+torn frame that results from a plugin writing while the compositor reads is not
+reproducible.

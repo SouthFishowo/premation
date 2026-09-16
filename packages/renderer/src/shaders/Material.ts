@@ -478,6 +478,8 @@ export const DEEP_GLOW_ACC_FX_MATERIAL = perspectiveMaterial('deep-glow-acc');
 export const DEEP_GLOW_COMPOSITE_FX_MATERIAL = twoTextureMaterial('deep-glow-composite');
 // Energy Beam (fxBeamPath.ts): single pass, the spine rides in the uniform block.
 export const BEAM_PATH_FX_MATERIAL = perspectiveMaterial('beam-path');
+// Effect Opacity (fxEffectOpacity.ts): the effect's output (tex) lerped over its input (tex2).
+export const EFFECT_OPACITY_FX_MATERIAL = twoTextureMaterial('fx-effect-opacity');
 
 /** Same binding shape as motion-tile: one source texture, warped in place. */
 export const BEND_MATERIAL: MaterialDescriptor = {
@@ -947,6 +949,118 @@ export const DEFORMED_MESH_LINEAR_MATERIAL: MaterialDescriptor = {
  * premultiplied twin because it reads only alpha — which is the same value in
  * either alpha space.
  */
+/**
+ * A plugin generator's per-instance data, as a vertex layout.
+ *
+ * Stride 36 — nine floats, exactly the contract's base instance. The plugin's
+ * buffer is uploaded with NO repacking, so this layout is not a description of
+ * the data, it IS the data; see `shaders/generatorInstances.ts` for the field
+ * list and `core/plugins/generator/generatorContract.ts` for where it is
+ * written down for authors.
+ *
+ * `stepMode: 'instance'` is the whole point, and it is the first layout in this
+ * renderer to use it — which is why `WebGL2Backend.configureAttribs` had to
+ * learn `vertexAttribDivisor`, and `setVertexBuffer` had to start honouring its
+ * slot.
+ */
+export const GENERATOR_INSTANCE_LAYOUT: VertexBufferLayout = {
+  strideBytes: 36,
+  stepMode: 'instance',
+  attributes: [
+    { shaderLocation: 1, offsetBytes: 0, format: 'float32x3' },
+    { shaderLocation: 2, offsetBytes: 12, format: 'float32x2' },
+    { shaderLocation: 3, offsetBytes: 20, format: 'float32x4' },
+  ],
+};
+
+/** The same, with the instance's atlas cell origin — stride 44, eleven floats. */
+export const GENERATOR_INSTANCE_UV_LAYOUT: VertexBufferLayout = {
+  strideBytes: 44,
+  stepMode: 'instance',
+  attributes: [
+    ...GENERATOR_INSTANCE_LAYOUT.attributes,
+    { shaderLocation: 4, offsetBytes: 36, format: 'float32x2' },
+  ],
+};
+
+/**
+ * A generator MESH vertex: position xyz + uv, 20 bytes.
+ *
+ * Location 5 for the uv, past every instance attribute, because the two layouts
+ * share one pipeline and a shader location can only come from one of them. Not
+ * `MESH3D_LAYOUT`: a generator mesh carries no normals — it is drawn unlit,
+ * inside a field that composites as a flat layer — and requiring twelve wasted
+ * bytes per vertex to reuse a constant would be a cost paid per mesh forever to
+ * save one declaration here.
+ */
+export const GENERATOR_MESH_LAYOUT: VertexBufferLayout = {
+  strideBytes: 20,
+  stepMode: 'vertex',
+  attributes: [
+    { shaderLocation: 0, offsetBytes: 0, format: 'float32x3' },
+    { shaderLocation: 5, offsetBytes: 12, format: 'float32x2' },
+  ],
+};
+
+/**
+ * The stride-44 layout WITHOUT the uv attribute.
+ *
+ * Needed because the vertex layout is decided by the buffer's STRIDE and the
+ * shader by the PRIMITIVE, and the two are independent: a plugin may send
+ * `stride: 11` with `primitive: 'point'`, or a sprite whose texture has not
+ * loaded. Reading a stride-44 buffer through the stride-36 layout does not
+ * fail — it walks the wrong bytes, and every particle lands somewhere
+ * plausible and wrong, which is the hardest class of bug to see.
+ */
+const GENERATOR_INSTANCE_WIDE_LAYOUT: VertexBufferLayout = {
+  ...GENERATOR_INSTANCE_LAYOUT,
+  strideBytes: GENERATOR_INSTANCE_UV_LAYOUT.strideBytes,
+};
+
+/** Instanced points / quads: the unit quad in slot 0, instances in slot 1. */
+export const GENERATOR_POINT_MATERIAL: MaterialDescriptor = {
+  shader: 'generator-point',
+  topology: 'triangle-list',
+  layout: [{ binding: 0, type: 'uniform-buffer', stages: ['vertex', 'fragment'] }],
+  buffers: [QUAD_LAYOUT, GENERATOR_INSTANCE_LAYOUT],
+};
+
+/** The same, for an instance buffer that carries u,v the shader does not read. */
+export const GENERATOR_POINT_WIDE_MATERIAL: MaterialDescriptor = {
+  ...GENERATOR_POINT_MATERIAL,
+  buffers: [QUAD_LAYOUT, GENERATOR_INSTANCE_WIDE_LAYOUT],
+};
+
+/** Instanced textured sprites — the uv layout, plus the plugin's image. */
+export const GENERATOR_SPRITE_MATERIAL: MaterialDescriptor = {
+  shader: 'generator-sprite',
+  topology: 'triangle-list',
+  layout: [
+    { binding: 0, type: 'uniform-buffer', stages: ['vertex', 'fragment'] },
+    { binding: 1, type: 'texture', stages: ['fragment'] },
+    { binding: 2, type: 'sampler', stages: ['fragment'] },
+  ],
+  buffers: [QUAD_LAYOUT, GENERATOR_INSTANCE_UV_LAYOUT],
+};
+
+/** Instanced meshes — the plugin's triangles in slot 0, instances in slot 1. */
+export const GENERATOR_MESH_MATERIAL: MaterialDescriptor = {
+  shader: 'generator-mesh',
+  topology: 'triangle-list',
+  layout: [
+    { binding: 0, type: 'uniform-buffer', stages: ['vertex', 'fragment'] },
+    { binding: 1, type: 'texture', stages: ['fragment'] },
+    { binding: 2, type: 'sampler', stages: ['fragment'] },
+  ],
+  buffers: [GENERATOR_MESH_LAYOUT, GENERATOR_INSTANCE_LAYOUT],
+};
+
+/** The same, for a stride-44 instance buffer — see `GENERATOR_POINT_WIDE_MATERIAL`. */
+export const GENERATOR_MESH_WIDE_MATERIAL: MaterialDescriptor = {
+  ...GENERATOR_MESH_MATERIAL,
+  buffers: [GENERATOR_MESH_LAYOUT, GENERATOR_INSTANCE_WIDE_LAYOUT],
+};
+
 export const TEXTURED_SILHOUETTE_MATERIAL: MaterialDescriptor = {
   ...TEXTURED_MATERIAL,
   shader: `${TEXTURED_MATERIAL.shader}-silhouette`,

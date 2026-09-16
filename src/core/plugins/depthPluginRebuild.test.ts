@@ -15,7 +15,13 @@
  */
 
 import { parseManifest } from './manifest';
-import { composeEffectShader, UNIFORM_HEADER_BYTES } from './effectSchema';
+import {
+  composeEffectShader,
+  packPassBlock,
+  HOST_BLOCK_FLOAT_OFFSET,
+  UNIFORM_HEADER_BYTES,
+  UNIFORM_RENDERER_HEADER_BYTES,
+} from './effectSchema';
 import { pluginEffectMaterial } from './pluginEffectMaterial';
 
 const base = {
@@ -27,8 +33,13 @@ const base = {
   main: 'main.js',
 };
 
-const parse = (contributes: unknown) => {
-  const result = parseManifest({ ...base, contributes });
+/**
+ * `apiVersion` is an argument because the second texture is an API-7 grammar:
+ * one layer parameter is as old as effects are, and the extra bindings only
+ * exist in the layout this version generates.
+ */
+const parse = (contributes: unknown, apiVersion = base.apiVersion) => {
+  const result = parseManifest({ ...base, apiVersion, contributes });
   return { manifest: result.manifest, errors: result.errors };
 };
 
@@ -170,8 +181,19 @@ describe('★ GAP 1 — CLOSED: an effect can sample a SECOND texture', () => {
     expect(material.layout.map((e) => e.binding)).toEqual([0, 1, 2]);
   });
 
-  it('still refuses more than one layer parameter', () => {
-    const { errors } = parse({
+  it('★ NO LONGER refuses a second layer parameter — four are allowed', () => {
+    /*
+      This assertion used to pin the one-texture limit. A depth plugin wants
+      colour AND depth AND a normal map, and a compositing one wants two inputs
+      plus a matte; one slot was the number the bind group happened to have,
+      not a number anybody argued for.
+
+      Four, and the bindings are 3, 5, 6, 7 — 4 stays `origin` whether or not
+      any effect on the machine uses it, because a binding number that moves
+      with an unrelated part of the manifest is one three separate places have
+      to re-derive and agree on.
+    */
+    const { manifest, errors } = parse({
       effects: [{
         id: 'parallax',
         label: 'Depth Parallax',
@@ -179,11 +201,35 @@ describe('★ GAP 1 — CLOSED: an effect can sample a SECOND texture', () => {
         params: {
           depthMap: { type: 'layer' },
           normalMap: { type: 'layer' },
+          aoMap: { type: 'layer' },
+          maskMap: { type: 'layer' },
         },
       }],
-    });
+    }, 7);
 
-    expect(errors.join()).toMatch(/layer parameters.*the limit is 1/);
+    expect(errors).toEqual([]);
+    const { wgsl } = composeEffectShader(manifest!.contributes.effects[0]!);
+    expect(wgsl).toContain('@binding(3) var depthMap');
+    expect(wgsl).toContain('@binding(5) var normalMap');
+    expect(wgsl).toContain('@binding(6) var aoMap');
+    expect(wgsl).toContain('@binding(7) var maskMap');
+    expect(wgsl).not.toContain('@binding(4) var');
+  });
+
+  it('refuses a FIFTH, and says why the ceiling is where it is', () => {
+    const { errors } = parse({
+      effects: [{
+        id: 'parallax',
+        label: 'Depth Parallax',
+        shader: PARALLAX,
+        params: {
+          a: { type: 'layer' }, b: { type: 'layer' }, c: { type: 'layer' },
+          d: { type: 'layer' }, e: { type: 'layer' },
+        },
+      }],
+    }, 7);
+
+    expect(errors.join()).toMatch(/layer parameters.*the limit is 4/);
   });
 
   it('still refuses `layer` on a layer KIND, where nothing could resolve it', () => {
@@ -240,27 +286,32 @@ ${PARALLAX}`;
   });
 });
 
-describe('★ GAP 2 — a shader layer kind and its effect are not connected', () => {
+describe('★ GAP 2 — CLOSED: a shader layer kind NAMES the effect that draws it', () => {
   /*
-    `render: "shader"` says a kind draws itself. It does not say WITH WHAT.
+    The gap, as this file recorded it twice: `render: "shader"` said a kind drew
+    itself and nothing said WITH WHAT. The two contribution lists had no
+    reference between them, so a manifest declaring a `depthImage` kind beside a
+    `parallax` effect was accepted and meant less than it appeared to — a reader
+    assumed the kind drew with the plugin's shader, and nothing in the data said
+    so.
 
-    A plugin declaring both a `depthImage` kind and a `parallax` effect has no
-    way to state that the kind renders using that effect — the two are separate
-    contribution lists with no reference between them. So the manifest below is
-    accepted and means less than it appears to: a reader would assume the kind
-    draws with the plugin's shader, and nothing in the data says so.
+    The fix is the form this file predicted: a `shader` field on the layer kind
+    naming one of the plugin's own effect ids, validated at parse time. It is
+    validated in two halves, because no single validator can see both lists —
+    `layerKindSchema` checks the NAME, `manifest.ts` checks that the effect
+    exists, once both lists are parsed.
 
-    The obvious form is a `shader` or `effect` field on the layer kind naming
-    one of the plugin's own effect ids, validated at parse time like `icon` is.
-    Recorded here rather than invented now, because the render side of a
-    self-drawing layer kind is not built either — inventing the manifest field
-    first would be a contract with nothing behind it.
+    The render side exists now too, which is what made the field worth adding:
+    `core/plugins/generator/generatorLayers.ts` turns such a kind into a
+    transparent layer carrying that one effect, and the plugin-effect path
+    draws it with the host's time / comp-size / frame inputs filled in.
   */
-  it('accepts a shader kind that names no shader, which is the gap', () => {
+  it('accepts a shader kind that names one of its own plugin effects', () => {
     const { manifest, errors } = parse({
       effects: [{ id: 'parallax', label: 'Depth Parallax', shader: PARALLAX, params: {} }],
       layerKinds: [{
         id: 'depthImage', label: 'Depth Image', render: 'shader',
+        shader: 'parallax',
         schemaVersion: 2,
         // A prop it does not need — see GAP 4 below, which is why this is here.
         props: { focal: { type: 'number', default: 50, animatable: true } },
@@ -268,10 +319,58 @@ describe('★ GAP 2 — a shader layer kind and its effect are not connected', (
     });
 
     expect(errors).toEqual([]);
-    const kind = manifest!.contributes.layerKinds[0]!;
-    // No field ties the kind to the effect. When one exists, this fails.
-    expect(Object.keys(kind)).not.toContain('shader');
-    expect(Object.keys(kind)).not.toContain('effect');
+    expect(manifest!.contributes.layerKinds[0]!.shader).toBe('parallax');
+  });
+
+  it('DROPS a kind naming an effect the plugin does not declare', () => {
+    // Dropped rather than kept with a dangling name: a shader kind that names
+    // nothing draws nothing, and an author who ships one finds out from a user.
+    const { errors } = parse({
+      effects: [{ id: 'parallax', label: 'Depth Parallax', shader: PARALLAX, params: {} }],
+      layerKinds: [{
+        id: 'depthImage', label: 'Depth Image', render: 'shader',
+        shader: 'paralax',
+        schemaVersion: 2,
+        props: { focal: { type: 'number', default: 50 } },
+      }],
+    });
+
+    expect(errors.join()).toMatch(/does not declare in "contributes.effects"/);
+    // And names what it DOES declare, so the typo is visible in the message.
+    expect(errors.join()).toMatch(/parallax/);
+    // A manifest with errors does not parse at all, so the kind cannot reach a
+    // document: `parseManifest` returns null rather than a partial contract.
+  });
+
+  it('refuses the field on a strategy that cannot use it', () => {
+    const { errors } = parse({
+      effects: [{ id: 'parallax', label: 'Depth Parallax', shader: PARALLAX, params: {} }],
+      layerKinds: [{
+        id: 'depthImage', label: 'Depth Image', render: 'proxy',
+        shader: 'parallax',
+        schemaVersion: 2,
+        props: { focal: { type: 'number', default: 50 } },
+      }],
+    });
+
+    expect(errors.join()).toMatch(/only meaningful on a kind with "render": "shader"/);
+  });
+
+  it('still accepts a shader kind that names NO shader — it just draws nothing', () => {
+    // The back-compat half: `render: "shader"` was legal for two grammar
+    // versions before the field existed, and a published manifest using it must
+    // not stop installing.
+    const { manifest, errors } = parse({
+      effects: [{ id: 'parallax', label: 'Depth Parallax', shader: PARALLAX, params: {} }],
+      layerKinds: [{
+        id: 'depthImage', label: 'Depth Image', render: 'shader',
+        schemaVersion: 2,
+        props: { focal: { type: 'number', default: 50 } },
+      }],
+    });
+
+    expect(errors).toEqual([]);
+    expect(manifest!.contributes.layerKinds[0]!.shader).toBeUndefined();
   });
 });
 
@@ -319,33 +418,125 @@ describe('★ GAP 4 — a shader kind is forced to declare properties it does no
   });
 });
 
-describe('★ GAP 3 — an effect cannot read the composition or the time', () => {
+describe('★ GAP 3 — CLOSED: an effect reads the composition and the time', () => {
   /*
-    A parallax effect that animates with the playhead needs time, and one that
-    respects the comp's aspect needs its size. Both exist in the renderer's
-    uniform header conceptually — `uvRect` carries the sample rect — but neither
-    is exposed to the author, and there is no declared parameter type for
-    "something the host fills in".
+    The gap, as it stood: a parallax effect that animates with the playhead
+    needed time, one that respects the comp's aspect needed its size, and there
+    was no way to ask for either. The workaround was an `animatable` number the
+    user keyframes by hand — per document rather than per effect, and wrong the
+    moment the comp's frame rate changes.
 
-    The built-in effects DO have this: `EffectParamDef` has a `'resolved'` type,
-    documented as "a param the RENDER PIPELINE fills in, not the user". So the
-    concept exists on the built-in side and has no plugin-facing equivalent.
+    ── What replaced it, and why it is not a parameter TYPE ───────────────────
 
-    An author's workaround is an `animatable` number they keyframe by hand,
-    which works and is worse: it is per-document rather than per-effect, and it
-    breaks the moment the comp's frame rate changes.
+    The obvious form was the one this file originally proposed: a `resolved`
+    parameter type mirroring the built-in `EffectParamDef`. It is still refused,
+    and deliberately. A host-filled `resolved` parameter would be a row in the
+    author's parameter list that the author cannot set, cannot animate and must
+    not name twice — an interface that exists to be ignored — and every author
+    would have to declare the same nine of them to get at values the host knows
+    unconditionally.
+
+    So they are MEMBERS OF THE BLOCK instead: every effect has them, no effect
+    declares them, and `RESERVED_PARAM_NAMES` refuses a parameter that would
+    collide. An author writes `params.time` in WGSL and `time` in GLSL.
   */
-  it('has no host-filled parameter type', () => {
+  it('still refuses a `resolved` parameter type — these are not parameters', () => {
     const { errors } = parse({
       effects: [{
         id: 'parallax',
         label: 'Depth Parallax',
         shader: PARALLAX,
-        params: { time: { type: 'resolved', default: 0 } },
+        params: { elapsed: { type: 'resolved', default: 0 } },
       }],
     });
 
     expect(errors.join()).toMatch(/type.*must be one of/);
+  });
+
+  it('★ declares the host inputs on every effect, declared or not', () => {
+    const { manifest, errors } = parse({
+      effects: [{ id: 'parallax', label: 'Depth Parallax', shader: PARALLAX, params: {} }],
+    });
+
+    expect(errors).toEqual([]);
+    const { wgsl } = composeEffectShader(manifest!.contributes.effects[0]!);
+    for (const member of [
+      'time', 'compTime', 'frame', 'fps', 'compSize', 'layerSize', 'pixelScale', 'downsample', 'seed',
+    ]) {
+      expect(wgsl).toContain(`  ${member} : `);
+    }
+  });
+
+  it('refuses a parameter that would collide with one of them', () => {
+    // Without this the generated struct has two members called `time`, and the
+    // compile error names a line in code the author never saw.
+    const { errors } = parse({
+      effects: [{
+        id: 'parallax',
+        label: 'Depth Parallax',
+        shader: PARALLAX,
+        params: { time: { type: 'number', default: 0 } },
+      }],
+    });
+
+    expect(errors.join()).toMatch(/uses a name the host fills in/);
+  });
+
+  it('fills them in, at the offsets the shader reads', () => {
+    /*
+      The half a manifest test cannot see: the struct saying `time` is at byte
+      96 is worth nothing unless the packer writes the time there. Packed here
+      and read back by offset, so a member reordered on one side and not the
+      other fails rather than renders a plausible picture.
+    */
+    const { manifest } = parse({
+      effects: [{ id: 'parallax', label: 'Depth Parallax', shader: PARALLAX, params: {} }],
+    });
+    const { layout } = composeEffectShader(manifest!.contributes.effects[0]!);
+
+    const buffer = new ArrayBuffer(layout.size);
+    packPassBlock(buffer, { width: 400, height: 200 }, 0.5, 1, {
+      compWidth: 1920, compHeight: 1080,
+      layerWidth: 800, layerHeight: 600,
+      time: 1.25, compTime: 2.5, frame: 60, fps: 24,
+      pixelScale: 2, downsample: 1, seed: 0.75,
+    });
+    const view = new DataView(buffer);
+    const read = (name: string): number =>
+      view.getFloat32(UNIFORM_RENDERER_HEADER_BYTES + HOST_BLOCK_FLOAT_OFFSET[name]! * 4, true);
+
+    expect(read('texelSize')).toBeCloseTo(1 / 400);
+    expect(read('passScale')).toBe(0.5);
+    expect(read('passIndex')).toBe(1);
+    expect(read('compSize')).toBe(1920);
+    expect(read('layerSize')).toBe(800);
+    expect(read('time')).toBe(1.25);
+    expect(read('compTime')).toBe(2.5);
+    expect(read('frame')).toBe(60);
+    expect(read('fps')).toBe(24);
+    expect(read('pixelScale')).toBe(2);
+    expect(read('downsample')).toBe(1);
+    expect(read('seed')).toBe(0.75);
+  });
+
+  it('gives a LAYER time that is not the playhead', () => {
+    // The distinction a retimed layer turns on: an effect animating with its
+    // layer has to follow the layer's clock, or it drifts against the picture
+    // it is drawn on.
+    const { manifest } = parse({
+      effects: [{ id: 'parallax', label: 'Depth Parallax', shader: PARALLAX, params: {} }],
+    });
+    const { layout } = composeEffectShader(manifest!.contributes.effects[0]!);
+    const buffer = new ArrayBuffer(layout.size);
+    packPassBlock(buffer, { width: 10, height: 10 }, 1, 0, {
+      compWidth: 100, compHeight: 100, layerWidth: 100, layerHeight: 100,
+      time: 0.5, compTime: 3, frame: 90, fps: 30,
+      pixelScale: 1, downsample: 1, seed: 0,
+    });
+    const view = new DataView(buffer);
+    const at = (n: string): number =>
+      view.getFloat32(UNIFORM_RENDERER_HEADER_BYTES + HOST_BLOCK_FLOAT_OFFSET[n]! * 4, true);
+    expect(at('time')).not.toBe(at('compTime'));
   });
 });
 

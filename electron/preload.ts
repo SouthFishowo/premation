@@ -83,6 +83,12 @@ const bridge = {
       ipcRenderer.invoke('render:stageFrame', jobId, index, bytes, ext),
     stageAudio: (jobId: string, bytes: Uint8Array) => ipcRenderer.invoke('render:stageAudio', jobId, bytes),
     encode: (jobId: string, opts: unknown) => ipcRenderer.invoke('render:encode', jobId, opts),
+    /** Streaming encode: open one ffmpeg child, feed it raw RGBA, finish. */
+    streamPreference: () => ipcRenderer.invoke('render:streamPreference') as Promise<'stream' | 'staged'>,
+    openStream: (jobId: string, opts: unknown) => ipcRenderer.invoke('render:openStream', jobId, opts),
+    streamFrame: (jobId: string, index: number, bytes: Uint8Array) =>
+      ipcRenderer.invoke('render:streamFrame', jobId, index, bytes),
+    finishStream: (jobId: string) => ipcRenderer.invoke('render:finishStream', jobId),
     /** Whether host ffmpeg can encode HEVC (libx265) for HDR10/HLG delivery. */
     probeHdr: () => ipcRenderer.invoke('render:probeHdr') as Promise<{ libx265: boolean }>,
     cancel: (jobId: string) => ipcRenderer.invoke('render:cancel', jobId),
@@ -147,6 +153,8 @@ const bridge = {
     minimize: () => ipcRenderer.invoke('window:minimize'),
     maximize: () => ipcRenderer.invoke('window:maximize'),
     close: () => ipcRenderer.invoke('window:close'),
+    setTitleBarOverlay: (colors: { color: string; symbolColor: string }) =>
+      ipcRenderer.invoke('window:setTitleBarOverlay', colors),
   },
 
   app: {
@@ -215,6 +223,73 @@ const bridge = {
      * pass every check that reads the name as text.
      */
     resolve: (hostname: string) => ipcRenderer.invoke('plugin:net-resolve', hostname),
+  },
+
+  /**
+   * Plugins that live in a FOLDER on this machine — the desktop half of the
+   * install story (electron/pluginLoader.ts).
+   *
+   * Its own namespace rather than more keys on `pluginNet`, because it is a
+   * different capability with a different risk: that one opens sockets, this
+   * one reads directories. Everything here is read-only, and the set of
+   * directories is decided in main — `read` takes a path but refuses one that
+   * is not inside a configured plugins folder, so the renderer can name a
+   * package and cannot name a file.
+   *
+   * `openFolder` takes no argument for the same reason: it opens the user's own
+   * plugins directory (creating it, which is what makes the instruction
+   * actionable) and nothing else.
+   */
+  plugins: {
+    /** The directories a scan looks in, with where each came from. */
+    paths: () => ipcRenderer.invoke('plugins:paths'),
+    /** Candidates, with `plugin.json` text for folders. No package is read. */
+    scan: () => ipcRenderer.invoke('plugins:scan'),
+    /** One package: `{ files, binaries }` for a folder, raw bytes for an archive. */
+    read: (path: string) => ipcRenderer.invoke('plugins:read', path),
+    openFolder: () => ipcRenderer.invoke('plugins:openFolder'),
+    /** Watch the folders and push `onChanged`. Developer mode turns this on. */
+    watch: (enabled: boolean) => ipcRenderer.invoke('plugins:watch', enabled),
+    /** "Something in a plugins folder changed" — no path, because the renderer
+     *  re-scans anyway and a half-written directory is not worth acting on. */
+    onChanged: (handler: () => void) => {
+      const listener = (): void => handler();
+      ipcRenderer.on('plugins:changed', listener);
+      return () => ipcRenderer.removeListener('plugins:changed', listener);
+    },
+  },
+
+  /**
+   * A plugin's COMPILED module, in a process of its own.
+   *
+   * `platform` and `arch` are constants rather than calls, and they are this
+   * process's own: the binary is picked by `process.platform`-`process.arch`,
+   * and a renderer deriving them from a user-agent string would report an
+   * arm64 Mac as x64 — which is a binary that loads and then crashes, instead
+   * of one that is refused with a sentence.
+   *
+   * Everything else is a verb main validates. There is no "read this binary"
+   * and no way to name a directory outside a plugins folder; see
+   * electron/pluginNativeIpc.ts for the three checks on the other side.
+   */
+  pluginNative: {
+    platform: process.platform,
+    arch: process.arch,
+    load: (request: unknown) => ipcRenderer.invoke('pluginNative:load', request),
+    call: (request: unknown) => ipcRenderer.invoke('pluginNative:call', request),
+    unload: (pluginId: string, reason?: string) =>
+      ipcRenderer.invoke('pluginNative:unload', pluginId, reason),
+    status: () => ipcRenderer.invoke('pluginNative:status'),
+    stage: (request: unknown) => ipcRenderer.invoke('pluginNative:stage', request),
+    unstage: (pluginId: string) => ipcRenderer.invoke('pluginNative:unstage', pluginId),
+    /** Plugin ids with a staging directory — names only. Input to the boot sweep. */
+    staged: () => ipcRenderer.invoke('pluginNative:staged'),
+    /** Crash, restart and session-disable — they happen to idle processes too. */
+    onEvent: (handler: (event: unknown) => void) => {
+      const listener = (_e: unknown, event: unknown): void => handler(event);
+      ipcRenderer.on('pluginNative:event', listener);
+      return () => ipcRenderer.removeListener('pluginNative:event', listener);
+    },
   },
 
   /**

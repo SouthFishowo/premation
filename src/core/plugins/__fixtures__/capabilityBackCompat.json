@@ -37,7 +37,16 @@
     "importers",
     "presets",
     "panels",
-    "wasm"
+    "wasm",
+    "effects.describe",
+    "animation.typed",
+    "layerkinds.generator",
+    "layerkinds.shader",
+    "ui.inspector",
+    "ui.canvas",
+    "ui.tools",
+    "ui.shortcuts",
+    "ui.expressions"
   ],
   "runtimeCapabilities": [
     "webgpu"

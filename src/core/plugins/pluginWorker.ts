@@ -24,6 +24,9 @@
 
 import { collectTransferables, type HostMessage, type WorkerMessage, type PluginCommandSpec, type RenderFinishedInfo } from './protocol';
 import type { PluginManifest, PluginPermission } from './manifest';
+import type { PluginCanvasEvent, PluginDrawList } from './uiCanvas';
+import { parseStorageDelete, parseStorageGet, parseStorageList, parseStorageSet } from './storageArgs';
+import { planModuleGraph, rewriteModule } from './moduleGraph';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -34,10 +37,38 @@ declare const self: DedicatedWorkerGlobalScope;
  * buffers in it, which is all of them but `assets.createImage` — so this is the
  * ordinary path, not a special case someone has to remember to take.
  */
+/**
+ * Blob URL → the package path whose source it holds.
+ *
+ * Filled while the module graph is built. It exists for one reason: a stack
+ * trace from inside a plugin names the URL the code was loaded from, and a blob
+ * URL is a random UUID. An author reading
+ * `at draw (blob:null/6f2a…:41:9)` has been told nothing — not which of their
+ * twenty files threw, and not that the line number is meaningful. Substituted
+ * on the way out so the log shows `at draw (lib/draw.js:41:9)`.
+ */
+const modulePathByUrl = new Map<string, string>();
+
+/** Swap every blob URL we minted for the package path it came from. */
+function mapBlobUrls(text: string): string {
+  if (modulePathByUrl.size === 0 || !text.includes('blob:')) return text;
+  let out = text;
+  for (const [url, path] of modulePathByUrl) {
+    if (out.includes(url)) out = out.split(url).join(path);
+  }
+  return out;
+}
+
 const post = (msg: WorkerMessage): void => {
-  const transfer = collectTransferables(msg);
-  if (transfer.length > 0) self.postMessage(msg, transfer);
-  else self.postMessage(msg);
+  // Only the two message kinds that carry author-facing prose. Doing it for
+  // every message would put a string scan on the export frame path.
+  const mapped: WorkerMessage =
+    msg.k === 'log' ? { ...msg, text: mapBlobUrls(msg.text) }
+      : msg.k === 'fatal' ? { ...msg, error: mapBlobUrls(msg.error) }
+        : msg;
+  const transfer = collectTransferables(mapped);
+  if (transfer.length > 0) self.postMessage(mapped, transfer);
+  else self.postMessage(mapped);
 };
 
 /**
@@ -166,6 +197,21 @@ const commandHandlers = new Map<string, (ctx: { selection: string[] }) => unknow
  *  have one panel's handler woken by the other's messages. */
 const panelListeners = new Map<string, Array<(data: unknown) => void>>();
 
+/*
+  The UI surface (API 7).
+
+  Three lists rather than one dispatcher, because the three things a plugin
+  hears about its interface arrive for unrelated reasons: a pointer landed on
+  its drawing, the user picked one of its tools, or an expression wants a value
+  it has not provided. A plugin usually registers for exactly one of them.
+*/
+const canvasListeners: Array<(e: PluginCanvasEvent) => void> = [];
+const toolListeners: Array<(e: { toolId: string; active: boolean }) => void> = [];
+const expressionHandlers = new Map<
+  string,
+  (...args: number[]) => number | number[] | Promise<number | number[]>
+>();
+
 /** Raw pixels as they cross the boundary — see `assets.ts` for the format. */
 export interface PluginImage {
   assetId: string;
@@ -175,6 +221,17 @@ export interface PluginImage {
   mime: string;
   bytes: Uint8Array;
 }
+
+/**
+ * What a keyframe may hold. A number writes one track; a colour writes the four
+ * `_r/_g/_b/_a` channel tracks; a point writes its axis tracks. The host maps
+ * and validates — see `typedKeyframes.ts`.
+ */
+export type KeyframeValue =
+  | number
+  | string
+  | { r: number; g: number; b: number; a?: number }
+  | { x: number; y: number; z?: number };
 
 /** `kindId` → the plugin's authored-edit callback. One per kind. */
 const layerChangeListeners = new Map<string, (e: { layerId: string; props: string[] }) => void>();
@@ -223,6 +280,22 @@ export interface ImporterHandlers {
 }
 
 const importers = new Map<string, ImporterHandlers>();
+
+/**
+ * What a `render: "generator"` layer kind implements.
+ *
+ * Called once per frame of that layer — the busiest callback in the API, and
+ * the only one on the path to a pixel. It must be a PURE function of its
+ * request: the same request, including the same incoming `state`, has to give
+ * the same instances, or scrubbing and export will disagree about what the
+ * composition contains. The host guarantees the first half of that (it replays
+ * from checkpoints so the state is always the state that frame really had);
+ * the plugin owes the second (no `Math.random()`, no wall clock, no reading
+ * anything the request did not carry).
+ */
+export type GenerateHandler = (request: unknown) => unknown;
+
+const generators = new Map<string, GenerateHandler>();
 
 function buildApi(
   manifest: PluginManifest,
@@ -314,6 +387,82 @@ function buildApi(
           : [solePanel(), args[0]];
         post({ k: 'toPanel', panelId: id, data: payload });
       },
+
+      /*
+        ── On-canvas UI ────────────────────────────────────────────────
+
+        `draw` REPLACES the whole drawing; there is no incremental API and
+        there will not be. A retained list the plugin owns end to end is a
+        thing it can reason about; a list mutated by two ends is a
+        synchronisation problem across a `postMessage` boundary, and the
+        symptom is a gizmo that is one gesture behind.
+
+        Points are in the LAYER's own space — the same space its anchor and
+        mask vertices are in. The host applies the transform, so the zoom, the
+        pan and the size of the window are never yours to think about.
+      */
+      draw: (list: PluginDrawList) => call('ui.draw', list),
+      clearDraw: () => call('ui.clearDraw'),
+      /**
+       * Pointer and key events on your drawing (and, while one of your tools
+       * is active, anywhere in the viewport). Coordinates are layer-space.
+       */
+      onCanvas: (handler: (e: PluginCanvasEvent) => void) => {
+        if (typeof handler !== 'function') throw new Error('onCanvas expects a function.');
+        canvasListeners.push(handler);
+      },
+      /** Set (or with null, clear) the text of one `status` parameter. */
+      setStatus: (...args: unknown[]) => {
+        const [panelId, param, text] = args.length >= 3
+          ? [args[0] as string | undefined, args[1] as string, args[2]]
+          : [undefined, args[0] as string, args[1]];
+        return call('ui.setStatus', panelId, param, text ?? null);
+      },
+    },
+
+    /** The values behind `contributes.inspector`, on one layer. */
+    params: {
+      /** Every parameter of a panel, defaults included. */
+      get: (layerId: string, panelId?: string) => call('params.get', layerId, panelId),
+      set: (layerId: string, ...rest: unknown[]) => {
+        // `set(layer, name, value)` on a single-panel plugin, or
+        // `set(layer, panel, name, value)`. Told apart by ARITY, like
+        // `sendToPanel` — sniffing types would make a three-argument call
+        // ambiguous the moment a panel and a parameter share a name.
+        const [panelId, name, value] = rest.length >= 3
+          ? [rest[0] as string | undefined, rest[1] as string, rest[2]]
+          : [undefined, rest[0] as string, rest[1]];
+        return call('params.set', layerId, panelId, name, value);
+      },
+    },
+
+    /** The tools this plugin contributes — see `contributes.tools`. */
+    tools: {
+      /** Fired when the user picks one of your tools, and when they leave it. */
+      onChanged: (handler: (e: { toolId: string; active: boolean }) => void) => {
+        if (typeof handler !== 'function') throw new Error('onChanged expects a function.');
+        toolListeners.push(handler);
+      },
+    },
+
+    /**
+     * Functions this plugin makes callable from expressions.
+     *
+     * The call site in an expression is SYNCHRONOUS and this is not, so the
+     * two are joined by a cache: `provide` fills it, and a call that misses
+     * returns your declared default and asks `handle` for the value. A plugin
+     * that pushes its values as it computes them never misses.
+     */
+    expressions: {
+      provide: (name: string, args: number[], value: number | number[]) =>
+        call('expressions.provide', name, args, value),
+      handle: (
+        name: string,
+        fn: (...args: number[]) => number | number[] | Promise<number | number[]>,
+      ) => {
+        if (typeof fn !== 'function') throw new Error('handle expects a function.');
+        expressionHandlers.set(String(name), fn);
+      },
     },
 
     commands: {
@@ -368,6 +517,40 @@ function buildApi(
         }
         exporters.set(exporterId, handlers);
         return () => exporters.delete(exporterId);
+      },
+    },
+    generators: {
+      /**
+       * Claim a `render: "generator"` layer kind declared in
+       * `contributes.layerKinds`, and produce its geometry.
+       *
+       *   motion.generators.register('sparks', (req) => {
+       *     const sim = req.state ?? seed(req.seed);
+       *     step(sim, 1 / req.fps);
+       *     return { instances: pack(sim), count: sim.alive, primitive: 'point', state: sim };
+       *   });
+       *
+       * `instances` is a `Float32Array`, nine floats per instance —
+       * x, y, z, size, rotation (radians), r, g, b, a — in LAYER space with the
+       * origin at the layer's centre. Eleven with `stride: 11`, the last two
+       * being the u,v of this instance's cell in a texture the package ships.
+       *
+       * The host calls this AHEAD of the playhead during playback and awaits it
+       * exactly during export; it is never on the render loop's critical path,
+       * so taking a few milliseconds costs latency rather than frame rate.
+       * Taking two seconds is treated as a failure and reported against this
+       * plugin by name.
+       *
+       * Return `transfer: true` only if the buffers are freshly allocated. The
+       * host will move them instead of copying — and will detach a pool you
+       * meant to reuse.
+       */
+      register: (kindId: string, generate: GenerateHandler) => {
+        if (typeof generate !== 'function') {
+          throw new Error(`generators.register("${kindId}") needs a generate function.`);
+        }
+        generators.set(kindId, generate);
+        return () => generators.delete(kindId);
       },
     },
     audio: {
@@ -500,8 +683,27 @@ function buildApi(
       }>>,
       add: (layerId: string, type: string) => call('effects.add', layerId, type) as Promise<string>,
       remove: (layerId: string, effectId: string) => call('effects.remove', layerId, effectId),
+      /**
+       * Refused — naming the closest real key and the range — when `key` is not
+       * one of the effect's parameters or `value` is outside its min/max.
+       */
       setParam: (layerId: string, effectId: string, key: string, value: number | string | boolean) =>
         call('effects.setParam', layerId, effectId, key, value),
+      /**
+       * An effect TYPE's parameters: `id` (the key setParam takes), label,
+       * type, default, min/max. Ask instead of guessing — `softness` not
+       * `blur`, 0–100 not 0–1. Needs no permission; it reads no project data.
+       */
+      describe: (type: string) => call('effects.describe', type) as Promise<{
+        type: string;
+        label: string;
+        params: Array<{
+          id: string; label: string; type: string; default: unknown;
+          min?: number; max?: number; unit?: string; precision?: number; group?: string;
+          options?: Array<{ value: number; label: string }>;
+          settable: boolean; animatable: boolean;
+        }>;
+      }>,
     },
 
     animation: {
@@ -510,9 +712,15 @@ function buildApi(
       }>>,
       sample: (id: string, prop: string, time: number) =>
         call('animation.sample', id, prop, time) as Promise<number | null>,
-      setKeyframe: (id: string, prop: string, time: number, value: number, easing?: string) =>
+      /**
+       * `value` is a number, a colour (`'#rrggbb'`, `'#rrggbbaa'`, or
+       * `{ r, g, b, a }` with r/g/b 0–255 and a 0–1) or a point (`{ x, y, z? }`).
+       * A colour becomes the `<prop>_r/_g/_b/_a` channel tracks the renderer
+       * reads; a point becomes `x/y/z`-style axis tracks. See the guide.
+       */
+      setKeyframe: (id: string, prop: string, time: number, value: KeyframeValue, easing?: string) =>
         call('animation.setKeyframe', id, prop, time, value, easing),
-      setKeyframes: (id: string, prop: string, kfs: Array<{ t: number; value: number; easing?: string }>) =>
+      setKeyframes: (id: string, prop: string, kfs: Array<{ t: number; value: KeyframeValue; easing?: string }>) =>
         call('animation.setKeyframes', id, prop, kfs),
       removeKeyframe: (id: string, prop: string, time: number) =>
         call('animation.removeKeyframe', id, prop, time),
@@ -574,16 +782,58 @@ function buildApi(
      *
      * A `project` write marks the document dirty and is NOT undoable. A plugin
      * that wants undoable state should put it in layer props.
+     *
+     * KEY-first, scope last and optional (default `'global'`) — what the guide
+     * documents. The older scope-first order is still accepted; see
+     * `storageArgs.ts` for how the two are told apart. The wire call is
+     * `(scope, key, …)` either way, so the host never sees the difference.
+     *
+     * A call matching neither form REJECTS (rather than throwing synchronously)
+     * so `await` and `.catch` both see it.
      */
     storage: {
-      get: (scope: 'global' | 'project', key: string) =>
-        call('storage.get', scope, key) as Promise<unknown>,
-      set: (scope: 'global' | 'project', key: string, value: unknown) =>
-        call('storage.set', scope, key, value) as Promise<true>,
-      delete: (scope: 'global' | 'project', key: string) =>
-        call('storage.delete', scope, key) as Promise<true>,
-      list: (scope: 'global' | 'project', prefix?: string) =>
-        call('storage.list', scope, prefix) as Promise<string[]>,
+      get: (...args: unknown[]) => {
+        try {
+          const a = parseStorageGet(args);
+          return call('storage.get', a.scope, a.key) as Promise<unknown>;
+        } catch (err) { return Promise.reject(err); }
+      },
+      set: (...args: unknown[]) => {
+        try {
+          const a = parseStorageSet(args);
+          return call('storage.set', a.scope, a.key, a.value) as Promise<true>;
+        } catch (err) { return Promise.reject(err); }
+      },
+      delete: (...args: unknown[]) => {
+        try {
+          const a = parseStorageDelete(args);
+          return call('storage.delete', a.scope, a.key) as Promise<true>;
+        } catch (err) { return Promise.reject(err); }
+      },
+      list: (...args: unknown[]) => {
+        try {
+          const a = parseStorageList(args);
+          return call('storage.list', a.scope, a.prefix) as Promise<string[]>;
+        } catch (err) { return Promise.reject(err); }
+      },
+    },
+
+    /**
+     * The plugin's own package, as data.
+     *
+     * `await motion.package.read('models/seg.onnx')` → `ArrayBuffer`;
+     * `read('shaders/blur.wgsl', 'text')` → `string`.
+     *
+     * This is how a plugin gets at the files it shipped that are not code — a
+     * WebAssembly module, weights, a LUT, a font, a mesh. Before it existed the
+     * only way was base64 inside a `.js` file, which is a third more bytes,
+     * decoded on every boot, and invisible to every size check.
+     *
+     * Imports are the wrong tool for these and say so: `import './look.cube'`
+     * is refused by the graph planner with a message pointing here.
+     */
+    package: {
+      read: (path: unknown, as?: unknown) => call('package.read', path, as) as Promise<string | ArrayBuffer>,
     },
   };
 }
@@ -703,15 +953,88 @@ async function runImport(msg: Extract<HostMessage, { k: 'import' }>): Promise<vo
   }
 }
 
+/**
+ * Produce one frame of a generator kind and reply.
+ *
+ * ALWAYS replies, for the same reason `runExportStep` and `runImport` do: the
+ * host has a scheduler slot open on this id, and during an export it is
+ * BLOCKED on it. A generate that answered nothing would stall the export behind
+ * a frame that will never arrive, with no error to show for it.
+ *
+ * The result is posted exactly as the plugin returned it. Validation is the
+ * host's — the worker has no business deciding whether 40 000 is too many
+ * instances, and duplicating the rule here would make the two copies the thing
+ * that has to agree.
+ */
+async function runGenerate(msg: Extract<HostMessage, { k: 'generate' }>): Promise<void> {
+  const generate = generators.get(msg.kindId);
+  if (!generate) {
+    post({
+      k: 'generateResult',
+      id: msg.id,
+      ok: false,
+      error:
+        `This plugin declares the generator layer kind "${msg.kindId}" but never called `
+        + `motion.generators.register("${msg.kindId}", ...).`,
+    });
+    return;
+  }
+  try {
+    const value = await generate(msg.request);
+    const transfer = !!(value && typeof value === 'object' && (value as { transfer?: unknown }).transfer === true);
+    post({ k: 'generateResult', id: msg.id, ok: true, value, ...(transfer ? { transfer } : {}) });
+  } catch (err) {
+    post({ k: 'generateResult', id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
 async function boot(msg: Extract<HostMessage, { k: 'boot' }>): Promise<void> {
   if (booted) return;
   booted = true;
   lockdown();
 
   const api = buildApi(msg.manifest, msg.permissions, msg.capabilities ?? []);
-  const url = URL.createObjectURL(new Blob([msg.code], { type: 'text/javascript' }));
+
+  /*
+    ── A package is a module GRAPH, not one file ─────────────────────────────
+
+    Every text file in the package becomes its own blob URL, and each relative
+    specifier inside it is rewritten to the URL of the file it resolves to.
+    Built dependencies-first, because a blob URL is minted from content: a
+    module cannot have a URL until everything it imports already has one.
+    `planModuleGraph` owns the resolution, the ordering and the refusals (a
+    cycle, a bare npm specifier, a `.wgsl` imported as code); this loop only
+    mints URLs in the order it was handed.
+
+    The single-file path stays as the fallback for a host that sent no `files`,
+    and it is the same code path — a one-module graph.
+  */
+  const urls: string[] = [];
+  const urlByPath = new Map<string, string>();
+  let entryUrl: string;
+  if (msg.files && msg.entry) {
+    const plan = planModuleGraph(msg.files, msg.entry);
+    if (!plan.ok) {
+      post({ k: 'fatal', error: plan.error });
+      return;
+    }
+    for (const module of plan.modules) {
+      const source = rewriteModule(module, (p) => urlByPath.get(p) ?? p);
+      const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+      urlByPath.set(module.path, url);
+      // The reverse map is what turns `blob:null/6f2a…:41:9` in a stack back
+      // into `lib/draw.js:41:9` on its way to the log.
+      modulePathByUrl.set(url, module.path);
+      urls.push(url);
+    }
+    entryUrl = urls[urls.length - 1]!;
+  } else {
+    entryUrl = URL.createObjectURL(new Blob([msg.code], { type: 'text/javascript' }));
+    urls.push(entryUrl);
+  }
+
   try {
-    const mod = (await import(/* @vite-ignore */ url)) as Record<string, unknown>;
+    const mod = (await import(/* @vite-ignore */ entryUrl)) as Record<string, unknown>;
     const activate =
       typeof mod.activate === 'function'
         ? (mod.activate as (a: unknown) => unknown)
@@ -729,9 +1052,21 @@ async function boot(msg: Extract<HostMessage, { k: 'boot' }>): Promise<void> {
     await activate(api);
     post({ k: 'activated' });
   } catch (err) {
+    // The stack goes to the LOG, the message to the error. They have different
+    // readers: the message becomes a toast and a row subtitle, where forty
+    // lines of frames would be noise, and the log is the place an author opens
+    // precisely to find out which of their files threw.
+    if (err instanceof Error && err.stack) post({ k: 'log', level: 'error', text: err.stack });
     post({ k: 'fatal', error: err instanceof Error ? `${err.message}` : String(err) });
-  } finally {
-    URL.revokeObjectURL(url);
+    // Revoked only on FAILURE, which is a change from the single-file version.
+    //
+    // That one revoked as soon as the import resolved, which was safe because
+    // the module was already evaluated. It is not safe for a graph: a lazy
+    // `await import('./heavy.js')` runs long after `activate()` returns, and a
+    // revoked URL would make it fail with "failed to fetch" — for code that is
+    // correct. The URLs now live as long as the worker, which is exactly as
+    // long as the plugin, and are freed when it is terminated.
+    for (const url of urls) URL.revokeObjectURL(url);
   }
 }
 
@@ -775,6 +1110,10 @@ self.onmessage = (ev: MessageEvent<HostMessage>): void => {
       void runImport(msg);
       return;
     }
+    case 'generate': {
+      void runGenerate(msg);
+      return;
+    }
     case 'renderFinished': {
       // Every listener runs even if an earlier one throws: one plugin's broken
       // handler must not silence its own other handler.
@@ -793,6 +1132,44 @@ self.onmessage = (ev: MessageEvent<HostMessage>): void => {
         catch (err) { post({ k: 'log', level: 'error', text: `onLayerChanged threw: ${String(err)}` }); }
       }
       break;
+    }
+    case 'canvas': {
+      // Every listener runs even if an earlier one throws — a plugin that
+      // draws two gizmos must not lose one to a bug in the other.
+      for (const fn of [...canvasListeners]) {
+        try { fn(msg.event); }
+        catch (err) { post({ k: 'log', level: 'error', text: `onCanvas threw: ${String(err)}` }); }
+      }
+      return;
+    }
+    case 'tool': {
+      for (const fn of [...toolListeners]) {
+        try { fn({ toolId: msg.toolId, active: msg.active }); }
+        catch (err) { post({ k: 'log', level: 'error', text: `onTool threw: ${String(err)}` }); }
+      }
+      return;
+    }
+    case 'expression': {
+      /*
+        An expression asked for a value this plugin has not provided yet.
+
+        The answer goes back as an ordinary `expressions.provide` call rather
+        than as a reply, so a plugin that pushes values ahead of time and a
+        plugin that computes them on demand use one code path. Nothing is sent
+        when there is no handler: the expression keeps using the declared
+        default, which is what a plugin with no handler means.
+      */
+      const fn = expressionHandlers.get(msg.name);
+      if (!fn) return;
+      void (async () => {
+        try {
+          const value = await fn(...msg.args);
+          await call('expressions.provide', msg.name, msg.args, value);
+        } catch (err) {
+          post({ k: 'log', level: 'error', text: `expression "${msg.name}" failed: ${String(err)}` });
+        }
+      })();
+      return;
     }
     case 'panelMessage':
       // Delivered only to the listeners for the panel it came from. The host

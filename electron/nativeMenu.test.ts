@@ -87,9 +87,23 @@ describe('nativeTemplateFromGroups', () => {
 
   it('adds the macOS app menu and Close on darwin', () => {
     const t = nativeTemplateFromGroups(GROUPS, opts('darwin'));
-    expect(t[0]!.role).toBe('appMenu');
+    const appMenu = t[0]!.submenu as Array<{ role?: string; label?: string; accelerator?: string; click?: { forwards?: string } }>;
+    expect(t[0]!.label).toBe('Premation');
+    expect(appMenu[0]!.role).toBe('about');
+    expect(appMenu[appMenu.length - 1]!.role).toBe('quit');
     const file = t.find((m) => m.label === 'File')!.submenu as Array<{ role?: string }>;
     expect(file[file.length - 1]!.role).toBe('close');
+  });
+
+  it('puts Settings… (⌘,) and Check for Updates… in the macOS app menu, not Help', () => {
+    const t = nativeTemplateFromGroups(GROUPS, opts('darwin'));
+    const appMenu = t[0]!.submenu as Array<{ label?: string; accelerator?: string; click?: { forwards?: string } }>;
+    const settings = appMenu.find((i) => i.label === 'Settings…')!;
+    expect(settings.accelerator).toBe('Cmd+,');
+    expect(settings.click?.forwards).toBe('view.customize');
+    expect(appMenu.some((i) => i.label === 'Check for Updates…')).toBe(true);
+    const help = t.find((m) => m.role === 'help')!.submenu as Array<{ label?: string }>;
+    expect(help.some((i) => i.label === 'Check for Updates…')).toBe(false);
   });
 
   it('owns Check for Updates, the version line, and dev-only items', () => {

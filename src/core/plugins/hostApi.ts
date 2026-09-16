@@ -37,11 +37,20 @@ import { insertImageNode } from '@core/scene/sceneInsert';
 import type { SceneKind } from '@core/scene/seedDefaultScene';
 import { checkOwnership } from './layerKindRegistry';
 import { buildCustomLayerNode, isReservedPropPath, readCustomLayer } from './customLayers';
-import { planStructuredWrite, STRUCTURED_PROP_NAMES } from './structuredProps';
+import { normaliseFillWrite, planStructuredWrite, STRUCTURED_PROP_NAMES } from './structuredProps';
+import {
+  describeEffect, effectParamProblem, propertyProblem, unknownEffectTypeMessage,
+} from './propValidation';
+import { planKeyframeWrites } from './typedKeyframes';
 import { regenerateProxyChildren } from './proxySubtree';
 import { onLayerChanged } from './layerChangeNotifier';
 import type { PluginManifest, PluginPermission } from './manifest';
 import type { PluginCommandSpec } from './protocol';
+import { clearPluginDrawList, setPluginDrawList, MAX_DRAW_ITEMS } from './uiCanvas';
+import { setPluginStatus } from './uiStatus';
+import { providePluginExpressionValue } from './uiExpressions';
+import { paramAxes, type PluginInspectorPanelContribution } from './uiParams';
+import { readPluginPanelValues, writePluginParam } from './uiParamValues';
 import { createImageAsset, readAssetPixels, requireAsset } from './assets';
 import { reparentNode } from '@core/scene/parenting';
 import {
@@ -172,6 +181,18 @@ export function createHostApi(
      * addition to it, not a second copy.
      */
     granted: () => ReadonlySet<PluginPermission>;
+    /**
+     * Read one file out of THIS plugin's installed package.
+     *
+     * A hook rather than a lookup here, because this file has no handle on the
+     * installed payload and should not grow one: `PluginHost` owns the record,
+     * and it is the side that can answer for a plugin that was uninstalled
+     * between the call and the read. Optional so a host built for enumeration
+     * (see `methodPermissionsFixture.test.ts`) need not supply one — the method
+     * then refuses, rather than being absent and reading to an author as a
+     * version mismatch.
+     */
+    readPackageFile?: (path: unknown, as: unknown) => Promise<string | ArrayBuffer>;
   },
 ): Record<string, (...args: unknown[]) => unknown> {
   const edit = <T>(what: string, fn: () => T): T => runDocumentEdit(`${manifest.name}: ${what}`, fn);
@@ -202,6 +223,32 @@ export function createHostApi(
     return id;
   };
 
+  /**
+   * Which contributed inspector panel a `params.*` / `ui.setStatus` call means.
+   *
+   * Same shape as `panelId` above, and the same reasoning: optional when the
+   * plugin declares exactly one, an error naming the choices when it declares
+   * several. Guessing would write a value into the wrong panel's component,
+   * which is a bug the author would see as "my parameter does not save".
+   */
+  const inspectorPanel = (raw: unknown): PluginInspectorPanelContribution => {
+    const panels = manifest.contributes.inspector;
+    if (panels.length === 0) {
+      return fail('This plugin declares no "contributes.inspector" panels, so it has no parameters.');
+    }
+    if (raw === undefined || raw === null) {
+      if (panels.length === 1) return panels[0]!;
+      return fail(
+        `This plugin declares ${panels.length} inspector panels — name one: ${panels.map((p) => p.id).join(', ')}.`,
+      );
+    }
+    const id = str(raw, 'inspector panel id');
+    const found = panels.find((p) => p.id === id);
+    return found ?? fail(
+      `No inspector panel "${id}" in this plugin's manifest. Declared: ${panels.map((p) => p.id).join(', ')}.`,
+    );
+  };
+
   const table: Record<string, (...args: unknown[]) => unknown> = {
     // ── UI / core ────────────────────────────────────────────────────────
     'ui.notify': (message, level) => {
@@ -219,6 +266,113 @@ export function createHostApi(
     // declare its panel has a bug, and it should read as one.
     'ui.openPanel': (id) => { hooks.openPanel(panelId(id)); return true; },
     'ui.closePanel': (id) => { hooks.closePanel(panelId(id)); return true; },
+
+    /*
+      ── On-canvas UI ───────────────────────────────────────────────────
+
+      The plugin hands over a RETAINED list of primitives and the host paints
+      it every frame with the layer's transform applied. Refused rather than
+      partially drawn: a list the sanitiser rejected is a bug in the plugin,
+      and silently drawing the half of it that parsed would leave the author
+      debugging a gizmo that is missing a line.
+    */
+    'ui.draw': (list) => {
+      if (!setPluginDrawList(manifest.id, list)) {
+        return fail(
+          'The draw list was refused. Every point must be a finite number, colours must be '
+          + `hex literals ("#4da3ff"), a layer-space list needs a "layerId", and there is a limit of ${MAX_DRAW_ITEMS} items.`,
+        );
+      }
+      return true;
+    },
+    'ui.clearDraw': () => { clearPluginDrawList(manifest.id); return true; },
+
+    /*
+      A `status` row's line. Not saved with the document — see `uiStatus.ts`:
+      it is what the plugin currently believes, and a belief from last Tuesday
+      restored with the project is worse than no line at all.
+    */
+    'ui.setStatus': (panelIdRaw, param, text) => {
+      const panel = inspectorPanel(panelIdRaw);
+      const name = str(param, 'parameter name');
+      const schema = panel.params.find((p) => p.name === name);
+      if (!schema || schema.type !== 'status') {
+        return fail(
+          `"${name}" is not a "status" parameter of the inspector panel "${panel.id}". `
+          + `Declared status rows: ${panel.params.filter((p) => p.type === 'status').map((p) => p.name).join(', ') || 'none'}.`,
+        );
+      }
+      setPluginStatus(manifest.id, panel.id, name, text === null ? null : String(text));
+      return true;
+    },
+
+    /*
+      ── Contributed parameters ─────────────────────────────────────────
+
+      The values behind `contributes.inspector`. Read answers the DECLARED
+      default for anything the user has never touched, so a plugin never has to
+      carry a second copy of its own defaults, and never sees `undefined` for a
+      parameter its manifest says has a value.
+    */
+    'params.get': (layerId, panelIdRaw) => {
+      const panel = inspectorPanel(panelIdRaw);
+      const id = node(layerId).id;
+      return readPluginPanelValues(id, manifest.id, panel);
+    },
+    'params.set': (layerId, panelIdRaw, name, value) => {
+      const panel = inspectorPanel(panelIdRaw);
+      const id = node(layerId).id;
+      const paramName = str(name, 'parameter name');
+      const schema = panel.params.find((p) => p.name === paramName);
+      if (!schema) {
+        return fail(
+          `"${paramName}" is not a parameter of the inspector panel "${panel.id}". `
+          + `Declared: ${panel.params.map((p) => p.name).join(', ')}.`,
+        );
+      }
+      const axes = paramAxes(schema);
+      return edit(`set ${schema.label ?? paramName}`, () => {
+        if (axes.length > 0) {
+          const v = (value ?? {}) as Record<string, unknown>;
+          for (const axis of axes) {
+            if (typeof v[axis] !== 'number' || !Number.isFinite(v[axis])) {
+              return fail(`"${paramName}" is a ${schema.type}; pass { ${axes.join(', ')} } of finite numbers.`);
+            }
+          }
+          for (const axis of axes) {
+            writePluginParam(id, manifest.id, panel, schema, v[axis], axis);
+          }
+        } else {
+          writePluginParam(id, manifest.id, panel, schema, value);
+        }
+        notifyScene();
+        return true;
+      });
+    },
+
+    /*
+      A value for one of this plugin's expression functions.
+
+      Push, not reply: the host asks when an expression misses the cache, but a
+      plugin is equally entitled to provide values nobody has asked for yet —
+      and that is the case that makes `plugin.<ns>.<fn>()` feel synchronous,
+      because every call then hits. See `uiExpressions.ts`.
+    */
+    'expressions.provide': (name, args, value) => {
+      const fn = str(name, 'expression function name');
+      if (!manifest.contributes.expressions.some((e) => e.name === fn)) {
+        return fail(
+          `"${fn}" is not in "contributes.expressions". Declared: `
+          + `${manifest.contributes.expressions.map((e) => e.name).join(', ') || 'none'}.`,
+        );
+      }
+      const list = Array.isArray(args) ? args : [];
+      const nums = list.map((n) => finite(n, 'expression argument'));
+      if (!providePluginExpressionValue(manifest.id, fn, nums, value as number | number[])) {
+        return fail('An expression value must be a finite number, or an array of 2–4 finite numbers.');
+      }
+      return true;
+    },
 
     'commands.register': (spec) => {
       const s = spec as Partial<PluginCommandSpec>;
@@ -249,6 +403,30 @@ export function createHostApi(
     'composition.get': () => {
       const c = useCompositionStore.getState();
       return { name: c.name, width: c.width, height: c.height, fps: c.fps, durationSeconds: c.durationSeconds };
+    },
+
+    /*
+      ── The plugin's own package ──────────────────────────────────────────
+
+      `await motion.package.read('models/seg.onnx')` → the bytes, as an
+      `ArrayBuffer`; `read('shaders/blur.wgsl', 'text')` → the text.
+
+      What this is FOR: before it existed, a plugin that needed a WebAssembly
+      module, a lookup table, a font or a mesh had exactly one way to carry it —
+      base64 inside a `.js` file. That is the same bytes plus a third again,
+      decoded on every boot, and invisible to every size check that looks at a
+      file. The package already carried these files (see `pluginPackage.ts`);
+      there was simply no verb that could get at them.
+
+      It reads the INSTALLED payload, never a filesystem: the host resolves the
+      path inside the package record and has no way to express anything else.
+      That is why it needs no permission — see the note in `METHOD_PERMISSIONS`.
+    */
+    'package.read': async (path, as) => {
+      if (!hooks.readPackageFile) {
+        return fail('This host cannot read package files.');
+      }
+      return hooks.readPackageFile(path, as);
     },
     /*
       The project's other compositions.
@@ -539,6 +717,20 @@ export function createHostApi(
         return fail(`"${p}" is reserved. Set a layer kind's own property by its declared name.`);
       }
       /*
+        `fill` → `fillPaint`, for the name an author actually types. A gradient
+        object or a hex colour is rerouted to the fill stack; a CSS gradient
+        string is refused with the object form. See `normaliseFillWrite`.
+      */
+      let writeProp = p;
+      let writeValue = value;
+      const fillRoute = normaliseFillWrite(
+        p,
+        value,
+        n.components.some((c) => typeof (c.props as Record<string, unknown>).fill === 'string'),
+      );
+      if (fillRoute && !fillRoute.ok) return fail(fillRoute.message);
+      if (fillRoute?.ok) { writeProp = fillRoute.prop; writeValue = fillRoute.value; }
+      /*
         Structured values — a path, a gradient, a stroke.
 
         Routed by the VALUE's shape rather than by the prop name, so a scalar
@@ -546,8 +738,8 @@ export function createHostApi(
         way it always did. `planStructuredWrite` validates completely before it
         returns the applier, so a refusal here has changed nothing.
       */
-      if (value !== null && typeof value === 'object') {
-        const plan = planStructuredWrite(p, value, n.id);
+      if (writeValue !== null && typeof writeValue === 'object') {
+        const plan = planStructuredWrite(writeProp, writeValue, n.id);
         if (!plan.ok) return fail(plan.message);
         return edit(`set ${p}`, () => {
           plan.apply();
@@ -561,6 +753,16 @@ export function createHostApi(
           + `${STRUCTURED_PROP_NAMES.join(', ')}.`,
         );
       }
+      /*
+        Refused BY NAME before anything is written.
+
+        An unknown name used to fall through to the Transform below and be
+        written there — a key that renders nothing, animates nothing, and is
+        saved into the document. The refusal names the closest real property.
+        See `propValidation.ts` for what counts as known.
+      */
+      const problem = propertyProblem(n, p);
+      if (problem) return fail(problem);
       const target = n.components.find((c) => p in (c.props as Record<string, unknown>))
         ?? n.components.find((c) => c.type === 'Transform');
       if (!target) return fail(`Layer "${n.name}" has no component that can hold "${p}".`);
@@ -673,12 +875,7 @@ export function createHostApi(
     'effects.add': (id, type) => {
       const n = node(id);
       const t = str(type, 'effect type');
-      if (!effectDefFor(t)) {
-        return fail(
-          `"${t}" is not an effect this editor has. A plugin's own effect is addressed as `
-          + '"<pluginId>.<effectId>", and only once that plugin is running.',
-        );
-      }
+      if (!effectDefFor(t)) return fail(unknownEffectTypeMessage(t));
       return edit(`add ${t}`, () => {
         const before = new Set(getNodeEffects(n.id).map((e) => e.id));
         addEffect(n.id, t as never);
@@ -725,6 +922,16 @@ export function createHostApi(
       });
     },
 
+    /**
+     * An effect TYPE's parameters — ids, types, defaults and the ranges
+     * `setParam` enforces. Read from the same `EffectDef` the Effect Controls
+     * panel draws, so it cannot disagree with what the user sees.
+     */
+    'effects.describe': (type) => {
+      const t = str(type, 'effect type');
+      return describeEffect(t) ?? fail(unknownEffectTypeMessage(t));
+    },
+
     'effects.setParam': (id, effectId, key, value) => {
       const n = node(id);
       const fx = str(effectId, 'effect id');
@@ -732,8 +939,24 @@ export function createHostApi(
       if (typeof value !== 'number' && typeof value !== 'string' && typeof value !== 'boolean') {
         return fail('Effect parameter values must be a number, string or boolean.');
       }
-      if (!getNodeEffects(n.id).some((e) => e.id === fx)) {
+      const target = getNodeEffects(n.id).find((e) => e.id === fx);
+      if (!target) {
         return fail(`"${n.name}" has no effect "${fx}".`);
+      }
+      /*
+        Checked against the effect's DEFINITION: the key must be one of its
+        params and the value must fit its type and min/max. Both used to be
+        stored as sent — a `blur` beside the real `softness`, a 0.5 where the
+        range is 0–100 — and reported as success.
+
+        Skipped only when the definition is not loaded (a plugin effect whose
+        plugin is stopped): there is nothing to check against, and refusing
+        would block editing a document that is otherwise fine.
+      */
+      const def = effectDefFor(target.type);
+      if (def) {
+        const problem = effectParamProblem(def, k, value);
+        if (problem) return fail(problem);
       }
       return edit(`set ${k}`, () => {
         updateEffectParam(n.id, fx, k, value as never);
@@ -753,20 +976,37 @@ export function createHostApi(
       defaultAnimation.sample(node(id).id, str(prop, 'property') as never, finite(time, 'time')) ?? null,
 
     // ── Animation, write ─────────────────────────────────────────────────
+    /*
+      Both keyframe writers go through `planKeyframeWrites`, which does two
+      things the old `finite(value)` could not:
+
+        • TYPED values. A colour becomes the four `<prop>_r/_g/_b/_a` channel
+          tracks and a point its axis tracks — the representation the renderer
+          and `ColorKfRow` already use — instead of "must be a finite number".
+        • KNOWN tracks. An unknown name is refused, naming the closest real one,
+          rather than creating a track nothing reads.
+
+      The plan is complete before `edit` opens, so a refusal has written nothing.
+    */
     'animation.setKeyframe': (id, prop, time, value, easing) => {
       const n = node(id);
-      const p = str(prop, 'property') as never;
+      const p = str(prop, 'property');
       const t = finite(time, 'time');
-      const v = finite(value, 'value');
-      return edit(`keyframe ${String(prop)}`, () => {
-        defaultAnimation.setKeyframe(n.id, p, t, v, typeof easing === 'string' ? (easing as never) : undefined);
+      const writes = planKeyframeWrites(n, p, [
+        { t, value, ...(typeof easing === 'string' ? { easing } : {}) },
+      ]);
+      return edit(`keyframe ${p}`, () => {
+        for (const w of writes) {
+          const k = w.keyframes[0]!;
+          defaultAnimation.setKeyframe(n.id, w.path as never, k.t, k.value, k.easing as never);
+        }
         return true;
       });
     },
 
     'animation.setKeyframes': (id, prop, kfs) => {
       const n = node(id);
-      const p = str(prop, 'property') as never;
+      const p = str(prop, 'property');
       if (!Array.isArray(kfs)) return fail('setKeyframes expects an array.');
       if (kfs.length > MAX_KEYFRAMES_PER_CALL) {
         return fail(`A single call may write at most ${MAX_KEYFRAMES_PER_CALL} keyframes.`);
@@ -775,14 +1015,15 @@ export function createHostApi(
         const o = (k ?? {}) as Record<string, unknown>;
         return {
           t: finite(o.t, `keyframe[${i}].t`),
-          value: finite(o.value, `keyframe[${i}].value`),
-          ...(typeof o.easing === 'string' ? { easing: o.easing as never } : {}),
+          value: o.value,
+          ...(typeof o.easing === 'string' ? { easing: o.easing } : {}),
         };
       });
-      return edit(`animate ${String(prop)}`, () => {
-        // The bulk API: one sort, one notification. Writing these one at a time
-        // is what made generated tracks freeze the app.
-        defaultAnimation.setKeyframes(n.id, p, clean);
+      const writes = planKeyframeWrites(n, p, clean);
+      return edit(`animate ${p}`, () => {
+        // The bulk API: one sort, one notification PER TRACK. Writing these one
+        // at a time is what made generated tracks freeze the app.
+        for (const w of writes) defaultAnimation.setKeyframes(n.id, w.path as never, w.keyframes as never);
         return true;
       });
     },

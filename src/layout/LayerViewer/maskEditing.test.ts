@@ -40,6 +40,17 @@ describe('mask editing geometry', () => {
     expect(moveHandle(pts, 0, 'in', 10, 0, true)[0]).toMatchObject({ inX: 10, inY: 0, outX: 10, outY: 10 });
   });
 
+  it('keeps the opposite handle\'s LENGTH on a smooth vertex, mirroring only its direction (AE)', () => {
+    const pts = [{ x: 0, y: 0, inX: -10, inY: 0, outX: 30, outY: 0 }];
+    const [p] = moveHandle(pts, 0, 'out', 0, 30, false);
+    expect(p).toMatchObject({ outX: 0, outY: 30 });
+    expect(p!.inX).toBeCloseTo(0);
+    expect(p!.inY).toBeCloseTo(-10); // was -30: the short side was stretched to match
+    const [q] = moveHandle(pts, 0, 'in', 0, -5, false);
+    expect(q!.outX).toBeCloseTo(0);
+    expect(q!.outY).toBeCloseTo(30);
+  });
+
   it('builds rectangle and ellipse masks from a drag, ignoring a click', () => {
     const rect = maskFromDrag('rect', -50, -20, 50, 40)!;
     expect(rect.closed).toBe(true);
@@ -56,5 +67,15 @@ describe('mask editing geometry', () => {
     const path = penPath([corner(0, 0), corner(10, 0), corner(5, 8)], 'p')!;
     expect(path).toMatchObject({ id: 'p', closed: true, mode: 'add' });
     expect(path.points).toHaveLength(3);
+  });
+});
+
+describe('moveHandle — broken pairs stay broken', () => {
+  it('an Alt drag marks the vertex broken, and a later plain drag keeps it that way', () => {
+    const pts = [{ x: 0, y: 0, inX: -10, inY: 0, outX: 10, outY: 0 }];
+    const [a] = moveHandle(pts, 0, 'out', 10, 10, true);
+    expect(a).toMatchObject({ outX: 10, outY: 10, inX: -10, inY: 0, broken: true });
+    const [b] = moveHandle([a!], 0, 'out', 0, 20, false);
+    expect(b).toMatchObject({ outX: 0, outY: 20, inX: -10, inY: 0, broken: true });
   });
 });

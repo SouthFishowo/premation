@@ -27,6 +27,24 @@ export interface ParsedShape {
   fillPaint?: ParsedGradientFill;
   strokeColor?: string;
   strokeWidth?: number;
+  /**
+   * Resolved `stroke-linecap` / `stroke-linejoin` / `stroke-miterlimit` /
+   * `stroke-dasharray` / `stroke-dashoffset` (all inherited), in SVG user units.
+   * Absent means the SVG initial value (butt / miter / 4 / none / 0).
+   */
+  strokeCap?: 'butt' | 'round' | 'square';
+  strokeJoin?: 'miter' | 'round' | 'bevel';
+  strokeMiterLimit?: number;
+  strokeDash?: number[];
+  strokeDashOffset?: number;
+  /** `vector-effect: non-scaling-stroke` — the width ignores the import scale. */
+  nonScalingStroke?: boolean;
+  /**
+   * `paint-order` paints the stroke BEFORE the fill (`stroke`, `stroke fill`,
+   * `markers stroke` …), so the fill covers the stroke's inner half — AE's fill
+   * Composite "Above Previous". Absent for the SVG default (fill, then stroke).
+   */
+  fillAboveStroke?: boolean;
   /** false for open outlines (polyline / line / paths without Z). */
   closed: boolean;
   /**
@@ -800,6 +818,21 @@ interface StyleCtx {
   fill?: string;
   stroke?: string;
   strokeWidth?: number;
+  /** Inherited stroke geometry — see `ParsedShape.strokeCap` and friends. */
+  strokeLinecap?: 'butt' | 'round' | 'square';
+  strokeLinejoin?: 'miter' | 'round' | 'bevel';
+  strokeMiterlimit?: number;
+  /** [] = explicitly `none`. */
+  strokeDasharray?: number[];
+  strokeDashoffset?: number;
+  /** Inherited `paint-order` puts stroke before fill — see `ParsedShape.fillAboveStroke`. */
+  paintOrderStrokeFirst?: boolean;
+  /**
+   * NOT inherited (`vector-effect` and `pathLength` apply to the element that
+   * declares them), so `resolveStyle` resets both on every element.
+   */
+  nonScalingStroke?: boolean;
+  pathLength?: number;
   /** The `color` property, so `currentColor` resolves the way a browser does. */
   color?: string;
   /**
@@ -847,9 +880,34 @@ function parseInlineStyle(style: string | null): Map<string, string> {
 /** Presentation properties read off an element, in cascade order. */
 const PRESENTATION_ATTRS = [
   'fill', 'stroke', 'stroke-width', 'opacity', 'fill-opacity', 'stroke-opacity',
+  'stroke-linecap', 'stroke-linejoin', 'stroke-miterlimit', 'stroke-dasharray', 'stroke-dashoffset',
+  'paint-order',
+  'vector-effect',
   'color', 'display', 'visibility',
   'font-size', 'font-family', 'font-weight', 'font-style', 'text-anchor',
 ] as const;
+
+/**
+ * A `stroke-dasharray` in user units: [] for `none` (or a pattern that cannot
+ * draw a dash), undefined to keep the inherited one (`inherit`, or a value the
+ * spec calls invalid — percentages and negatives among them, which a browser
+ * also ignores).
+ */
+function parseDashArray(raw: string | undefined): number[] | undefined {
+  if (raw === undefined) return undefined;
+  const s = raw.trim().toLowerCase();
+  if (s === 'inherit' || s === '') return undefined;
+  if (s === 'none') return [];
+  const parts = s.split(/[\s,]+/).filter(Boolean);
+  const out: number[] = [];
+  for (const p of parts) {
+    if (p.endsWith('%')) return undefined;
+    const n = absoluteLength(p);
+    if (n === undefined || !Number.isFinite(n) || n < 0) return undefined;
+    out.push(n);
+  }
+  return out.some((n) => n > 0) ? out : [];
+}
 
 /** The root font size `rem` resolves against — CSS's initial value. */
 const ROOT_FONT_SIZE = 16;
@@ -939,6 +997,39 @@ function resolveStyle(
     const n = parseFloat(sw);
     if (Number.isFinite(n)) next.strokeWidth = n;
   }
+
+  // Stroke geometry. Inherited like `stroke-width`; unknown keywords keep the
+  // inherited value, which is what a browser does with an invalid declaration.
+  const cap = d.get('stroke-linecap')?.trim().toLowerCase();
+  if (cap === 'butt' || cap === 'round' || cap === 'square') next.strokeLinecap = cap;
+  const join = d.get('stroke-linejoin')?.trim().toLowerCase();
+  if (join === 'round' || join === 'bevel' || join === 'miter') next.strokeLinejoin = join;
+  // SVG 2's `miter-clip` and `arcs` fall back to a miter in every renderer.
+  else if (join === 'miter-clip' || join === 'arcs') next.strokeLinejoin = 'miter';
+  const ml = d.get('stroke-miterlimit');
+  if (ml != null) {
+    const n = Number.parseFloat(ml);
+    if (Number.isFinite(n) && n >= 1) next.strokeMiterlimit = n;
+  }
+  const dashes = parseDashArray(d.get('stroke-dasharray'));
+  if (dashes !== undefined) next.strokeDasharray = dashes;
+  const dof = d.get('stroke-dashoffset');
+  if (dof != null) {
+    const n = absoluteLength(dof.trim());
+    if (n !== undefined && Number.isFinite(n)) next.strokeDashoffset = n;
+  }
+  // `paint-order`, inherited: the listed keywords come first, the rest follow
+  // in the default order (fill, stroke, markers). Only whether STROKE precedes
+  // FILL matters here — that is a fill painted over the stroke's inner half.
+  const po = d.get('paint-order')?.trim().toLowerCase();
+  if (po) {
+    const listed = po === 'normal' ? [] : po.split(/\s+/);
+    const order = [...listed, ...['fill', 'stroke', 'markers'].filter((k) => !listed.includes(k))];
+    next.paintOrderStrokeFirst = order.indexOf('stroke') < order.indexOf('fill') || undefined;
+  }
+  next.nonScalingStroke = d.get('vector-effect')?.trim().toLowerCase() === 'non-scaling-stroke' || undefined;
+  const pl = Number(el.getAttribute('pathLength'));
+  next.pathLength = Number.isFinite(pl) && pl > 0 ? pl : undefined;
 
   // Group opacity MULTIPLIES down; fill/stroke opacity are inherited outright.
   const op = parseAlpha(d.get('opacity'));
@@ -1758,6 +1849,23 @@ export function parseSvgToShapes(svgContent: string, opts?: SvgParseOptions): Pa
     const strokeRaw = resolvePaint(r.style.stroke);
     const strokeColor = strokeRaw && strokeRaw !== 'none' ? strokeRaw : undefined;
     const strokeWidth = r.style.strokeWidth != null && Number.isFinite(r.style.strokeWidth) ? r.style.strokeWidth : undefined;
+    // Dashes are measured in `pathLength` units when the element declares one,
+    // and converting needs the true arc length — so such a pattern is dropped
+    // (solid, the fully-drawn state) rather than laid down at the wrong scale.
+    const dash = r.style.strokeDasharray && r.style.strokeDasharray.length > 0 && r.style.pathLength === undefined
+      ? r.style.strokeDasharray
+      : undefined;
+    const strokeGeometry = strokeColor
+      ? {
+        ...(r.style.strokeLinecap && r.style.strokeLinecap !== 'butt' ? { strokeCap: r.style.strokeLinecap } : {}),
+        ...(r.style.strokeLinejoin && r.style.strokeLinejoin !== 'miter' ? { strokeJoin: r.style.strokeLinejoin } : {}),
+        ...(r.style.strokeMiterlimit !== undefined && r.style.strokeMiterlimit !== 4 ? { strokeMiterLimit: r.style.strokeMiterlimit } : {}),
+        ...(dash ? { strokeDash: dash } : {}),
+        ...(dash && r.style.strokeDashoffset ? { strokeDashOffset: r.style.strokeDashoffset } : {}),
+        ...(r.style.nonScalingStroke ? { nonScalingStroke: true } : {}),
+        ...(r.style.paintOrderStrokeFirst ? { fillAboveStroke: true } : {}),
+      }
+      : {};
 
     // Budget is spent across the whole file, not per shape: one pathological
     // artwork must not be able to generate work the app cannot absorb. Past the
@@ -1780,6 +1888,7 @@ export function parseSvgToShapes(svgContent: string, opts?: SvgParseOptions): Pa
       ...(fillPaint ? { fillPaint } : {}),
       strokeColor,
       strokeWidth,
+      ...strokeGeometry,
       closed: r.closed,
       ...(centeredRuns ? { subpaths: centeredRuns } : {}),
       width,

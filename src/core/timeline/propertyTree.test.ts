@@ -147,6 +147,25 @@ describe('a row only promises what the engine keeps', () => {
     expect(buildStaticPropertyTree('a').some((r) => r.group === 'material')).toBe(false);
   });
 
+  it('lists Geometry Options (keyframeable depths) on a 3D shape, above Material Options', () => {
+    defaultSceneGraph.addNode(node('g', 'shape', { z: 0 }));
+    const tree = buildStaticPropertyTree('g');
+    const rows = tree.filter((r) => r.group === 'geometry');
+    // A rect has no counters, so no Hole Bevel Depth.
+    expect(rows.map((r) => r.prop)).toEqual(['bevelDepth', 'extrusionDepth']);
+    for (const r of rows) expect(r.members).toEqual([r.prop]);
+    expect(rows.map((r) => r.label)).toEqual(['Bevel Depth', 'Extrusion Depth']);
+    const firstMaterial = tree.findIndex((r) => r.group === 'material');
+    expect(tree.findIndex((r) => r.group === 'geometry')).toBeLessThan(firstMaterial);
+  });
+
+  it('a 3D text layer also gets Hole Bevel Depth; a 2D layer gets no Geometry Options', () => {
+    defaultSceneGraph.addNode(node('tx', 'text', { z: 0 }));
+    expect(buildStaticPropertyTree('tx').filter((r) => r.group === 'geometry').map((r) => r.prop))
+      .toEqual(['bevelDepth', 'holeBevelDepth', 'extrusionDepth']);
+    expect(buildStaticPropertyTree('a').some((r) => r.group === 'geometry')).toBe(false);
+  });
+
   it('collapses Position into one row, and splits it when dimensions separate', () => {
     const merged = buildStaticPropertyTree('a').find((r) => r.merged);
     expect(merged?.members).toEqual(['x', 'y']);

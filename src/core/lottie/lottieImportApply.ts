@@ -173,9 +173,31 @@ export function applyImportPlan(
     // Paints. A gradient goes on as a real gradient rather than being dropped:
     // dropping it left the node on the scene facade's PLACEHOLDER colour, which
     // is how a green button imported as blue.
-    if (L.fill) setNodeFill(nodeId, toFillPaint(L.fill));
+    // A fill's paint-op fields (Lottie `bm`, and Composite Above when the file
+    // lists its fill ahead of its stroke) ride the paint object, as the Fill
+    // rows write them.
+    if (L.fill) {
+      setNodeFill(nodeId, {
+        ...toFillPaint(L.fill),
+        ...(L.fill.blendMode ? { blendMode: L.fill.blendMode } : {}),
+        ...(L.fill.composite === 'above' ? { composite: 'above' as const } : {}),
+      } as FillPaint);
+    }
     if (L.stroke && L.stroke.width > 0) {
-      setNodeStroke(nodeId, { ...defaultStroke(L.stroke.color), width: L.stroke.width, opacity: L.stroke.opacity });
+      const st = L.stroke;
+      setNodeStroke(nodeId, {
+        ...defaultStroke(st.color),
+        width: st.width,
+        opacity: st.opacity,
+        ...(st.cap ? { cap: st.cap } : {}),
+        ...(st.join ? { join: st.join } : {}),
+        ...(st.miterLimit !== undefined ? { miterLimit: st.miterLimit } : {}),
+        ...(st.dash ? { dash: st.dash } : {}),
+        ...(st.dashOffset !== undefined ? { dashOffset: st.dashOffset } : {}),
+        ...(st.paint ? { paint: toFillPaint(st.paint) } : {}),
+        ...(st.paint && st.gradient ? { gradient: st.gradient } : {}),
+        ...(st.blendMode ? { blendMode: st.blendMode } : {}),
+      });
     }
 
     // The facade owns the comp→layer time conversion; going through it keeps
@@ -193,6 +215,14 @@ export function applyImportPlan(
       tracks.set(`${nodeId} ${tr.prop}`, { nodeId, prop: tr.prop, keyframes: toKeyframes(tr.keyframes, shift) });
     }
 
+    // Animated stroke channels (width / colour / opacity-as-alpha / dash
+    // offset), on the paths buildSnapshot folds into the primary stroke.
+    if (L.stroke && L.stroke.width > 0) {
+      for (const tr of L.stroke.tracks ?? []) {
+        tracks.set(`${nodeId} ${tr.prop}`, { nodeId, prop: tr.prop, keyframes: toKeyframes(tr.keyframes, 0) });
+      }
+    }
+
     // Trim Paths: one trim operator on the drawable, its animated channels
     // keyed onto the operator's own id-scoped prop paths — the same tracks
     // the Path Operators card and the timeline's Contents tree edit.
@@ -202,7 +232,7 @@ export function applyImportPlan(
         start: L.trim.start,
         end: L.trim.end,
         offset: L.trim.offset,
-        trimMultiple: L.trim.multiple,
+        trimMultipleShapes: L.trim.multiple,
       };
       addPathOp(nodeId, op);
       for (const tr of L.trim.tracks) {

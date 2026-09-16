@@ -82,6 +82,19 @@ interface LottieShapeItem {
   sk?: LottieProp; // skew (tr) — warned, not applied
   /** Trim Paths mode (tm): 1 = simultaneously, 2 = individually. */
   m?: number;
+  /** Stroke line cap (st/gs): 1 butt, 2 round, 3 projecting (square). */
+  lc?: number;
+  /** Stroke line join (st/gs): 1 miter, 2 round, 3 bevel. */
+  lj?: number;
+  /** Stroke miter limit (st/gs) — a plain number; newer exports add `ml2`. */
+  ml?: number;
+  ml2?: LottieProp;
+  /** Stroke dashes (st/gs): `d` dash, `g` gap, `o` offset, in list order. */
+  d?: Array<{ n?: string; nm?: string; v?: LottieProp }>;
+  /** Radial gradient highlight length, −100..100 % (gf/gs). The highlight ANGLE is `a`. */
+  h?: LottieProp;
+  /** Paint blend mode (fl/st/gf/gs): bodymovin's BlendMode enum. */
+  bm?: number;
   nm?: string;
 }
 interface LottieLayer {
@@ -167,6 +180,10 @@ export interface PlannedFill {
   radius?: number;
   stops?: PlannedStop[];
   opacityStops?: Array<{ offset: number; opacity: number }>;
+  /** Lottie `bm`, when not Normal. */
+  blendMode?: PaintBlendMode;
+  /** 'above' when the group lists this fill BEFORE its stroke — Lottie draws the first paint on top. */
+  composite?: 'above';
 }
 /**
  * A Lottie `tm` (Trim Paths) in force for a drawable — the editor's trim
@@ -182,10 +199,32 @@ export interface PlannedTrim {
   multiple: 'individually' | 'simultaneously';
   tracks: PlannedScalarTrack[];
 }
+/**
+ * A resolved Lottie `st` / `gs`. The optional fields are present only when the
+ * file said something, so a plain stroke plans exactly as it always did.
+ *
+ * Animated channels ride along as `tracks` on the keyframe paths the renderer
+ * folds into the primary stroke (`strokeWidth`, `stroke_r|g|b|a`,
+ * `strokeDashOffset` — see buildSnapshot), the same way `PlannedTrim` carries
+ * its tracks, so they survive the single-drawable host collapse with the stroke.
+ */
 export interface PlannedStroke {
   color: string;
   width: number;
   opacity: number;
+  cap?: 'butt' | 'round' | 'square';
+  join?: 'miter' | 'round' | 'bevel';
+  miterLimit?: number;
+  /** Dash pattern in px ([d, g, d, g, …]). */
+  dash?: number[];
+  dashOffset?: number;
+  /** Gradient stroke paint (`gs`). Its opacity lives on `opacity`, not in here. */
+  paint?: PlannedFill;
+  /** A `gs`'s free Start/End points and highlight, relative to the drawable's box. */
+  gradient?: StrokeGradientGeometry;
+  /** Lottie `bm`, when not Normal. */
+  blendMode?: PaintBlendMode;
+  tracks?: PlannedScalarTrack[];
 }
 
 export type PlannedKind = 'shape' | 'text' | 'image' | 'null' | 'solid' | 'group';
@@ -398,6 +437,138 @@ function planGradient(
   return base;
 }
 
+const LOTTIE_CAPS = { 1: 'butt', 2: 'round', 3: 'square' } as const;
+const LOTTIE_JOINS = { 1: 'miter', 2: 'round', 3: 'bevel' } as const;
+
+/** An animated channel's keyframe list (≥ 2 keys), or undefined when static. */
+function animatedKfs(lp: LottieProp | undefined, comp: number, fr: number, mul = 1): PlannedScalarKf[] | undefined {
+  const c = channel(lp, comp, fr, mul);
+  return c.kfs && c.kfs.length >= 2 ? c.kfs : undefined;
+}
+
+import { strokeTrackPath, dashParamAt } from '@core/rendering/strokeTracks';
+import { lottieBlendToPaint, type PaintBlendMode } from '@core/rendering/raster/paintBlend';
+import type { StrokeGradientGeometry } from '@core/paint/stroke';
+
+/**
+ * Lottie `st` / `gs` → a planned stroke: colour or gradient paint, width,
+ * opacity, cap (`lc`), join (`lj`), miter limit (`ml`/`ml2`), dashes (`d`),
+ * blend mode (`bm`), and for a gradient its Start/End points (`s`/`e`) and
+ * radial highlight (`h` length %, `a` angle °) — with every ANIMATED channel
+ * (width, colour, opacity, miter limit, each dash/gap, dash offset, the
+ * gradient points and highlight) as a keyframe track on the path
+ * `resolveStrokeTracks` folds for the PRIMARY stroke.
+ *
+ * Opacity is a real `strokeOpacity` track since 2026-09-15. It used to be keyed
+ * through `stroke_a` — the colour's alpha, the only opacity the renderer then
+ * sampled — which forced three held colour tracks onto every fade and could not
+ * fade a gradient stroke at all.
+ */
+function planStroke(
+  it: LottieShapeItem,
+  fr: number,
+  box: { x0: number; y0: number; x1: number; y1: number } | null,
+  ctx: { hostName: string; warnings: string[] },
+): PlannedStroke | undefined {
+  const tracks: PlannedScalarTrack[] = [];
+  let out: PlannedStroke;
+  if (it.ty === 'gs') {
+    const g = planGradient(it, fr, box);
+    if (!g) return undefined;
+    out = { color: g.color, width: 0, opacity: g.opacity, paint: { ...g, opacity: 1 } };
+    // AE's free Start/End points, relative to the drawable's box — the only
+    // frame the model can store them in, so without a box the gradient keeps
+    // the angle/centre reading `planGradient` gave it.
+    if (box) {
+      const w = Math.max(1e-6, box.x1 - box.x0);
+      const h = Math.max(1e-6, box.y1 - box.y0);
+      const rel = (v: number, axis: 0 | 1): number => (axis === 0 ? (v - box.x0) / w : (v - box.y0) / h);
+      const hl = staticOf(it.h, 0, fr, 0) / 100;
+      const ha = staticOf(it.a, 0, fr, 0);
+      out.gradient = {
+        startX: rel(staticOf(it.s, 0, fr), 0), startY: rel(staticOf(it.s, 1, fr), 1),
+        endX: rel(staticOf(it.e, 0, fr), 0), endY: rel(staticOf(it.e, 1, fr), 1),
+        ...(it.t === 2 && hl !== 0 ? { highlightLength: Math.max(-1, Math.min(1, hl)) } : {}),
+        ...(it.t === 2 && ha !== 0 ? { highlightAngle: ha } : {}),
+      };
+      const pointTrack = (lp: LottieProp | undefined, axis: 0 | 1, param: 'gradientStartX' | 'gradientStartY' | 'gradientEndX' | 'gradientEndY'): void => {
+        const k = animatedKfs(lp, axis, fr);
+        if (k) tracks.push({ prop: strokeTrackPath(0, param), keyframes: k.map((kf) => ({ ...kf, value: rel(kf.value, axis) })) });
+      };
+      pointTrack(it.s, 0, 'gradientStartX');
+      pointTrack(it.s, 1, 'gradientStartY');
+      pointTrack(it.e, 0, 'gradientEndX');
+      pointTrack(it.e, 1, 'gradientEndY');
+      if (it.t === 2) {
+        const hk = animatedKfs(it.h, 0, fr, 1 / 100);
+        if (hk) tracks.push({ prop: strokeTrackPath(0, 'highlightLength'), keyframes: hk });
+        const ak = animatedKfs(it.a, 0, fr);
+        if (ak) tracks.push({ prop: strokeTrackPath(0, 'highlightAngle'), keyframes: ak });
+      }
+    }
+  } else {
+    const hex = hexFromLottieColor(it.c);
+    if (!hex) return undefined;
+    out = { color: hex, width: 0, opacity: Math.max(0, Math.min(1, staticOf(it.o, 0, fr, 100) / 100)) };
+    const rgb = [0, 1, 2].map((i) => animatedKfs(it.c, i, fr));
+    if (rgb[0] && rgb[1] && rgb[2]) {
+      tracks.push({ prop: 'stroke_r', keyframes: rgb[0] }, { prop: 'stroke_g', keyframes: rgb[1] }, { prop: 'stroke_b', keyframes: rgb[2] });
+    }
+  }
+  // Opacity, for `st` and `gs` alike. The static value stays the first key —
+  // what the stroke falls back to if the track is ever removed.
+  const alpha = animatedKfs(it.o, 0, fr, 1 / 100);
+  if (alpha) {
+    tracks.push({ prop: strokeTrackPath(0, 'opacity'), keyframes: alpha.map((k) => ({ ...k, value: Math.max(0, Math.min(1, k.value)) })) });
+  }
+
+  // Width. A stroke whose first key is 0 would be dropped as "no stroke" by
+  // the reader before its track could ever widen it, so the stored base is the
+  // widest key (the track overrides it at every frame anyway).
+  const wk = animatedKfs(it.w, 0, fr);
+  out.width = wk ? Math.max(...wk.map((k) => k.value)) : staticOf(it.w, 0, fr, 1);
+  if (wk) tracks.push({ prop: 'strokeWidth', keyframes: wk });
+
+  const cap = LOTTIE_CAPS[it.lc as keyof typeof LOTTIE_CAPS];
+  if (cap) out.cap = cap;
+  const join = LOTTIE_JOINS[it.lj as keyof typeof LOTTIE_JOINS];
+  if (join) out.join = join;
+  const ml = typeof it.ml === 'number' ? it.ml : it.ml2 ? staticOf(it.ml2, 0, fr, 4) : undefined;
+  if (ml !== undefined && Number.isFinite(ml)) out.miterLimit = Math.max(1, ml);
+  // `ml2` is the ANIMATABLE miter limit newer exporters write beside `ml`.
+  const mlk = animatedKfs(it.ml2, 0, fr);
+  if (mlk) tracks.push({ prop: strokeTrackPath(0, 'miterLimit'), keyframes: mlk.map((k) => ({ ...k, value: Math.max(1, k.value) })) });
+
+  const blend = lottieBlendToPaint(it.bm);
+  if (blend) out.blendMode = blend;
+
+  if (Array.isArray(it.d) && it.d.length > 0) {
+    const dash: number[] = [];
+    let dropped = false;
+    for (const entry of it.d) {
+      if (entry.n === 'o') {
+        out.dashOffset = staticOf(entry.v, 0, fr, 0);
+        const ok = animatedKfs(entry.v, 0, fr);
+        if (ok) tracks.push({ prop: 'strokeDashOffset', keyframes: ok });
+      } else if (entry.n === 'd' || entry.n === 'g') {
+        // Each dash/gap slot animates on its own track — AE's three pairs.
+        const slot = dashParamAt(dash.length);
+        const kfs = animatedKfs(entry.v, 0, fr);
+        if (kfs && slot) tracks.push({ prop: strokeTrackPath(0, slot), keyframes: kfs.map((k) => ({ ...k, value: Math.max(0, k.value) })) });
+        else if (kfs) dropped = true;
+        dash.push(Math.max(0, staticOf(entry.v, 0, fr, 0)));
+      }
+    }
+    if (dropped) ctx.warnings.push(`Layer "${ctx.hostName}": dash/gap animation past the third pair imported static.`);
+    // An all-zero pattern draws a solid line in every player; say so directly.
+    if (dash.some((v) => v > 0)) out.dash = dash;
+    else delete out.dashOffset;
+  }
+
+  if (tracks.length > 0) out.tracks = tracks;
+  return out;
+}
+
 // ── Shape trees ────────────────────────────────────────────────────
 
 /** Paint in force for a group's drawables (inherited by nested groups). */
@@ -471,36 +642,44 @@ function planShapeItems(
   // A group's paint operators are listed alongside (usually after) its paths
   // and apply to all of them, so resolve this level's paint up front.
   const scope: PaintScope = { ...inherited };
+  // Lottie draws a group's FIRST paint on top. A fill listed before this level's
+  // stroke is therefore drawn OVER it — AE's Composite "Above Previous" on the
+  // fill, which is how the engine's paint stack says the same thing.
+  let strokeSeen = false;
+  const fillOps = (it: LottieShapeItem): Pick<PlannedFill, 'blendMode'> => {
+    const blend = lottieBlendToPaint(it.bm);
+    return blend ? { blendMode: blend } : {};
+  };
+  const markFillAbove = (fill: PlannedFill): PlannedFill =>
+    (strokeSeen ? fill : { ...fill, composite: 'above' });
+  let levelFill: LottieShapeItem | null = null;
   for (const it of items) {
     switch (it.ty) {
       case 'fl': {
         const hex = hexFromLottieColor(it.c);
-        if (hex) scope.fill = { type: 'solid', color: hex, opacity: Math.max(0, Math.min(1, staticOf(it.o, 0, fr, 100) / 100)) };
+        if (hex) {
+          scope.fill = { type: 'solid', color: hex, opacity: Math.max(0, Math.min(1, staticOf(it.o, 0, fr, 100) / 100)), ...fillOps(it) };
+          levelFill = it;
+        }
         break;
       }
       case 'gf': {
         const g = planGradient(it, fr, null);
-        if (g) scope.fill = g;
-        else ctx.warnings.push(`Layer "${ctx.hostName}": a gradient fill had no readable stops — left unpainted.`);
-        break;
-      }
-      case 'st': {
-        const hex = hexFromLottieColor(it.c);
-        if (hex) {
-          scope.stroke = {
-            color: hex,
-            width: staticOf(it.w, 0, fr, 1),
-            opacity: Math.max(0, Math.min(1, staticOf(it.o, 0, fr, 100) / 100)),
-          };
-        }
-        break;
-      }
-      case 'gs': {
-        const g = planGradient(it, fr, null);
         if (g) {
-          scope.stroke = { color: g.color, width: staticOf(it.w, 0, fr, 1), opacity: g.opacity };
-          ctx.warnings.push(`Layer "${ctx.hostName}": gradient STROKE flattened to its first stop (gradient strokes are not supported).`);
-        }
+          scope.fill = { ...g, ...fillOps(it) };
+          levelFill = it;
+        } else ctx.warnings.push(`Layer "${ctx.hostName}": a gradient fill had no readable stops — left unpainted.`);
+        break;
+      }
+      case 'st':
+      case 'gs': {
+        const st = planStroke(it, fr, null, ctx);
+        if (st) {
+          scope.stroke = st;
+          // Only a fill of THIS level, already seen, sits above this stroke.
+          if (levelFill && !strokeSeen && scope.fill) scope.fill = markFillAbove(scope.fill);
+          strokeSeen = true;
+        } else if (it.ty === 'gs') ctx.warnings.push(`Layer "${ctx.hostName}": a gradient stroke had no readable stops — left unstroked.`);
         break;
       }
       case 'tm': {
@@ -628,7 +807,12 @@ function planShapeItems(
       node.fill = fill;
       node.staticProps.fill = fill.color; // flat fallback for solid readers
     }
-    if (scope.stroke) node.stroke = scope.stroke;
+    let stroke = scope.stroke;
+    if (stroke?.paint?.type === 'radial' && box) {
+      const src = items.find((x) => x.ty === 'gs');
+      if (src) stroke = planStroke(src, fr, box, ctx) ?? stroke;
+    }
+    if (stroke) node.stroke = stroke;
     if (scope.trim) node.trim = scope.trim;
 
     ctx.out.push(node);

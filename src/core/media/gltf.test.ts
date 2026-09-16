@@ -98,6 +98,48 @@ function quadBin(): { bin: Uint8Array; json: Record<string, unknown> } {
   return { bin, json };
 }
 
+describe('parseGltf — required extensions and sparse accessors', () => {
+  it('refuses a Draco-compressed file instead of importing empty geometry', () => {
+    const { bin, json } = quadBin();
+    const glb = buildGlb({ ...json, extensionsUsed: ['KHR_draco_mesh_compression'], extensionsRequired: ['KHR_draco_mesh_compression'] }, bin);
+    expect(() => parseGltf(glb)).toThrow(/KHR_draco_mesh_compression.*Draco-compressed/);
+  });
+
+  it('still reads a file whose only required extension is one it supports', () => {
+    const { bin, json } = quadBin();
+    const parsed = parseGltf(buildGlb({ ...json, extensionsRequired: ['KHR_texture_transform'] }, bin));
+    expect(parsed.meshes[0]!.primitives[0]!.positions).toHaveLength(12);
+  });
+
+  it('applies a SPARSE morph target over its all-zero base (Blender blend shapes)', () => {
+    const { bin: base, json } = quadBin();
+    // Sparse payload: vertex 2 moves by (0, 0, 5). uint16 index + vec3 float value.
+    const idx = new Uint16Array([2]);
+    const val = new Float32Array([0, 0, 5]);
+    const idxOff = base.length + pad4(base.length);
+    const valOff = idxOff + idx.byteLength + pad4(idx.byteLength);
+    const bin = new Uint8Array(valOff + val.byteLength);
+    bin.set(base, 0);
+    bin.set(new Uint8Array(idx.buffer), idxOff);
+    bin.set(new Uint8Array(val.buffer), valOff);
+    const j = json as { buffers: unknown[]; bufferViews: unknown[]; accessors: unknown[]; meshes: Array<{ primitives: Array<Record<string, unknown>> }> };
+    j.buffers = [{ byteLength: bin.length }];
+    j.bufferViews = [...j.bufferViews,
+      { buffer: 0, byteOffset: idxOff, byteLength: idx.byteLength },
+      { buffer: 0, byteOffset: valOff, byteLength: val.byteLength },
+    ];
+    const iv = j.bufferViews.length - 2;
+    j.accessors = [...j.accessors, {
+      componentType: 5126, count: 4, type: 'VEC3',
+      sparse: { count: 1, indices: { bufferView: iv, componentType: 5123 }, values: { bufferView: iv + 1 } },
+    }];
+    j.meshes[0]!.primitives[0]!.targets = [{ POSITION: j.accessors.length - 1 }];
+    const parsed = parseGltf(buildGlb(j, bin));
+    const delta = Array.from(parsed.meshes[0]!.primitives[0]!.targets[0]!.positions!);
+    expect(delta).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0]);
+  });
+});
+
 describe('parseGltf — GLB container', () => {
   it('reads meshes, materials, and the node hierarchy from a built GLB', () => {
     const { bin, json } = quadBin();

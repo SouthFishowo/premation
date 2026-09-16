@@ -72,6 +72,12 @@ export type Tool =
   // this implicitly whenever exactly one layer was selected — which, because
   // drawing selects what it draws, was always.
   | 'mask-pen'
+  // AE's Pen flyout: vertex tools that do one thing wherever they land, and
+  // the Mask Feather tool (G cycles Pen ⇄ Mask Feather).
+  | 'add-vertex'
+  | 'delete-vertex'
+  | 'convert-vertex'
+  | 'mask-feather'
   | 'puppet-pin'
   | 'bone'
   // Roto Brush: paint foreground / background strokes on a footage layer and

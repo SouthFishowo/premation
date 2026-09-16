@@ -32,12 +32,13 @@ import { ScopesPanel } from '@layout/Scopes';
 import { TranscriptPanel } from '@layout/Transcript';
 import { SourceMonitorPanel } from '@layout/SourceMonitor/SourceMonitorPanel';
 import { CharacterPanel } from '@layout/Inspector/CharacterPanel';
-import { ParagraphPanel } from '@layout/Inspector/ParagraphPanel';
 import { AlignPanel } from '@layout/Inspector/AlignPanel';
 import { InfoAudioPanel } from '@layout/Inspector/InfoAudioPanel';
 import { AudioPanel } from '@layout/Inspector/AudioPanel';
 import { PreviewPanel } from '@layout/Inspector/PreviewPanel';
 import { TrackerPanel } from '@layout/Inspector/TrackerPanel';
+// The barrel, deliberately: it registers Ctrl+8 / Ctrl+9 and the paint keys on load.
+import { PaintPanel, BrushesPanel } from '@layout/Paint';
 import { ScenePanel } from '@layout/Scene/ScenePanel';
 import { AssetsPanel } from '@layout/Assets/AssetsPanel';
 import { PropertiesPanel } from './PropertiesPanel';
@@ -57,6 +58,11 @@ import { LibraryPanel } from './LibraryPanel';
  * `properties` already is. Their sections now render inside it. DockPanel drops
  * panelOrder ids that no longer register, so persisted layouts and saved
  * workspaces holding the old ids simply lose the dead tabs.
+ *
+ * `paragraph` is gone for the same reason (2026-09-15): it had no def, so
+ * nothing registered or opened it, and `ParagraphPanel` is a deprecated
+ * re-export of `CharacterPanel` — registering it would have added a second
+ * "Text" panel, not a Paragraph one.
  */
 export const PANEL_COMPONENTS: Readonly<Record<string, ComponentType>> = {
   scene: ScenePanel,
@@ -65,7 +71,6 @@ export const PANEL_COMPONENTS: Readonly<Record<string, ComponentType>> = {
   presets: MotionPresetsPanel,
   properties: PropertiesPanel,
   character: CharacterPanel,
-  paragraph: ParagraphPanel,
   align: AlignPanel,
   swatches: SwatchesPanel,
   info: InfoAudioPanel,
@@ -74,6 +79,8 @@ export const PANEL_COMPONENTS: Readonly<Record<string, ComponentType>> = {
   preview: PreviewPanel,
   sourceMonitor: SourceMonitorPanel,
   tracker: TrackerPanel,
+  paint: PaintPanel,
+  brushes: BrushesPanel,
   rig: RigPanel,
   motion: MotionEditorPanel,
   effects: EffectsPanel,

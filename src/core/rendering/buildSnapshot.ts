@@ -20,6 +20,10 @@ import { readNodeBlend } from '@core/effects/blendMode';
 import { readNodePreserveTransparency } from '@core/effects/preserveTransparency';
 import { readNodeMask, readNodeMaskAt, maskPathPolyline, roundedRectMask, applyMaskPropertyTracks, type LayerMask } from '@core/effects/mask';
 import { BEAM_PEN_UP, BEAM_SOURCE } from '@core/effects/beamPath';
+import type { EffectParamValue } from '@core/effects/effects';
+import { effectWantsAllMaskPaths, packMaskPaths } from '@core/effects/strokePaint';
+import { scribbleWiggleState } from '@core/effects/scribble';
+import { resolveWriteOnTrail, writeOnUsesBrush } from '@core/effects/writeOnBrush';
 import { displacedMeshFor, getHeightField } from '@core/scene/heightDisplacement';
 import type { MaterialOptions } from '@core/scene/material';
 import { traceTextRuns } from '@core/scene/shapesFromText';
@@ -30,6 +34,7 @@ import {
   type CornerRadiiTuple,
 } from '@core/scene/cornerRadii';
 import { readNodeMatte, readMatte } from '@core/effects/matte';
+import { pushLayerError, errorMessage, type LayerError } from './layerErrors';
 import { readNodeAdjustment } from '@core/effects/adjustment';
 import {
   readNodeMotionBlur,
@@ -41,7 +46,8 @@ import {
   type MotionBlurConfig,
 } from '@core/effects/motionBlur';
 import { readNodeFill, readNodeFills, sampleFillAt, type FillPaint } from '@core/paint/fill';
-import { readNodeStroke, readNodeRenderStrokes } from '@core/paint/stroke';
+import { readNodeStrokes } from '@core/paint/stroke';
+import { resolveStrokeStack } from './strokeTracks';
 import { useAssetStore } from '@stores/assetStore';
 import { localMatrix, worldTransformOf, worldMatrixOf, localUnderParent, type LocalOf, type ParentOf } from '@core/scene/worldTransform';
 import { parentWorld3d, resolveNode3DTransform, composeNodeWorld3d } from '@core/scene/nodeMatrix';
@@ -57,6 +63,9 @@ import { nearestPrecompRoot, precompAncestorChain, isPrecomp } from '@core/scene
 import { readNodeAnchor } from '@core/scene/anchor';
 import { readNodeLight, lightAttenuationAt, lightReach } from '@core/scene/light';
 import { readNodeParticle, resolveParticleConfig } from '@core/particles/particleSim';
+// Deliberately the leaf module, not the plugin barrel: `buildSnapshot` runs in
+// the render-tests harness and in export, neither of which has a plugin host.
+import { generatorFrameFor, generatorKindOf, shaderKindOf, shaderLayerEffect } from '@core/plugins/generator/generatorLayers';
 import { measureParagraphBox, measureTextNodeSize, readMeasuredTextStyle } from '@core/text/measureText';
 import { hasTextPath, readTextStrokePaint, textExtrasForNode } from '@core/text/textExtras';
 import { applyGradientTracks, TEXT_STROKE_GRADIENT_TRACKS } from './gradientPaintTracks';
@@ -70,7 +79,7 @@ import { readForceMotionBlur } from '@core/effects/forceMotionBlur';
 import { readPosterizeTimeFps } from '@core/effects/posterizeTime';
 import { readNodeQuality } from '@core/effects/layerQuality';
 import { resolveAudioSpectrum, resolveAudioWaveformSamples } from '@core/audio/audioSpectrum';
-import { readNodeMaterial } from '@core/scene/material';
+import { readNodeMaterial, MATERIAL_ANIMATABLE } from '@core/scene/material';
 import { extrusionGeometry, EXTRUSION_WALL_FALLBACK_FILL, GRADIENT_WALL_SEGMENTS, EXTRUSION_SLICE_STEP_PX, MAX_EXTRUSION_SLICES } from '@core/scene/extrusion';
 import { extrusionOutlineFor, extrusionMeshFor, type ExtrusionMeshRequest } from '@core/scene/extrusionMesh';
 import { readNodeModelRef, modelPrimitiveFor } from '@core/scene/modelMesh';
@@ -85,7 +94,8 @@ import { isLutEffect } from '@core/effects/colorLut';
 import { readNodeFaceMaterials, resolveFaceMaterial, faceKindOf } from '@core/scene/faceMaterials';
 import { faceEffectsFor } from '@core/scene/faceEffects';
 import { shadeLayer, planeNormalOf, toShaderLights, lightAim3D, aimToCompAngleDeg, type SceneLight } from '@core/scene/lightShading';
-import { readNodePaint } from '@core/paint/paintStrokes';
+import { readNodePaint, type PaintConfig } from '@core/paint/paintStrokes';
+import { resolvePaintAt } from '@core/paint/paintTime';
 import { contentAwareFillAt } from '@core/effects/contentAwareFillVideo';
 import { resolvePathOps, applyPathOpChain, shapeOutline, type PolyRun } from '@core/scene/pathOps';
 import { readNodePolystar, resolvePolystar, polystarOutline } from '@core/scene/polystar';
@@ -99,6 +109,7 @@ import { sourceTextExpressionResultFor } from '@core/textExpr/sourceTextProvider
 import { applySourceTextExpressionResult } from '@core/textExpr/applySourceTextResult';
 import { bracketFrames } from './videoFrameCache';
 import { footageSourceOf, applyLoop } from '@core/source/sourceInfo';
+import { hasRetime, pickRetimeBar, retimeClipOf, retimedChainTime } from '@core/animation/retime';
 import { slotFitOf, coverUvRect } from '@core/template/mediaSlots';
 import { readSceneCamera, readSceneDof, dofBlurPx, dofIrisParams, viewCameraNode, cameraFromNode } from '@core/scene/camera3d';
 import { orthoViewOf, type CameraViewMode } from '@core/scene/cameraViewMode';
@@ -124,6 +135,7 @@ import type { MotionSample } from './RenderBackend';
 import type { AnimationEngine } from '@motion/animation';
 import type { RenderSnapshot, RenderLayer, LayerKind, SubpathPaint, SsaoConfig } from './RenderBackend';
 import { contentHashOf } from './contentHash';
+import { probeStaticPrecomp } from './staticPrecompCache';
 import { rasterPadding } from './raster/vectorDraw';
 import { readNodePuppet, getCachedRestMesh, deform, silhouetteFromPathPoints, resolvePuppetSilhouette, overlapDepthField, sortTrianglesByDepth } from '../rig/puppet';
 import { resolveLivePins } from '../rig/livePins';
@@ -310,8 +322,86 @@ function num(v: unknown): number | undefined {
   return typeof v === 'number' ? v : undefined;
 }
 
+/**
+ * Component arrays that are safe to memoize derived reads on ACROSS frames.
+ *
+ * Only arrays handed out by `AppNodeView.renderComponents()` qualify: that
+ * accessor rebuilds a fresh array whenever the scene mutation epoch moves and
+ * returns the identical array otherwise, and its contract is read-only (see
+ * `SceneGraph.renderComponents`). So "same array" means "no scene mutation
+ * since", and a WeakMap keyed on it can never serve a stale read.
+ *
+ * Plain node literals (tests, render-only clones from `expandCompInstances`,
+ * Essential-Properties patches) are NOT registered — their arrays may be
+ * rebuilt or mutated in place with no epoch to say so — and always read fresh.
+ */
+type BaseProps = ReturnType<typeof readBaseUncached>;
+
+/** Reads derived from one epoch-stable components array, filled lazily. */
+interface ComponentsMemo {
+  base?: BaseProps;
+  /** The transform `base` was read with — part of its input. */
+  baseTransform?: SceneNode['transform'];
+  /** `readNodeMaterial(node)` with NO animated values folded in. */
+  material?: MaterialOptions;
+}
+
+/**
+ * The registry IS the memo: an array gets an entry exactly when
+ * `materializeForFrame` saw it come from a live view, so one lookup answers
+ * both "is this safe to memoize" and "what do we already know".
+ */
+const epochStableComponents = new WeakMap<object, ComponentsMemo>();
+
+/**
+ * {@link readBaseUncached}, memoized across frames on an epoch-stable
+ * components array (see `epochStableComponents`). The transform is part of
+ * the input (`x ?? node.transform.position.x`), so the hit also has to be for
+ * the same transform object — itself epoch-memoized by `renderTransformOf`.
+ * The returned object is shared: callers only read it.
+ */
+function readBase(node: SceneNode): BaseProps {
+  const memo = epochStableComponents.get(node.components);
+  if (!memo) return readBaseUncached(node);
+  if (memo.base && memo.baseTransform === node.transform) return memo.base;
+  memo.base = readBaseUncached(node);
+  memo.baseTransform = node.transform;
+  return memo.base;
+}
+
+/**
+ * A node's kind. Deliberately NOT memoized: `readNodeKind` finds the kind on
+ * the first component almost always, which measured cheaper than the WeakMap
+ * lookup a memo costs (tried; it was slower on 1000 layers).
+ */
+const kindOf = readNodeKind;
+
+/** Material props a keyframe can override — see `readNodeMaterial`. */
+const MATERIAL_TRACKS: ReadonlySet<string> = new Set(MATERIAL_ANIMATABLE);
+
+/**
+ * `readNodeMaterial(node, values)`, memoized across frames when it can be.
+ *
+ * `readNodeMaterial` folds animated values over the stored Transform props
+ * ONLY for `MATERIAL_ANIMATABLE` names. When the node's sampled values hold
+ * none of those, the fold is a copy of the stored props and the result equals
+ * `readNodeMaterial(node)` — a pure function of the components array, so it is
+ * cached on it. Any animated material prop takes the uncached path. The object
+ * is shared and read-only to callers.
+ */
+function materialOf(node: SceneNode, values: ReadonlyMap<string, number> | undefined): MaterialOptions {
+  const memo = epochStableComponents.get(node.components);
+  if (!memo) return readNodeMaterial(node, values);
+  if (values) {
+    for (const k of values.keys()) {
+      if (MATERIAL_TRACKS.has(k)) return readNodeMaterial(node, values);
+    }
+  }
+  return (memo.material ??= readNodeMaterial(node));
+}
+
 /** Read base (authoring) props off a node's components. */
-function readBase(node: SceneNode): {
+function readBaseUncached(node: SceneNode): {
   x: number; y: number; rotation: number; opacity: number;
   scaleX: number; scaleY: number;
   width?: number; height?: number;
@@ -520,6 +610,40 @@ function readNumProp(node: SceneNode, prop: string): number | undefined {
   return undefined;
 }
 
+// ── Layer-literal helpers ───────────────────────────────────────────────
+// Former IIFEs of the per-layer RenderLayer literal, lifted to module scope so
+// the literal allocates no closures (see the note above that literal).
+
+/** Fill opacity — stored 0..100 like `opacity`, emitted 0..1. Absent stays
+ *  undefined rather than defaulting to 1, so a layer that never touched it does
+ *  not get routed down the CPU-bake path. */
+function fillOpacityOf(v: number | undefined): number | undefined {
+  return typeof v === 'number' ? Math.max(0, Math.min(1, v / 100)) : undefined;
+}
+
+/**
+ * A layer's displayed text. PARAGRAPH text renders WRAPPED. Wrapping is done
+ * by the same function the measurement uses, so the box the rasterizer
+ * allocates and the lines it draws into it can never disagree about where
+ * breaks fall. Text on a path is point text: its box width never wraps it.
+ */
+function wrappedLayerText(node: SceneNode, raw: string | undefined): string | undefined {
+  const boxWidth = hasTextPath(node) ? 0 : readNumProp(node, 'boxWidth');
+  if (!boxWidth || boxWidth <= 0 || typeof raw !== 'string') return raw;
+  const style = readMeasuredTextStyle(node, { content: raw, boxWidth });
+  return style ? style.content : raw;
+}
+
+/** Animated `fontWeight` (continuous, clamped to CSS's 1–1000) over the static string. */
+function animatedFontWeight(animated: number | undefined, base: string | undefined): string | undefined {
+  return animated !== undefined ? String(Math.max(1, Math.min(1000, animated))) : base;
+}
+
+/** `v` unless it is undefined — deliberately not `??`, which would also skip null. */
+function definedOr<T>(v: T | undefined, fallback: T | undefined): T | undefined {
+  return v !== undefined ? v : fallback;
+}
+
 /** Opacity multiplier applied to layers that are ghosted in Focus Mode. */
 const GHOST_OPACITY = 0.12;
 
@@ -550,6 +674,13 @@ export interface SnapshotFocus {
  * asked for. This stays confined to the render path, which only ever READS.
  */
 function materializeForFrame(n: SceneNode): SceneNode {
+  const components = renderComponentsOf(n);
+  // A live view's render array is epoch-memoized — register it so reads
+  // derived from it can be memoized across frames (`epochStableComponents`).
+  if (typeof (n as { renderComponents?: unknown }).renderComponents === 'function'
+    && !epochStableComponents.has(components)) {
+    epochStableComponents.set(components, {});
+  }
   return {
     id: n.id,
     name: n.name,
@@ -564,7 +695,7 @@ function materializeForFrame(n: SceneNode): SceneNode {
     locked: n.locked,
     solo: n.solo,
     color: n.color,
-    components: renderComponentsOf(n),
+    components,
     // Comp-instance bookkeeping. This is an explicit field list, not a spread,
     // so anything not named here is DROPPED — and both of these are set on
     // render-only clones by `expandCompInstances`, after which every downstream
@@ -736,7 +867,7 @@ export function buildSnapshot(
   // `transform` and friends through prototype getters, and the spread in
   // `applyOwnOverrides` drops them — `readBase` then died on an undefined
   // transform. A materialized node is a plain object, so the spread is safe.
-  ).map(materializeForFrame).map(applyOwnOverrides), fieldOf, pathOf);
+  ).map(materializeForFrame).map(ownOverrides && ownOverrides.size > 0 ? applyOwnOverrides : (n) => n), fieldOf, pathOf);
   // LAYER PANEL (`comp.layerView`): the one layer and nothing else — not the
   // layers parented to it — drawn with its eye on, un-soloed, and SEALED if it
   // is a collapsed comp (a collapsed comp draws nothing of its own; its layers
@@ -807,9 +938,21 @@ export function buildSnapshot(
   const nodeById = new Map(nodes.map((n) => [n.id, n] as const));
   const worldCache = new Map<string, Matrix2D>();
 
+  // Whether this walk holds any comp-instance clone / any Essential Properties
+  // override at all. Every animation and clip lookup below goes through
+  // `srcId` and `overriddenOf` — several times per node per frame — and in the
+  // overwhelmingly common frame (no collapsed instances) each call paid a Map
+  // lookup and a property read only to learn "no". When nothing in `nodes`
+  // carries either marker the answer is the same for every id, so the lookups
+  // are skipped; the full versions are kept verbatim for the frames that do.
+  const anyInstanceSource = nodes.some((n) => instanceSourceOf(n) !== null);
+  const anyOverriddenProps = nodes.some((n) => overriddenPropsOf(n) !== undefined);
+
   // Comp-instance id indirection: a clone samples the ORIGINAL node's
   // animation tracks and timeline clips. Real nodes map to themselves.
-  const srcId = (id: string): string => instanceSourceOf(nodeById.get(id)) ?? id;
+  const srcId = anyInstanceSource
+    ? (id: string): string => instanceSourceOf(nodeById.get(id)) ?? id
+    : (id: string): string => id;
   /**
    * Essential Properties: props this clone overrides (see
    * `compInstanceOverrides.ts`). Attached to the clone by `expandCompInstances`.
@@ -821,8 +964,10 @@ export function buildSnapshot(
    * inspector control would look wired while changing nothing. Dropping the
    * prop here is what makes the override REPLACE the animation, as AE does.
    */
-  const overriddenOf = (id: string): ReadonlySet<string> | null =>
-    (nodeById.get(id) as unknown as { __overriddenProps?: ReadonlySet<string> })?.__overriddenProps ?? null;
+  const overriddenOf = anyOverriddenProps
+    ? (id: string): ReadonlySet<string> | null =>
+        (nodeById.get(id) as unknown as { __overriddenProps?: ReadonlySet<string> })?.__overriddenProps ?? null
+    : (): ReadonlySet<string> | null => null;
   const anim: AnimationEngine = {
     sample: (id, prop, tt) =>
       overriddenOf(id)?.has(prop) ? undefined : rawAnim.sample(srcId(id), prop, tt),
@@ -837,6 +982,12 @@ export function buildSnapshot(
       overriddenOf(id)?.has(prop) ? false : rawAnim.isAnimated(srcId(id), prop),
     timeSpan: (id) => rawAnim.timeSpan(srcId(id)),
     sampleData: (id: string, prop: string, tt: number) => rawAnim.sampleData(srcId(id), prop, tt),
+    // The Speed % integral (`retime.ts`) reads the keys themselves, not samples.
+    tracksFor: (id: string) => {
+      const ov = overriddenOf(id);
+      const tracks = rawAnim.tracksFor(srcId(id));
+      return ov ? tracks.filter((tr) => !ov.has(tr.prop)) : tracks;
+    },
   } as AnimationEngine;
   const controller = {
     getLayersForNode: (id: string) => rawController.getLayersForNode(srcId(id)),
@@ -853,7 +1004,17 @@ export function buildSnapshot(
     Bounded rather than `while (true)`: a malformed parent cycle must not hang a
     render. Nothing legitimate nests groups 32 deep.
   */
+  // Memoized per snapshot: the clip set cannot change mid-build, and this is
+  // asked once per node by `isLiveAt` and again by each of the three remap
+  // builders and every `retimedAt` — each a registry lookup plus, for a group
+  // member, a parent walk.
+  const governingClipsCache = new Map<string, ReturnType<typeof controller.getLayersForNode>>();
   const governingClipsOf = (id: string): ReturnType<typeof controller.getLayersForNode> => {
+    let hit = governingClipsCache.get(id);
+    if (!hit) { hit = governingClipsUncached(id); governingClipsCache.set(id, hit); }
+    return hit;
+  };
+  const governingClipsUncached = (id: string): ReturnType<typeof controller.getLayersForNode> => {
     const own = controller.getLayersForNode(id);
     if (own.length > 0) return own;
     let node = nodeById.get(id);
@@ -863,7 +1024,7 @@ export function buildSnapshot(
       const parent = nodeById.get(parentId as string);
       // A precomp boundary, or anything that is not a plain group, ends the
       // walk: only a group's members are clip-less by design.
-      if (!parent || isPrecomp(parent) || readNodeKind(parent) !== 'group') return [];
+      if (!parent || isPrecomp(parent) || kindOf(parent) !== 'group') return [];
       const clips = controller.getLayersForNode(parent.id as string);
       if (clips.length > 0) return clips;
       node = parent;
@@ -875,6 +1036,30 @@ export function buildSnapshot(
   // (stretch / reverse / freeze), so its animation is sampled at that time.
   // Default (100% / no reverse / no freeze) is identity → no behaviour change.
   const remapOf = (id: string): (tt: number) => number => makeRemap(id, false, remapCache);
+  /**
+   * The same map for a RETIMED value (Speed % or Frame Number). A retimed
+   * value may leave the bar's comp range — 200% near the out-point reads past
+   * it, slow motion near a trimmed in-point reads before it — and still means
+   * a position in that clip's source, so the clip map extrapolates from the
+   * nearest bar instead of falling through to raw comp time.
+   */
+  //
+  // And SUB-FRAME, for the reason `subRemapOf` is: a retimed value is
+  // continuous. Rounded to the comp grid, 25% held each source frame for four
+  // comp frames and then jumped — so Pixel Motion's bracket weight was always
+  // zero and slow motion on any real clip bar never blended at all.
+  const sourceRemapOf = (id: string): (tt: number) => number => makeRemap(id, true, sourceRemapCache, true);
+  /** Chain-axis retimed time for `id` at comp time `tt`, or undefined when not retimed. */
+  const retimedAt = (id: string, tt: number): number | undefined => {
+    if (!hasRetime(anim, id)) return undefined;
+    const clip = retimeClipOf(pickRetimeBar(governingClipsOf(id), Math.round(tt * fps)), fps);
+    return retimedChainTime(anim, id, tt, clip);
+  };
+  /** The source time a layer shows at comp time `tt`, through its retime when it has one. */
+  const retimedSourceAt = (id: string, tt: number): number => {
+    const retimed = retimedAt(id, tt);
+    return retimed !== undefined ? sourceRemapOf(id)(retimed) : remapOf(id)(tt);
+  };
   /**
    * The same map, WITHOUT the frame quantisation — for motion blur.
    *
@@ -893,10 +1078,11 @@ export function buildSnapshot(
     id: string,
     subFrame: boolean,
     cache: Map<string, (tt: number) => number>,
+    extrapolate = false,
   ): (tt: number) => number => {
     const hit = cache.get(id);
     if (hit) return hit;
-    let fn = buildRemap(id, subFrame);
+    let fn = buildRemap(id, subFrame, extrapolate);
     // Cloner cascade: a clone with a time offset plays its animation that many
     // seconds behind the source. Applied at COMP time — outside every clip map,
     // loop and precomp remap — because "this copy runs 0.3s behind" is a
@@ -912,7 +1098,10 @@ export function buildSnapshot(
     return fn;
   };
   /** Nearest ancestor clone root's time offset, or 0. Bounded walk. */
+  const anyCloneOffset = nodes.some((n) => cloneOffsetOf(n) !== null);
   const cloneTimeOffsetOf = (id: string): number => {
+    // No clone anywhere in this walk ⇒ every walk would end at 0.
+    if (!anyCloneOffset) return 0;
     let cur = nodeById.get(id);
     for (let i = 0; cur && i < 64; i++) {
       const off = cloneOffsetOf(cur);
@@ -930,7 +1119,9 @@ export function buildSnapshot(
   const remapCache = new Map<string, (tt: number) => number>();
   /** The same memo for the sub-frame twin — see `subRemapOf`. */
   const subRemapCache = new Map<string, (tt: number) => number>();
-  const buildRemap = (id: string, subFrame = false): (tt: number) => number => {
+  /** The same memo for the extrapolating twin — see `sourceRemapOf`. */
+  const sourceRemapCache = new Map<string, (tt: number) => number>();
+  const buildRemap = (id: string, subFrame = false, extrapolate = false): (tt: number) => number => {
     const n = nodeById.get(id);
 
     let baseMap = (tt: number) => tt;
@@ -960,7 +1151,8 @@ export function buildSnapshot(
       baseMap = (tt: number) => {
         const exact = tt * fps;
         const frame = Math.round(exact);
-        const active = clips.find((l) => l.isActiveAt(frame));
+        const active = clips.find((l) => l.isActiveAt(frame))
+          ?? (extrapolate ? pickRetimeBar(clips, frame) : undefined);
         if (active) {
           // WHICH bar is live is a question about frames and rounds; WHERE in
           // the source we are does not have to (see `subRemapOf`).
@@ -1038,17 +1230,11 @@ export function buildSnapshot(
     // via its `sourceTime`) is never double-counted for its own children.
     if (n) {
       const chain = precompAncestorChain(n, nodeById);
-      const anyAnimated = chain.some(
-        (pc) => anim.isAnimated(pc.id, 'timeRemap') || anim.isAnimated(pc.id, 'precompTime'),
-      );
+      const anyAnimated = chain.some((pc) => hasRetime(anim, pc.id));
       if (anyAnimated) {
         return (tt) => {
           let time = tt;
-          for (const pc of chain) {
-            if (anim.isAnimated(pc.id, 'timeRemap') || anim.isAnimated(pc.id, 'precompTime')) {
-              time = anim.sample(pc.id, 'timeRemap', time) ?? anim.sample(pc.id, 'precompTime', time) ?? time;
-            }
-          }
+          for (const pc of chain) time = retimedAt(pc.id, time) ?? time;
           return own(time);
         };
       }
@@ -1127,6 +1313,12 @@ export function buildSnapshot(
     own: Effect[];
     all: Effect[];
   } => {
+    // No effects and no layer styles — most layers. Every stage below maps an
+    // empty list to an empty list, so skip straight to that (fresh arrays: the
+    // caller appends paint strokes/fills to `all`).
+    const ownRaw = readNodeRenderEffects(node);
+    const styles = readNodeLayerStyles(node);
+    if (ownRaw.length === 0 && !styles) return { own: [], all: [] };
     const sample = (path: string): number | undefined => {
       const v = values?.get(path);
       return typeof v === 'number' ? v : undefined;
@@ -1143,9 +1335,8 @@ export function buildSnapshot(
         animated.add(dot < 0 ? rest : rest.slice(0, dot));
       }
     }
-    const ownRaw = readNodeRenderEffects(node);
     const styleRaw = layerStylesToEffects(
-      readNodeLayerStyles(node), globalLight.angle, globalLight.altitude,
+      styles, globalLight.angle, globalLight.altitude,
       (k) => animated.has(k),
     );
     const resolved = resolveEffectParams([...ownRaw, ...styleRaw], sample, layerTimeSec);
@@ -1207,6 +1398,23 @@ export function buildSnapshot(
     // pure function of its params, and a TRACKED mask (maskAnim) yields a
     // different polyline per frame, which both follows the object and varies
     // the content hash so cached frames re-render.
+    //
+    // 2026-09-15, the paint effects (Stroke, Scribble, Vegas ▸ All Masks) take
+    // EVERY mask, in mask order with its closed flag, mode and inversion, as the
+    // packed `maskPathsMeta` / `maskPathsXY` pair (see `packMaskPaths`), plus
+    // the index of the picked one. Resolved at most once per stack, and only
+    // when some effect asks, from the mask's shape track AND its numeric
+    // property tracks — the same mask the layer itself is cut by this frame.
+    let effectMask: LayerMask | undefined | null = null;
+    const effectMaskNow = (): LayerMask | undefined => {
+      if (effectMask === null) {
+        effectMask = applyMaskPropertyTracks(
+          (layerTimeSec !== undefined ? readNodeMaskAt(node, layerTimeSec) : undefined) ?? readNodeMask(node),
+          values,
+        );
+      }
+      return effectMask;
+    };
     const all = withAudio.map((e) => {
       const p = paramsOf(e);
       // Energy Beam on the layer's OWN text outline: the traced runs, each a
@@ -1223,13 +1431,43 @@ export function buildSnapshot(
         }
         return { ...e, params: { ...p, pathPoints } };
       }
+      let extra: Record<string, EffectParamValue> | undefined;
+      const put = (k: string, v: EffectParamValue): void => { (extra ??= {})[k] = v; };
+      if (effectWantsAllMaskPaths(e.type, p)) {
+        const paths = effectMaskNow()?.paths ?? [];
+        const packed = packMaskPaths(paths);
+        put('maskPathsMeta', packed.meta);
+        put('maskPathsXY', packed.xy);
+        const pick = typeof p.pathMaskId === 'string' ? p.pathMaskId : '';
+        put('pathMaskIndex', pick === '' ? -1 : paths.findIndex((mp) => mp.id === pick));
+      }
+      // Scribble's wiggle rides the layer clock, quantised here (Jumpy holds a
+      // state between jumps) so a static or jumpy scribble keeps its cache entry.
+      if (e.type === 'scribble') put('wiggleState', scribbleWiggleState(p, layerTimeSec));
+      // Write-on's brush form draws values of its tracks at PAST times: the dab
+      // history is sampled here, where the animation engine is reachable.
+      if (e.type === 'write-on' && layerTimeSec !== undefined && writeOnUsesBrush(p)) {
+        const trail = resolveWriteOnTrail(
+          e.id, p, layerTimeSec,
+          (prop, tt) => anim.sample(node.id, prop, tt),
+          (prop) => anim.isAnimated(node.id, prop),
+          anim.timeSpan(node.id)?.start,
+        );
+        put('brushTrailXY', trail.xy);
+        put('brushTrailSize', trail.size);
+        put('brushTrailAttr', trail.attr);
+        put('brushTrailFilled', trail.filled ? 1 : 0);
+      }
+      const base = extra ? { ...p, ...(extra as Record<string, EffectParamValue>) } : undefined;
       const pathMaskId = p.pathMaskId;
-      if (typeof pathMaskId !== 'string' || pathMaskId === '') return e;
+      if (typeof pathMaskId !== 'string' || pathMaskId === '') return base ? { ...e, params: base } : e;
       const m = (layerTimeSec !== undefined ? readNodeMaskAt(node, layerTimeSec) : undefined)
         ?? readNodeMask(node);
       const path = m?.paths.find((mp) => mp.id === pathMaskId);
       const pathPoints = path ? maskPathPolyline(path) : [];
-      return { ...e, params: { ...p, pathPoints } };
+      // Whether the polyline is a loop. A flat point list cannot say, and Vegas
+      // walked an OPEN mask as one — lights ran along the chord between its ends.
+      return { ...e, params: { ...(base ?? p), pathPoints, pathClosed: path?.closed === true } };
     });
 
     return { own: all.slice(0, ownRaw.length), all };
@@ -1329,8 +1567,7 @@ export function buildSnapshot(
   const precompSourceTime = (groupNode: SceneNode): number => {
     // A comp layer in the Layer panel, scrubbed past the host's range.
     if (layerView?.sourceTime !== undefined && groupNode.id === layerView.id) return layerView.sourceTime;
-    const remapped = anim.sample(groupNode.id, 'timeRemap', t) ?? anim.sample(groupNode.id, 'precompTime', t);
-    return remapOf(groupNode.id)(remapped !== undefined ? remapped : t);
+    return retimedSourceAt(groupNode.id, t);
   };
   const buildPrecompContainer = (
     groupNode: SceneNode,
@@ -1761,7 +1998,15 @@ export function buildSnapshot(
    * the predicate is the point — a camera judged live by one rule and drawn by
    * another is the class of bug this file keeps re-learning.
    */
+  // Memoized per snapshot — the emit-order pre-pass, the light passes and the
+  // walk itself each ask it for the same node at the same `t`.
+  const liveCache = new Map<string, boolean>();
   const isLiveAt = (nodeId: string): boolean => {
+    let live = liveCache.get(nodeId);
+    if (live === undefined) { live = isLiveAtUncached(nodeId); liveCache.set(nodeId, live); }
+    return live;
+  };
+  const isLiveAtUncached = (nodeId: string): boolean => {
     // The Layer panel shows the whole source, In/Out or not (`layerView`).
     if (layerView && nodeId === layerView.id) return true;
     // The GOVERNING clips, not merely this node's own.
@@ -1919,11 +2164,16 @@ export function buildSnapshot(
    * acquire a flat screen-space smudge on top of its real shadow.
    */
   let hasShadowMapLight = false;
+  /** Mapped lights seen so far — the renderer's map budget is two per run. */
+  let mappedShadowLights = 0;
   const shadowLights: ShadowLight[] = (() => {
     if (comp.draft3d) return [];
     const out: ShadowLight[] = [];
     for (const n of nodes) {
-      if (readNodeKind(n) !== 'light') continue;
+      if (kindOf(n) !== 'light') continue;
+      // A light outside its in/out bar, or with its eye off, draws no glow —
+      // and must throw no shadow either (AE: a disabled light does nothing).
+      if (n.visible === false || !isLiveAt(n.id)) continue;
       const lt = readNodeLight(n);
       if (!lt.shadows || lt.type === 'ambient' || lt.type === 'environment') continue;
       // A light rendering a real shadow MAP must not also throw a projected
@@ -1932,7 +2182,11 @@ export function buildSnapshot(
       // where the projection's input list is built, rather than at the
       // projection site: the caster and receiver bookkeeping below is shared
       // with the beam wash and must keep running.
-      if (lt.shadowMap) { hasShadowMapLight = true; continue; }
+      // ...but only for the lights that actually GET a map. The renderer has two
+      // map bindings per 3D run (CompositionPass: the first two mapped lights in
+      // light order); a third mapped lamp used to be dropped here and then got
+      // no shadow of any kind. Past the budget it keeps the projected copy.
+      if (lt.shadowMap && mappedShadowLights < 2) { mappedShadowLights++; hasShadowMapLight = true; continue; }
       const av = valuesOf(n.id);
       const wp = nodeWorldPosition(n);
       out.push({
@@ -2054,7 +2308,11 @@ export function buildSnapshot(
    */
   let envReflect: { sky: unknown; intensity: number; rotationDeg: number } | undefined;
   for (const n of comp.draft3d ? [] : nodes) {
-    if (readNodeKind(n) !== 'light') continue;
+    if (kindOf(n) !== 'light') continue;
+    // Same gate as the glow and the projected shadow: a trimmed or switched-off
+    // light kept shading every 3D layer (and rendering its shadow map) after
+    // its wash had already gone.
+    if (n.visible === false || !isLiveAt(n.id)) continue;
     const lt = readNodeLight(n);
     const av = valuesOf(n.id);
     const wp = nodeWorldPosition(n);
@@ -2256,20 +2514,11 @@ export function buildSnapshot(
     if (stack.includes(ref) || stack.length >= MAX_COMP_DEPTH) return null;
     if (!graph.getNode(ref)) return null;
     const size = comp.compSizeOf?.(ref) ?? { width: comp.width, height: comp.height };
-    const nested = buildSnapshot(
-      graph,
-      rawAnim,
-      // The container reports this as its `sourceTime`; the content has to be
-      // rendered at the same instant or a time-remapped comp shows one frame and
-      // claims another.
-      precompSourceTime(node),
-      // Focus rings, guides and the region of interest belong to the composition
-      // the user is EDITING, never to one nested inside it.
-      undefined,
-      undefined,
-      undefined,
-      motionBlur,
-      {
+    // The container reports this as its `sourceTime`; the content has to be
+    // rendered at the same instant or a time-remapped comp shows one frame and
+    // claims another.
+    const nestedTime = precompSourceTime(node);
+    const nestedComp: SnapshotComp = {
         ...comp,
         width: size.width,
         height: size.height,
@@ -2290,8 +2539,45 @@ export function buildSnapshot(
         camera3dMode: 'active',
         customViewCamera: undefined,
         compStack: [...stack, ref],
-      },
+    };
+    // A comp whose content cannot change with time reuses its last nested
+    // pass — see staticPrecompCache.ts for exactly what "cannot change" means.
+    // A retimed or remapped container is time-dependent by definition.
+    const probe = probeStaticPrecomp({
+      graph,
+      anim: rawAnim,
+      ref,
+      comp: nestedComp,
+      time: nestedTime,
+      fps,
+      containerTimeDependent: hasRetime(anim, node.id) || readNodeLayerTime(node) !== undefined,
+      clipsOf: (id) => rawController.getLayersForNode(id),
+    });
+    if (probe.hit) {
+      return {
+        layers: prefixLayerIds(probe.hit.layers, `${node.id}::`),
+        ...(probe.hit.scene3d ? { scene3d: probe.hit.scene3d } : {}),
+      };
+    }
+    const nested = buildSnapshot(
+      graph,
+      rawAnim,
+      nestedTime,
+      // Focus rings, guides and the region of interest belong to the composition
+      // the user is EDITING, never to one nested inside it.
+      undefined,
+      undefined,
+      undefined,
+      motionBlur,
+      nestedComp,
     );
+    // A layer that failed INSIDE the nested comp was isolated there; carry the
+    // record up, under the id the host sees, so export refuses this frame too.
+    if (nested.layerErrors) {
+      for (const e of nested.layerErrors) {
+        layerErrors = pushLayerError(layerErrors, { ...e, layerId: `${node.id}::${e.layerId}` });
+      }
+    }
     // The nested comp's OWN 3D frame, exactly as its pass resolved it (inner
     // world space, inner comp px). Present only when it has 3D content — a 2D
     // comp's instance stays byte-identical. SSAO is deliberately NOT carried:
@@ -2304,6 +2590,11 @@ export function buildSnapshot(
           ...(nested.envMap ? { envMap: nested.envMap } : {}),
         }
       : undefined;
+    // Never cache a pass that dropped a layer: the error has to be re-reported
+    // (and export refused) on every frame it happens.
+    if (probe.commit && !nested.layerErrors) {
+      probe.commit({ layers: nested.layers, ...(scene3d ? { scene3d } : {}) });
+    }
     return {
       layers: prefixLayerIds(nested.layers, `${node.id}::`),
       ...(scene3d ? { scene3d } : {}),
@@ -2325,7 +2616,7 @@ export function buildSnapshot(
   {
     const emitOrder: SceneNode[] = [];
     for (const n of nodes) {
-      const k = readNodeKind(n);
+      const k = kindOf(n);
       if (k === 'group' || k === 'null' || k === 'camera' || k === 'audio') continue;
       if (k === 'comp' && readCompCollapse(n)) continue;
       if (isBooleanOperand(n)) continue;
@@ -2363,8 +2654,29 @@ export function buildSnapshot(
     }, node);
   };
 
-  for (const node of nodes) {
-    const kind = readNodeKind(node);
+  /**
+   * Layers that threw and were skipped this build — null until one does. Also
+   * filled by `nestedCompLayers` above (read only when it is called, from the
+   * walk below, so declaring it here is safe).
+   */
+  let layerErrors: LayerError[] | null = null;
+
+  /** Remove everything a failed node emitted before it threw — see the guarded walk below. */
+  const dropEmittedLayers = (id: string): void => {
+    const prefix = `${id}::`;
+    const prune = (list: RenderLayer[]): void => {
+      for (let i = list.length - 1; i >= 0; i--) {
+        const lid = list[i]!.id;
+        if (lid === id || lid.startsWith(prefix)) list.splice(i, 1);
+      }
+    };
+    prune(layers);
+    for (const inner of precompInner.values()) prune(inner);
+  };
+
+  /** One scene node's layer build — the body of the walk below (`return` is its `continue`). */
+  const buildLayerNode = (node: SceneNode): void => {
+    const kind = kindOf(node);
     if (kind === 'comp') {
       // A COLLAPSED instance is structural here: its layers were already
       // expanded into this walk, so the node itself draws nothing and must not
@@ -2380,14 +2692,14 @@ export function buildSnapshot(
           emitLayer(buildPrecompContainer(node, nested?.layers, nested?.scene3d), node);
         }
       }
-      continue;
+      return;
     }
     // Groups / nulls / cameras / audio are structural — they never draw.
-    if (kind === 'group' || kind === 'null' || kind === 'camera' || kind === 'audio') continue;
+    if (kind === 'group' || kind === 'null' || kind === 'camera' || kind === 'audio') return;
     // Live-boolean operands stay in the scene for editing/animation but paint
     // only through their result layer — skipping here is what keeps the merge
     // from double-drawing the sources.
-    if (isBooleanOperand(node)) continue;
+    if (isBooleanOperand(node)) return;
 
     // AE-style layer in/out points: when the timeline has clip bars for this
     // node and NONE is active at the current frame, the layer sits outside its
@@ -2398,15 +2710,15 @@ export function buildSnapshot(
     // end-exclusive).
     // `isLiveAt` (hoisted above the camera block) holds the end-exclusive clamp
     // and the reasoning behind it; the camera selection applies the same test.
-    if (!isLiveAt(node.id)) continue;
+    if (!isLiveAt(node.id)) return;
 
     // Draft 3D: light layers draw nothing (their glow wash IS lighting).
-    if (kind === 'light' && comp.draft3d) continue;
+    if (kind === 'light' && comp.draft3d) return;
 
     // Hidden / un-soloed: keep a stack stub, skip the expensive materialize.
     if (!needsFullBuild.has(node.id)) {
       emitInvisibleStub(node);
-      continue;
+      return;
     }
 
     // Light: a radial glow at its world position, composited (screen) to
@@ -2418,7 +2730,7 @@ export function buildSnapshot(
       // wash from — its whole contribution is the rig expanded into
       // sceneLights above. Emitting the point-glow here painted a radial
       // bloom for a light that is everywhere.
-      if (lt.type === 'environment') continue;
+      if (lt.type === 'environment') return;
       // PROJECT the glow through the current view. The wash used to be emitted
       // at the light's raw comp x/y, so it ignored both the light's depth and
       // the active view entirely: switch to Left view and every layer moved
@@ -2503,7 +2815,7 @@ export function buildSnapshot(
       if (lt.type === 'spot' || lt.type === 'parallel') {
         washLights.push({ nodeId: node.id, layer: washLayer, reach });
       }
-      continue;
+      return;
     }
 
     // Particle emitter: a self-drawing layer. buildSnapshot resolves its world
@@ -2562,7 +2874,103 @@ export function buildSnapshot(
           particles: cfg,
         }, node);
       }
-      continue;
+      return;
+    }
+
+    /*
+      Plugin GENERATOR layer: the plugin produced this layer's geometry.
+
+      The one-character gate first — a native kind has no dot in it, a
+      namespaced plugin kind always does — so a project with no plugin layers
+      pays a single `indexOf` per layer and nothing else. Everything past it is
+      in `core/plugins/generator/`, including the decision not to wait: the
+      plugin's code cannot run on this thread, so this takes whatever the
+      scheduler has and states the demand for the frame it actually wants.
+
+      A generator layer with no geometry still EMITS. It is an empty layer, not
+      a missing one: it holds its place in the stack, keeps its transform and
+      its keyframes, and starts drawing the moment its plugin answers.
+    */
+    if (kind.indexOf('.') >= 0) {
+      const genKind = generatorKindOf(kind);
+      if (genKind) {
+        const w = worldTransformOf(node.id, localOf, parentOf, worldCache);
+        const gv = valuesOf(node.id);
+        const gOpacity = gv?.has('opacity') ? (gv.get('opacity') as number) / 100 : 1;
+        const gEval: Record<string, unknown> = {};
+        if (gv) for (const [k, val] of gv.entries()) gEval[k] = val;
+        const gGeom = readGeometry(node, gEval);
+        const gW = gGeom?.width ?? comp.width;
+        const gH = gGeom?.height ?? comp.height;
+        const frame = generatorFrameFor(node, kind, {
+          compTime: t,
+          // The layer's own clock, through the same helper every other layer's
+          // source time goes through — a generator on a 50% time-stretched
+          // layer must step at half speed, and reading raw comp time here is
+          // how it would not.
+          layerTime: retimedSourceAt(node.id, t),
+          fps,
+          compSize: { width: comp.width, height: comp.height },
+          layerSize: { width: gW, height: gH },
+          sampled: gv,
+        });
+        // The comp lens, for the field's own perspective divide — the same
+        // rule the particle field follows: a 3D generator parallaxes through
+        // the composition's camera rather than through a private lens, and a
+        // 2D one is orthographic.
+        const genPerspective = is3DEnabled(node) && camera ? camera.focalLength : undefined;
+        emitLayer({
+          id: node.id, kind: 'shape',
+          x: w.x, y: w.y, rotation: w.rotation, scaleX: w.scaleX, scaleY: w.scaleY, depth: 0,
+          opacity: gOpacity, width: gW, height: gH,
+          fill: '#000', visible: node.visible !== false,
+          blend: readNodeBlend(node),
+          ...(readNodePreserveTransparency(node) ? { preserveTransparency: true } : {}),
+          ...(frame ? { generator: frame } : {}),
+          ...(genPerspective ? { generatorPerspective: genPerspective } : {}),
+        }, node);
+        return;
+      }
+
+      /*
+        Plugin SHADER layer kind — GAP 2, closed.
+
+        The kind names one of its plugin's effects and the effect draws it: the
+        layer is emitted as a transparent surface of its own size carrying that
+        one effect, which the plugin-effect path then compiles, binds and runs
+        on both backends with the host's time / comp-size / frame inputs. No
+        second render path, and nothing here knows what WGSL is.
+
+        A `shader` kind that names NO shader is not handled here and falls
+        through to the ordinary path, exactly as it did before the field
+        existed — which is to say it draws nothing.
+      */
+      const shaderKind = shaderKindOf(kind);
+      if (shaderKind) {
+        const w = worldTransformOf(node.id, localOf, parentOf, worldCache);
+        const sv = valuesOf(node.id);
+        const sOpacity = sv?.has('opacity') ? (sv.get('opacity') as number) / 100 : 1;
+        const sEval: Record<string, unknown> = {};
+        if (sv) for (const [k, val] of sv.entries()) sEval[k] = val;
+        const sGeom = readGeometry(node, sEval);
+        const effect = shaderLayerEffect(node, shaderKind, sv);
+        emitLayer({
+          id: node.id, kind: 'shape',
+          x: w.x, y: w.y, rotation: w.rotation, scaleX: w.scaleX, scaleY: w.scaleY, depth: 0,
+          opacity: sOpacity,
+          width: sGeom?.width ?? comp.width,
+          height: sGeom?.height ?? comp.height,
+          // Transparent, because the KERNEL is the content: an opaque carrier
+          // would be what the effect sampled, and every such kind would be a
+          // shader applied to a black rectangle.
+          fill: 'rgba(0,0,0,0)',
+          visible: node.visible !== false,
+          blend: readNodeBlend(node),
+          ...(readNodePreserveTransparency(node) ? { preserveTransparency: true } : {}),
+          ...(effect ? { effects: [effect as unknown as Effect] } : {}),
+        }, node);
+        return;
+      }
     }
 
     const base = readBase(node);
@@ -2960,7 +3368,7 @@ export function buildSnapshot(
       // approximation this compositor makes everywhere (layers are whole quads,
       // not clipped geometry); true near-plane clipping needs the GPU path to
       // own it.
-      if (O.clipped) continue;
+      if (O.clipped) return;
       matrix = m;
       // The full 4×4 world matrix rides along for the GPU depth-tested path;
       // the projected affine stays as the universal fallback.
@@ -3044,92 +3452,24 @@ export function buildSnapshot(
       finalFill = Color.toHex({ r, g, b, a: alpha });
     }
 
-    const baseStroke = readNodeStroke(node);
-    let finalStroke = baseStroke;
-    // Dash offset folds in exactly the way the stroke colour does — sampled off
-    // the animated-value map and written into the RESOLVED stroke rather than
-    // read from the stored object.
-    if (baseStroke && a?.has('strokeDashOffset')) {
-      finalStroke = { ...baseStroke, dashOffset: a.get('strokeDashOffset') ?? 0 };
-    }
-    // F34, FIXED. `strokeWidth` was registered as keyframeable in
-    // `propertyMeta`, offered a stopwatch by the inspector and the timeline, and
-    // sampled by NOTHING for a shape stroke — a 6→40 ramp rendered 5296 stroke
-    // pixels at both ends. The comment that used to sit here cited that as the
-    // reason dash offset did NOT copy its shape; the honest fix is to make
-    // `strokeWidth` behave like dash offset rather than to keep a second
-    // pattern alive as a warning.
-    //
-    // Chained off `finalStroke` for the reason stated below it: width, colour
-    // and dash offset can all be animated on one layer.
-    if (finalStroke && a?.has('strokeWidth')) {
-      const w = a.get('strokeWidth');
-      // A negative width is not a thinner stroke, it is a Canvas2D exception —
-      // and the property's own `min: 0` says so. Clamp rather than trust the
-      // curve, since an overshooting ease can undershoot zero between keys.
-      if (typeof w === 'number' && Number.isFinite(w)) {
-        finalStroke = { ...finalStroke, width: Math.max(0, w) };
-      }
-    }
-    // Taper and Wave. Nine tracks, folded HERE for the same reason every other
-    // stroke track is: `propertyMeta` gives them a stopwatch, and a stopwatch
-    // the renderer never samples is F34/F35 — twice on this board already.
-    //
-    // Each falls back to the STORED profile rather than to a constant, so a
-    // taper authored statically survives when only one of its nine is animated.
-    if (finalStroke && a) {
-      const t = finalStroke.taper;
-      const num = (k: string, fallback: number): number => {
-        const v = a.get(k);
-        return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
-      };
-      if (
-        a.has('strokeTaperStartWidth') || a.has('strokeTaperEndWidth') ||
-        a.has('strokeTaperStartLength') || a.has('strokeTaperEndLength') ||
-        a.has('strokeTaperStartEase') || a.has('strokeTaperEndEase')
-      ) {
-        finalStroke = { ...finalStroke, taper: {
-          startWidth: num('strokeTaperStartWidth', t?.startWidth ?? 1),
-          endWidth: num('strokeTaperEndWidth', t?.endWidth ?? 1),
-          startLength: num('strokeTaperStartLength', t?.startLength ?? 0),
-          endLength: num('strokeTaperEndLength', t?.endLength ?? 0),
-          startEase: num('strokeTaperStartEase', t?.startEase ?? 0),
-          endEase: num('strokeTaperEndEase', t?.endEase ?? 0),
-        } };
-      }
-      const wv = finalStroke.wave;
-      if (a.has('strokeWaveAmount') || a.has('strokeWaveWavelength') || a.has('strokeWavePhase')) {
-        finalStroke = { ...finalStroke, wave: {
-          amount: num('strokeWaveAmount', wv?.amount ?? 0),
-          wavelength: num('strokeWaveWavelength', wv?.wavelength ?? 0),
-          phase: num('strokeWavePhase', wv?.phase ?? 0),
-        } };
-      }
-    }
-    // Chained off `finalStroke`, not `baseStroke`: colour and dash offset can be
-    // animated on the same layer, and rebuilding from `baseStroke` here would
-    // silently drop whichever was applied first.
-    if (finalStroke && a?.has('stroke_r')) {
-      const r = a.get('stroke_r') ?? 0;
-      const g = a.get('stroke_g') ?? 0;
-      const b = a.get('stroke_b') ?? 0;
-      const alpha = a.get('stroke_a') ?? 1;
-      finalStroke = { ...finalStroke, color: Color.toHex({ r, g, b, a: alpha }) };
-    }
+    // The stroke STACK, every entry with its own tracks folded in — width, dash
+    // offset, taper, wave and colour as before (F34: a stopwatch the renderer
+    // never samples is a bug), plus opacity, miter limit, dash values and
+    // gradient points. Entry 0 keeps the original flat track names; entry i ≥ 1
+    // reads `stroke.<i>.<param>`. See `strokeTracks.ts` for the order contract
+    // that keeps an animated layer's raster cache key what it always was.
+    const strokeFold = resolveStrokeStack(readNodeStrokes(node), a, layerW, layerH);
+    const finalStroke = strokeFold.stroke;
 
-    // Multi-fill / multi-stroke stacks. Animated tracks (fill_* / stroke_* /
-    // fillAngle/…) bind to entry 0 only — the resolved primary above replaces
-    // the stack's first entry so animation stays honoured.
+    // Multi-fill stack. Animated fill tracks (fill_* / fillAngle/…) bind to
+    // entry 0 only — the resolved primary above replaces the stack's first
+    // entry so animation stays honoured.
     const fillStack = readNodeFills(node);
     const fillPaints =
       fillStack.length > 1
         ? [fillPaint ?? fillStack[0]!, ...fillStack.slice(1)]
         : undefined;
-    const strokeStack = readNodeRenderStrokes(node);
-    const strokes =
-      strokeStack.length > 1
-        ? [...(finalStroke ? [finalStroke] : []), ...strokeStack.slice(1)]
-        : undefined;
+    const strokes = strokeFold.strokes;
 
     // Appearance / paint stroke is drawn into the shape raster for vectors, but
     // image / video / text upload a texture and never stroke that geometry — so
@@ -3251,24 +3591,37 @@ export function buildSnapshot(
     // resolving twice per layer per frame is pure waste.
     const glass = resolveGlass(readNodeLayerStyles(node)?.glass, a, globalLight.angle);
 
+    // Values the literal below used to compute inline, through IIFEs and
+    // conditional spreads. Hoisted for SPEED, not style: a literal interrupted
+    // by `...(cond ? {…} : {})` cannot be built from V8's boilerplate — every
+    // key after the first spread becomes a runtime define, and the per-layer
+    // mix of spreads gives each layer a different hidden class. On 1000 flat
+    // shapes that literal was ~40% of the whole snapshot. The conditional keys
+    // are now assigned AFTER the literal, only when present, so a key that was
+    // absent stays absent; only their position in key order moves, and nothing
+    // reads a RenderLayer's key order (no serialisation, no `in`, the content
+    // hash builds its own ordered projection).
+    const layerSourceTime = layerView?.sourceTime !== undefined && node.id === layerView.id
+      // A Layer panel scrubbed past the comp's range pins the frame itself.
+      ? layerView.sourceTime
+      : retimedSourceAt(node.id, t);
+    const layerTimeNow = remapOf(node.id)(t);
+    const liveSourceText = anim.sampleData(node.id, 'text.source', layerTimeNow);
+    const layerMaterial = materialOf(node, a);
+
     const layer: RenderLayer = {
       id: node.id,
       kind: layerKind,
       blend: readNodeBlend(node),
-      ...(readNodePreserveTransparency(node) ? { preserveTransparency: true } : {}),
       mask: resolvedMask,
       matte: readNodeMatte(node),
       isAdjustment: readNodeAdjustment(node) || undefined,
       quality: readNodeQuality(node) === 'draft' ? 'draft' : undefined,
-      paint: readNodePaint(node) ?? undefined,
-      contentAwareFillSrc: contentAwareFillAt(node, remapOf(node.id)(t)) ?? undefined,
-      sourceTime: (() => {
-        // A Layer panel scrubbed past the comp's range pins the frame itself.
-        if (layerView?.sourceTime !== undefined && node.id === layerView.id) return layerView.sourceTime;
-        const remapped = anim.sample(node.id, 'timeRemap', t) ?? anim.sample(node.id, 'precompTime', t);
-        if (remapped !== undefined) return remapOf(node.id)(remapped);
-        return remapOf(node.id)(t);
-      })(),
+      // The frame's paint: live strokes only, keyframed options sampled at
+      // layer time. Undefined when unpainted (or nothing live) — no work.
+      paint: resolveLayerPaintAt(node, layerTimeNow, a, anim, nodeById, (id) => remapOf(id)(t)),
+      contentAwareFillSrc: contentAwareFillAt(node, layerTimeNow) ?? undefined,
+      sourceTime: layerSourceTime,
       // Frame blending. This is the read that had been missing since the flag
       // was added: the dropdown wrote `frameBlend` and no renderer ever looked
       // at it. Resolved to bracket times here because only buildSnapshot knows
@@ -3279,10 +3632,7 @@ export function buildSnapshot(
         const fbMode = readNodeLayerTime(node)?.frameBlend;
         if (fbMode !== 'mix' && fbMode !== 'pixelMotion') return undefined;
         if (layerKind !== 'video') return undefined;
-        const st = (() => {
-          const remapped = anim.sample(node.id, 'timeRemap', t) ?? anim.sample(node.id, 'precompTime', t);
-          return remapOf(node.id)(remapped !== undefined ? remapped : t);
-        })();
+        const st = retimedSourceAt(node.id, t);
         // Bracket on the SOURCE's rate when we know it. This was the documented
         // KNOWN LIMIT in videoFrameCache: nothing in the browser reports a
         // `<video>`'s frame rate, so the bracket fell back to the composition's
@@ -3300,27 +3650,13 @@ export function buildSnapshot(
       // Fill opacity — stored 0..100 like `opacity`, emitted 0..1. Absent
       // stays undefined rather than defaulting to 1, so a layer that never
       // touched it does not get routed down the CPU-bake path.
-      fillOpacity: (() => {
-        const v = a?.get('fillOpacity') ?? readNumProp(node, 'fillOpacity');
-        return typeof v === 'number' ? Math.max(0, Math.min(1, v / 100)) : undefined;
-      })(),
+      fillOpacity: fillOpacityOf(a?.get('fillOpacity') ?? readNumProp(node, 'fillOpacity')),
       // Skew — animatable like every other transform property, so it reads
       // from the sampled values first and the static prop second.
       skew: a?.get('skew') ?? readNumProp(node, 'skew'),
       skewAxis: a?.get('skewAxis') ?? readNumProp(node, 'skewAxis'),
-      // Continuous Rasterization. Emitted only when ON, so a layer without the
-      // switch carries no field and the snapshot is unchanged from before this
-      // feature existed. Gated on `supportsContinuousRaster` here rather than
-      // trusted from the prop, so a stray flag on an image layer cannot make the
-      // provider allocate a 64MB raster that cannot look any better.
-      ...(readContinuousRaster(node) && supportsContinuousRaster(node)
-        ? { continuousRaster: true }
-        : {}),
-      // Corner Pin. Read here (identity/degenerate pins already collapse to
-      // undefined) and warped onto the render mvp in snapshotToFrameScene; export
-      // and preview share this path, so a pinned layer is perspective-correct in
-      // both. Absent = affine, snapshot unchanged from before the feature.
-      ...(readNodeCornerPin(node) ? { cornerPin: readNodeCornerPin(node) } : {}),
+      // (Continuous Rasterization and Corner Pin are assigned after the
+      // literal, only when present — see the note above it.)
       // Legacy unseeded solids still lack a real transform — keep them
       // full-frame until the user resizes. Seeded solids transform normally.
       x: isSolid && !is3D && solidUnseeded ? comp.width / 2 : px,
@@ -3371,22 +3707,7 @@ export function buildSnapshot(
       // Per-corner radii ride alongside for Appearance → individual corners;
       // uniform SDF still reads `cornerRadius` when all four match.
       cornerRadius: resolvedCornerRadius,
-      ...(resolvedCornerRadius > 0 || hasIndependentCornerRadii(resolvedCornerRadii)
-        ? { cornerRadii: resolvedCornerRadii }
-        : {}),
-      // The scale the raster will be stretched by, so the shape path can undo
-      // it for the CORNERS alone — see `RenderLayer.cornerRadiusScale`. `sx`/
-      // `sy` are the effective (world / projected) scale at this point, which
-      // is the same pair the compositor places the quad with. Emitted only when
-      // it would change something.
-      ...((() => {
-        const csx = Math.abs(sx);
-        const csy = Math.abs(sy);
-        const rounded = resolvedCornerRadius > 0 || hasIndependentCornerRadii(resolvedCornerRadii);
-        return rounded && (csx !== 1 || csy !== 1) && csx > 1e-6 && csy > 1e-6
-          ? { cornerRadiusScale: [csx, csy] as const }
-          : {};
-      })()),
+      // (`cornerRadii` / `cornerRadiusScale` are assigned after the literal.)
       // Keyframeable like any numeric prop: an animated track wins over the base,
       // so a panel can frost in over time.
       // Glass owns the backdrop blur when it is on — one control, not two that
@@ -3395,20 +3716,11 @@ export function buildSnapshot(
       glass,
       pathPoints,
       pathOpen: pathOpen || undefined,
-      // Source Text keyframes (hold-interpolated data track, like AE) beat the
-      // component's static content.
-      text: (() => {
-        const live = anim.sampleData(node.id, 'text.source', remapOf(node.id)(t));
-        const raw = typeof live === 'string' ? live : base.text;
-        // PARAGRAPH text renders WRAPPED. Wrapping is done by the same function
-        // the measurement uses, so the box the rasterizer allocates and the
-        // lines it draws into it can never disagree about where breaks fall.
-        // Text on a path is point text: its box width never wraps it.
-        const boxWidth = hasTextPath(node) ? 0 : readNumProp(node, 'boxWidth');
-        if (!boxWidth || boxWidth <= 0 || typeof raw !== 'string') return raw;
-        const style = readMeasuredTextStyle(node, { content: raw, boxWidth });
-        return style ? style.content : raw;
-      })(),
+      // Source Text keyframes (hold-interpolated data track, like AE — sampled
+      // once above as `liveSourceText`) beat the
+      // component's static content; paragraph text renders wrapped — see
+      // `wrappedLayerText`.
+      text: wrappedLayerText(node, typeof liveSourceText === 'string' ? liveSourceText : base.text),
       // Numeric character props are keyframeable — sample the animated value
       // when a track exists, else fall back to the static base prop.
       fontSize: a?.get('fontSize') ?? base.fontSize,
@@ -3416,29 +3728,67 @@ export function buildSnapshot(
       // Animated weight beats the static string — continuous (not rounded), so
       // a variable font's wght axis actually glides instead of stepping through
       // the nine named stops. Clamped to CSS's 1–1000.
-      fontWeight: (() => {
-        const w = a?.get('fontWeight');
-        return w !== undefined ? String(Math.max(1, Math.min(1000, w))) : base.fontWeight;
-      })(),
+      fontWeight: animatedFontWeight(a?.get('fontWeight'), base.fontWeight),
       // Variable-font width / slant — Canvas uses font-variation-settings, not
-      // the font shorthand (see textFontVariationSettings).
-      fontWidth: (() => {
-        const w = a?.get('fontWidth');
-        return w !== undefined ? w : base.fontWidth;
-      })(),
-      fontSlant: (() => {
-        const s = a?.get('fontSlant');
-        return s !== undefined ? s : base.fontSlant;
-      })(),
+      // the font shorthand (see textFontVariationSettings). `!== undefined`
+      // rather than `??`, exactly as before.
+      fontWidth: definedOr(a?.get('fontWidth'), base.fontWidth),
+      fontSlant: definedOr(a?.get('fontSlant'), base.fontSlant),
       fontStyle: base.fontStyle,
       letterSpacing: a?.get('letterSpacing') ?? base.letterSpacing,
       lineHeight: a?.get('lineHeight') ?? base.lineHeight,
       align: base.align,
       paragraphSpacing: a?.get('paragraphSpacing') ?? base.paragraphSpacing,
       strokeOverFill: base.strokeOverFill,
-      // Character-panel extras. The numeric ones are keyframeable like the
-      // other character props; the case/variant/super-sub switches are not.
-      ...(kind === 'text' ? {
+      // (Text-only Character-panel extras are assigned after the literal.)
+      // Depth of field applies to 3D layers only. A 2D layer's `depth` is just
+      // the focal length, which matches the DOF focus default — so this looked
+      // fine until someone set Focus Distance, at which point every 2D title,
+      // logo and UI layer blurred along with the 3D scene. AE never defocuses 2D
+      // layers; they are not in the camera's space at all.
+      filter: isSolid || !layerMaterial.castsShadows
+        ? withDof(filter, is3D ? depth : undefined)
+        : withShadow(withDof(filter, is3D ? depth : undefined), px, py),
+      effects: resolvedEffects.length ? resolvedEffects : undefined,
+      // Heal absolute backend URLs baked into older documents → same-origin path.
+      // Resolution order lives in rigMeshInputs so the puppet overlay resolves
+      // the SAME source this layer draws (its coverage mask is keyed off it).
+      src: resolveRigImageSrc(node, kind, base, layerTimeNow, (id) => assetById().get(id), comp.useProxies === true ? 'viewport' : 'original'),
+      assetId: base.assetId,
+    };
+
+    // The literal's conditional keys, in their original relative order.
+    if (readNodePreserveTransparency(node)) layer.preserveTransparency = true;
+    // Continuous Rasterization. Emitted only when ON, so a layer without the
+    // switch carries no field and the snapshot is unchanged from before this
+    // feature existed. Gated on `supportsContinuousRaster` here rather than
+    // trusted from the prop, so a stray flag on an image layer cannot make the
+    // provider allocate a 64MB raster that cannot look any better.
+    if (readContinuousRaster(node) && supportsContinuousRaster(node)) layer.continuousRaster = true;
+    // Corner Pin. Read here (identity/degenerate pins already collapse to
+    // undefined) and warped onto the render mvp in snapshotToFrameScene; export
+    // and preview share this path, so a pinned layer is perspective-correct in
+    // both. Absent = affine, snapshot unchanged from before the feature.
+    const cornerPin = readNodeCornerPin(node);
+    if (cornerPin) layer.cornerPin = cornerPin;
+    {
+      const rounded = resolvedCornerRadius > 0 || hasIndependentCornerRadii(resolvedCornerRadii);
+      if (rounded) layer.cornerRadii = resolvedCornerRadii;
+      // The scale the raster will be stretched by, so the shape path can undo
+      // it for the CORNERS alone — see `RenderLayer.cornerRadiusScale`. `sx`/
+      // `sy` are the effective (world / projected) scale at this point, which
+      // is the same pair the compositor places the quad with. Emitted only when
+      // it would change something.
+      const csx = Math.abs(sx);
+      const csy = Math.abs(sy);
+      if (rounded && (csx !== 1 || csy !== 1) && csx > 1e-6 && csy > 1e-6) {
+        layer.cornerRadiusScale = [csx, csy] as const;
+      }
+    }
+    // Character-panel extras. The numeric ones are keyframeable like the
+    // other character props; the case/variant/super-sub switches are not.
+    if (kind === 'text') {
+      Object.assign(layer, {
         textTransform: base.textTransform,
         fontVariant: base.fontVariant,
         verticalAlign: base.verticalAlign,
@@ -3455,8 +3805,7 @@ export function buildSnapshot(
         textExtras: withTextMoreOptions((() => {
           const boxWidth = hasTextPath(node) ? 0 : readNumProp(node, 'boxWidth');
           if (!boxWidth || boxWidth <= 0) return textExtrasForNode(node);
-          const live = anim.sampleData(node.id, 'text.source', remapOf(node.id)(t));
-          const raw = typeof live === 'string' ? live : base.text;
+          const raw = typeof liveSourceText === 'string' ? liveSourceText : base.text;
           if (typeof raw !== 'string') return textExtrasForNode(node);
           const style = readMeasuredTextStyle(node, { content: raw, boxWidth });
           // The style also carries a paragraph box's Fit Text to Box scale,
@@ -3475,51 +3824,36 @@ export function buildSnapshot(
         // Variable-font axes beyond wght/wdth/slnt, with `text.axis.<tag>`
         // tracks applied. Undefined unless the layer sets one.
         fontAxes: resolveFontAxes(node, a),
-      } : {}),
-      // Depth of field applies to 3D layers only. A 2D layer's `depth` is just
-      // the focal length, which matches the DOF focus default — so this looked
-      // fine until someone set Focus Distance, at which point every 2D title,
-      // logo and UI layer blurred along with the 3D scene. AE never defocuses 2D
-      // layers; they are not in the camera's space at all.
-      filter: isSolid || !readNodeMaterial(node, a).castsShadows
-        ? withDof(filter, is3D ? depth : undefined)
-        : withShadow(withDof(filter, is3D ? depth : undefined), px, py),
-      effects: resolvedEffects.length ? resolvedEffects : undefined,
-      // Heal absolute backend URLs baked into older documents → same-origin path.
-      // Resolution order lives in rigMeshInputs so the puppet overlay resolves
-      // the SAME source this layer draws (its coverage mask is keyed off it).
-      src: resolveRigImageSrc(node, kind, base, remapOf(node.id)(t), (id) => assetById().get(id), comp.useProxies === true ? 'viewport' : 'original'),
-      assetId: base.assetId,
-      ...(kind === 'svg' && readSvgLayer(node)?.livePlayback ? { liveSvgPlayback: true } : {}),
-      // Media-slot COVER crop. The quad is already the slot rect (fillSlot
-      // keeps the box there on purpose), so filling it without distortion means
-      // sampling a sub-rect of the source. Computed per frame rather than baked
-      // at fill time because the slot's box can be animated — a scaling slot
-      // must re-crop as its aspect changes, and a baked rect would smear.
-      ...(() => {
-        if (slotFitOf(node) !== 'cover') return {};
-        const slot = { width: base.width ?? 0, height: base.height ?? 0 };
-        const source = footageSourceOf(node);
-        const size = source && source.width > 0
-          ? { width: source.width, height: source.height }
-          : null;
-        const uv = size ? coverUvRect(size, slot) : null;
-        return uv ? { uvRect: uv } : {};
-      })(),
-      // Interpret Footage ▸ Alpha and ▸ Fields. Read from the ASSET's
-      // interpretation, so one correction fixes every layer using that file —
-      // including layers in other compositions — rather than being re-set per
-      // layer.
-      ...(footageSourceOf(node)?.alpha === 'premultiplied' ? { premultipliedSource: true } : {}),
-      ...((): { fieldsSource?: 'upper' | 'lower'; pulldownSource?: number } => {
-        const source = footageSourceOf(node);
-        // Mutually exclusive by construction: footageSourceOf suppresses
-        // `fields` while Remove Pulldown is set (the served frames are
-        // progressive — see sourceInfo.ts).
-        if (source?.pulldownPhase !== undefined) return { pulldownSource: source.pulldownPhase };
-        return source?.fields ? { fieldsSource: source.fields } : {};
-      })(),
-    };
+      });
+    }
+    if (kind === 'svg' && readSvgLayer(node)?.livePlayback) layer.liveSvgPlayback = true;
+    // Media-slot COVER crop. The quad is already the slot rect (fillSlot
+    // keeps the box there on purpose), so filling it without distortion means
+    // sampling a sub-rect of the source. Computed per frame rather than baked
+    // at fill time because the slot's box can be animated — a scaling slot
+    // must re-crop as its aspect changes, and a baked rect would smear.
+    if (slotFitOf(node) === 'cover') {
+      const slot = { width: base.width ?? 0, height: base.height ?? 0 };
+      const source = footageSourceOf(node);
+      const size = source && source.width > 0
+        ? { width: source.width, height: source.height }
+        : null;
+      const uv = size ? coverUvRect(size, slot) : null;
+      if (uv) layer.uvRect = uv;
+    }
+    // Interpret Footage ▸ Alpha and ▸ Fields. Read from the ASSET's
+    // interpretation, so one correction fixes every layer using that file —
+    // including layers in other compositions — rather than being re-set per
+    // layer.
+    {
+      const source = footageSourceOf(node);
+      if (source?.alpha === 'premultiplied') layer.premultipliedSource = true;
+      // Mutually exclusive by construction: footageSourceOf suppresses
+      // `fields` while Remove Pulldown is set (the served frames are
+      // progressive — see sourceInfo.ts).
+      if (source?.pulldownPhase !== undefined) layer.pulldownSource = source.pulldownPhase;
+      else if (source?.fields) layer.fieldsSource = source.fields;
+    }
 
     // Per-quad Lambert lighting (Material Options → Accepts Lights, default
     // off): the plane normal comes from the layer's 3D world matrix; the
@@ -3527,7 +3861,7 @@ export function buildSnapshot(
     // adapter folds into the draw tint — identical on the GPU depth path and
     // the affine fallback. No lights in the scene ⇒ identity ⇒ nothing added.
     if (is3D && world3d && sceneLights.length > 0) {
-      const mat = readNodeMaterial(node, a);
+      const mat = layerMaterial;
       if (mat.acceptsLights) {
         const lit = shadeLayer(
           planeNormalOf(world3d),
@@ -3864,8 +4198,11 @@ export function buildSnapshot(
               ownX + ((anim.sample(node.id, 'x', ti) ?? localX) - localX),
               ownY + ((anim.sample(node.id, 'y', ti) ?? localY) - localY),
               anim.sample(node.id, 'z', ti) ?? z3,
-              anim.sample(node.id, 'rotationX', ti) ?? rotX,
-              anim.sample(node.id, 'rotationY', ti) ?? rotY,
+              // An Orient-Towards-Camera layer faces the eye in every sample,
+              // exactly as its frame does; the raw tilt props would turn it away
+              // the moment motion blur switched on.
+              faceRotX !== rotX ? faceRotX : anim.sample(node.id, 'rotationX', ti) ?? rotX,
+              faceRotY !== rotY ? faceRotY : anim.sample(node.id, 'rotationY', ti) ?? rotY,
               ownRot + ((anim.sample(node.id, 'rotation', ti) ?? localRot) - localRot),
               sc ?? anim.sample(node.id, 'scaleX', ti) ?? ownScaleX,
               sc ?? anim.sample(node.id, 'scaleY', ti) ?? ownScaleY,
@@ -3986,7 +4323,7 @@ export function buildSnapshot(
       // 3D only — see the `filter` twin above.
       const dofFx = is3D ? dofEffectOf(depth) : null;
       if (dofFx) gpuFx.push(dofFx);
-      const mat = readNodeMaterial(node, a);
+      const mat = layerMaterial;
       // Solids are excluded from the 2D drop shadow only: a 2D solid is pinned
       // full-frame, so a drop shadow off it would be a shadow of the whole
       // comp. A 3D solid is un-pinned onto its own transform (see
@@ -4171,6 +4508,9 @@ export function buildSnapshot(
       depth: number;
       bevel: number;
       bevelStyle: ExtrusionMeshRequest['bevelStyle'];
+      holeBevelScale: number;
+      /** The effects a glyph BODY may carry (colour/LUT); the plane keeps all. */
+      effects: RenderLayer['effects'];
       faceMats: ReturnType<typeof readNodeFaceMaterials>;
       wallFill: string;
       lit: boolean;
@@ -4307,7 +4647,8 @@ export function buildSnapshot(
         and the quad is not emitted.
       */
       const complexOutline = layer.kind === 'text' || (layer.kind === 'shape' && layer.primitive === 'path');
-      const meshOwnsFront = complexOutline && meshBevel > 0 && !perCharText;
+      // AE Hole Bevel Depth: the counters' chamfer as a % of the rim's.
+      const holeBevelScale = Math.max(0, Math.min(100, a?.get('holeBevelDepth') ?? d3.holeBevelDepth)) / 100;
       /*
         Effect REACH decides the path. COLOUR effects reach every surface of
         the body on the mesh: the AFFINE ones (invert, tint, …) fold into the
@@ -4328,9 +4669,23 @@ export function buildSnapshot(
       // mesh is defocused per pixel from the depth buffer (the gather pass),
       // so the appended flat-quad blur is not what it needs — and counting it
       // sent every extruded text to the slice stack the moment DOF came on.
-      const meshBlockedByFx = (layer.effects ?? []).some(
+      const spatialFx = (layer.effects ?? []).some(
         (e) => e.enabled !== false && e.id !== 'dof' && !isColorEffect(e.type) && !isLutEffect(e.type),
       );
+      /*
+        ...EXCEPT for text and paths. A rect or ellipse falls back to flat
+        faces that each carry their own resolve, which looks right. A complex
+        outline falls back to the SLICE STACK: up to 400 flat copies of the
+        whole string, lit as fronts, each spreading the layer — the smeared,
+        see-through, offset-double "broken 3D text" you got the moment a drop
+        shadow or a stroke style was added (styles compile to effects, so ANY
+        layer style tripped this). So a styled complex outline keeps its SOLID:
+        the mesh body takes the colour grades it can, and the FRONT is the
+        layer's own full-size quad carrying every effect and style, exactly
+        as a flat styled layer draws. The mesh then skips its front chamfer —
+        a full-size quad would hide it and leave a notch behind its edge.
+      */
+      const meshBlockedByFx = spatialFx && !complexOutline;
       /*
         INTERIOR layer styles (inner shadow, inner glow, satin, bevel, stroke)
         hug the contour of the surface they are on, so each one has to be
@@ -4343,7 +4698,17 @@ export function buildSnapshot(
         the spatial effects above follow. Overlays are not in this set: they
         repaint the surface and already reach every face through `wallFill`.
       */
-      const meshBlockedByStyles = faceStyles !== undefined;
+      // Same exemption as the effects above, for the same reason: a complex
+      // outline's fallback is the slice stack, so its interior styles resolve on
+      // the front quad and the body stays a solid.
+      const meshBlockedByStyles = faceStyles !== undefined && !complexOutline;
+      /** A text/path whose front carries what the mesh cannot: drawn by the quad. */
+      const styledFront = complexOutline && (spatialFx || faceStyles !== undefined);
+      const meshOwnsFront = complexOutline && meshBevel > 0 && !perCharText && !styledFront;
+      /** Colour/LUT grades (and the DOF entry) — all a mesh carrier can apply. */
+      const meshEffects = styledFront
+        ? (layer.effects ?? []).filter((e) => e.enabled !== false && (e.id === 'dof' || isColorEffect(e.type) || isLutEffect(e.type)))
+        : layer.effects;
       /*
         Per-character 3D + extrusion: one solid PER GLYPH (AE 26), not one
         shared body under detachable planes. Decided here — the material
@@ -4367,6 +4732,8 @@ export function buildSnapshot(
             depth: extrusionDepth,
             bevel: meshBevel,
             bevelStyle: d3.bevelStyle,
+            holeBevelScale,
+            effects: meshEffects,
             faceMats,
             wallFill,
             lit: extLit,
@@ -4381,7 +4748,11 @@ export function buildSnapshot(
         ? null
         : extrusionOutlineFor(layer, node, layerW, layerH);
       const builtMesh = meshOutline
-        ? extrusionMeshFor(meshOutline, layerW, layerH, { depth: extrusionDepth, bevel: meshBevel, bevelStyle: d3.bevelStyle, frontCap: meshOwnsFront })
+        ? extrusionMeshFor(meshOutline, layerW, layerH, {
+            depth: extrusionDepth, bevel: meshBevel, bevelStyle: d3.bevelStyle, frontCap: meshOwnsFront,
+            ...(styledFront ? { frontBevel: false } : {}),
+            ...(complexOutline ? { holeBevelScale } : {}),
+          })
         : null;
       let meshEmitted = false;
       if (builtMesh) {
@@ -4449,8 +4820,8 @@ export function buildSnapshot(
           const scrub = {
             // Colour-only by the gate above (affine + LUT); the adapter folds
             // them into the range colours (solid) / colour matrix + LUT strip
-            // (textured).
-            effects: layer.effects,
+            // (textured). A styled text/path front keeps the rest on its quad.
+            effects: meshEffects,
             matte: undefined,
             isMatteSource: undefined,
             isAdjustment: undefined,
@@ -4611,7 +4982,9 @@ export function buildSnapshot(
           };
 
           if (extLit) {
-            const lg = shadeLayer(planeNormalOf(M), { x: world.x, y: world.y, z: z3 }, sceneLights);
+            // The material's Ambient / Diffuse, as the GPU path applies them —
+            // without it the affine fallback lit a Diffuse-100 body at half.
+            const lg = shadeLayer(planeNormalOf(M), { x: world.x, y: world.y, z: z3 }, sceneLights, { ambient: extMat.ambient, diffuse: extMat.diffuse });
             if (lg) {
               sliceLayer.lighting = lg;
               sliceLayer.shade3d = { specular: extMat.specular / 100, shininess: extMat.shininess, ambient: extMat.ambient, diffuse: extMat.diffuse, ...(extMat.shading === 'pbr' ? { roughness: extMat.roughness / 100, metal: extMat.metal / 100 } : {}), ...(extMat.shading === 'toon' ? { toonBands: extMat.toonBands, metal: extMat.metal / 100 } : {}) };
@@ -4785,7 +5158,7 @@ export function buildSnapshot(
               above (their normals are all +Z, so clamping would black the whole
               stack out under a front light).
             */
-            const lg = shadeLayer(planeNormalOf(M), { x: world.x, y: world.y, z: z3 }, sceneLights, undefined, true);
+            const lg = shadeLayer(planeNormalOf(M), { x: world.x, y: world.y, z: z3 }, sceneLights, { ambient: extMat.ambient, diffuse: extMat.diffuse }, true);
             if (lg) {
               faceLayer.lighting = lg;
               faceLayer.shade3d = { specular: extMat.specular / 100, shininess: extMat.shininess, oneSided: true, ambient: extMat.ambient, diffuse: extMat.diffuse, ...(extMat.shading === 'pbr' ? { roughness: extMat.roughness / 100, metal: extMat.metal / 100 } : {}), ...(extMat.shading === 'toon' ? { toonBands: extMat.toonBands, metal: extMat.metal / 100 } : {}) };
@@ -5013,7 +5386,13 @@ export function buildSnapshot(
           const pg = perGlyphExtrusion;
           const bodyOutline = extrusionOutlineFor(glyphLayer, node, g.width, g.height);
           const body = bodyOutline
-            ? extrusionMeshFor(bodyOutline, g.width, g.height, { depth: pg.depth, bevel: pg.bevel, bevelStyle: pg.bevelStyle })
+            // The glyph PLANE is the full-size front, so the body chamfers only
+            // its back: a front ring would sit hidden behind the plane and
+            // leave a notch along every glyph edge.
+            ? extrusionMeshFor(bodyOutline, g.width, g.height, {
+                depth: pg.depth, bevel: pg.bevel, bevelStyle: pg.bevelStyle,
+                frontBevel: false, holeBevelScale: pg.holeBevelScale,
+              })
             : null;
           if (body) {
             // An animator fill colour recolours the glyph's whole solid, as a
@@ -5049,10 +5428,10 @@ export function buildSnapshot(
               fill: resolveFaceMaterial(pg.faceMats, 'side', wallBase).fill,
               visible: layer.visible,
               flatFacet: true,
-              // Colour/LUT effects only (the perGlyphExtrusion gate): the
-              // adapter folds them into the range colours, exactly as it does
-              // for the whole-string carrier's `scrub.effects`.
-              effects: layer.effects,
+              // Colour/LUT effects only: the adapter folds them into the range
+              // colours, exactly as it does for the whole-string carrier's
+              // `scrub.effects`. A styled layer's spatial ones stay on the plane.
+              effects: pg.effects,
               ...(layer.castsShadow3d ? { castsShadow3d: true } : {}),
               extrudedMesh: { key: body.key, vertices: body.mesh.vertices, indices: body.mesh.indices, ranges },
             };
@@ -5074,7 +5453,7 @@ export function buildSnapshot(
           }
         }
         if (pcLit) {
-          const lg = shadeLayer(planeNormalOf(M), { x: O.x, y: O.y, z: z3 + g.offsetZ }, sceneLights);
+          const lg = shadeLayer(planeNormalOf(M), { x: O.x, y: O.y, z: z3 + g.offsetZ }, sceneLights, { ambient: pcMat.ambient, diffuse: pcMat.diffuse });
           if (lg) {
             glyphLayer.lighting = lg;
             glyphLayer.shade3d = { specular: pcMat.specular / 100, shininess: pcMat.shininess, ambient: pcMat.ambient, diffuse: pcMat.diffuse, ...(pcMat.shading === 'pbr' ? { roughness: pcMat.roughness / 100, metal: pcMat.metal / 100 } : {}), ...(pcMat.shading === 'toon' ? { toonBands: pcMat.toonBands, metal: pcMat.metal / 100 } : {}) };
@@ -5085,7 +5464,19 @@ export function buildSnapshot(
     } else if (frontDrawnByMesh) {
       // Front cap already drawn as part of the extrusion mesh (see meshOwnsFront).
     } else if (frontInset > 0) {
-      emitLayer({ ...layer, width: layerW - 2 * frontInset, height: layerH - 2 * frontInset }, node);
+      // The inset front's corners follow the chamfer's inner edge, whose radius
+      // is the outline's minus the inset — keeping the full radius left a
+      // 0.41·bevel sliver of open body at every rounded corner.
+      const insetR = (r: number): number => Math.max(0, r - frontInset);
+      emitLayer({
+        ...layer,
+        width: layerW - 2 * frontInset,
+        height: layerH - 2 * frontInset,
+        ...(layer.cornerRadius !== undefined ? { cornerRadius: insetR(layer.cornerRadius) } : {}),
+        ...(layer.cornerRadii
+          ? { cornerRadii: layer.cornerRadii.map(insetR) as unknown as NonNullable<RenderLayer['cornerRadii']> }
+          : {}),
+      }, node);
     } else if (
       is3D &&
       dof &&
@@ -5135,6 +5526,40 @@ export function buildSnapshot(
     // Echo ▸ Composite In Front: the ghosts held back above, now that the layer
     // they trail is on the canvas. Empty for every other operator.
     for (const ghost of echoesInFront) emitLayer(ghost, node);
+  };
+
+  /*
+    The layer walk, one node at a time, each isolated from the rest.
+
+    A node that throws (effect params that break a resolver, a malformed path,
+    a NaN reaching a matrix helper) used to throw out of buildSnapshot and
+    blank the whole frame. Now it is dropped — together with anything it had
+    already emitted, so no half-built layer or its `::shadow` / `::ext-*`
+    helpers reach the frame — and replaced by the same invisible stub a hidden
+    layer gets. The stub matters: a positional track matte pairs a layer with
+    its NEIGHBOUR in the stack, and an empty slot would silently re-pair the
+    next matte with the wrong layer.
+
+    The failure is recorded on the snapshot (`layerErrors`): preview reports it
+    once, export refuses the frame. Nothing is allocated unless a node throws.
+  */
+  for (const node of nodes) {
+    try {
+      buildLayerNode(node);
+    } catch (err) {
+      layerErrors = pushLayerError(layerErrors, {
+        layerId: node.id,
+        ...(node.name ? { layerName: node.name } : {}),
+        stage: 'snapshot',
+        message: errorMessage(err),
+      });
+      dropEmittedLayers(node.id);
+      try {
+        emitInvisibleStub(node);
+      } catch {
+        /* reading the node's matte is what threw — leave the slot empty */
+      }
+    }
   }
 
   // ── Beams that land: project an aimed light's pool onto the plane it lits ──
@@ -5395,6 +5820,19 @@ export function buildSnapshot(
   const anyThreeD = layers.some((l) => l.matrix);
   if (anyThreeD) {
     const locked = new Array<boolean>(layers.length).fill(false);
+    // id → FIRST index, built once, only if some layer names a matte source.
+    // This was a `findIndex` per matted layer — O(n²) on a comp full of mattes.
+    let firstIndexById: Map<string, number> | null = null;
+    const indexOfId = (id: string): number => {
+      if (!firstIndexById) {
+        firstIndexById = new Map();
+        for (let k = 0; k < layers.length; k++) {
+          const lid = layers[k]!.id;
+          if (!firstIndexById.has(lid)) firstIndexById.set(lid, k);
+        }
+      }
+      return firstIndexById.get(id) ?? -1;
+    };
     for (let i = 0; i < layers.length; i++) {
       const l = layers[i]!;
       if (l.isAdjustment) locked[i] = true;
@@ -5414,7 +5852,7 @@ export function buildSnapshot(
         locked[i] = true; // the matted layer
         const sourceId = readMatte(l.matte)?.sourceId;
         if (sourceId) {
-          const j = layers.findIndex((x) => x.id === sourceId);
+          const j = indexOfId(sourceId);
           if (j >= 0) locked[j] = true;
         } else if (i + 1 < layers.length) {
           // Positional matte consumes the layer ABOVE in the stack — the row
@@ -5538,6 +5976,8 @@ export function buildSnapshot(
     view,
     camera3d,
     lights3d,
+    // Present only when a layer threw and was skipped (see the guarded walk).
+    ...(layerErrors ? { layerErrors } : {}),
     // Only worth carrying with a 3D layer to reflect in — and only when the
     // environment actually contributes: a zeroed Intensity or Reflections
     // leaves the shader multiplying the map by 0, which is a texture upload
@@ -5691,6 +6131,37 @@ export function resolveMatteSources(layers: RenderLayer[]): void {
       layer.matteSourceId = layers[i + 1]!.id;
     }
   }
+}
+
+/**
+ * A layer's paint for one frame — live strokes, keyframed Stroke Options /
+ * Transform / Path sampled at LAYER time, clone source times resolved (see
+ * `core/paint/paintTime.ts`). An unpainted layer returns at the first check,
+ * so the pass costs nothing for the layers that do not use it.
+ */
+function resolveLayerPaintAt(
+  node: SceneNode,
+  layerT: number,
+  values: ReadonlyMap<string, number> | undefined,
+  anim: { sampleData(nodeId: string, prop: string, t: number): unknown },
+  nodes: ReadonlyMap<string, SceneNode>,
+  layerTimeOf: (id: string) => number,
+): PaintConfig | undefined {
+  const stored = readNodePaint(node);
+  if (!stored) return undefined;
+  return resolvePaintAt(stored, {
+    t: layerT,
+    values,
+    selfId: node.id,
+    sampleData: (prop) => anim.sampleData(node.id, prop, layerT),
+    layerTimeOf,
+    sizeOf: (id) => {
+      const props = nodes.get(id)?.components.find((c) => c.type === 'Transform')?.props as Record<string, unknown> | undefined;
+      return typeof props?.width === 'number' && typeof props?.height === 'number'
+        ? { width: props.width, height: props.height }
+        : null;
+    },
+  });
 }
 
 export { COMP_WIDTH, COMP_HEIGHT };

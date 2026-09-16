@@ -15,7 +15,8 @@
 
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { Providers } from '@providers/Providers';
-import { useLayoutStore } from '@stores/layoutStore';
+import { useLayoutStore, consumeLayoutMigration } from '@stores/layoutStore';
+import { reconcileActiveWorkspace } from '@core/layout/workspaceManager';
 import { useSelectionStore } from '@stores/selectionStore';
 import { useUIStore } from '@stores/uiStore';
 import { type EasingPreset } from '@core/animation/keyframeAssistants';
@@ -35,6 +36,7 @@ import { useSpaceTransport } from '@hooks/useSpaceTransport';
 import { getTimelineController, getRemappedTime, compToKeyframeTime, keyframeToCompTime } from '@core/timeline/TimelineController';
 import { staticOrDefaultValue, writeStaticPropertyValue } from '@core/inspector/propertyValue';
 import { MASK_ANIM_PROP, buildStaticPropertyTree } from '@core/timeline/propertyTree';
+import { PATH_ANIM_PROP, togglePathAnimation } from '@core/workspace/pathCommands';
 import { modifiedPropertyRows } from '@core/animation/modifiedProps';
 import { deriveTimelineTracks } from '@layout/Timeline/deriveTimelineTracks';
 import { runSceneEditDetection } from '@core/tracking/sceneEditCommand';
@@ -262,9 +264,14 @@ function EditorShellInner(): JSX.Element {
     // nothing at all once it is absent from the registry.
     const openBefore = new Set(Object.values(useLayoutStore.getState().panelOrder).flat());
     for (const p of availablePanelDefs()) {
-      registerPanel({ id: p.id, title: p.title, icon: p.icon, region: p.region, weight: p.weight, closable: p.closable });
+      registerPanel({ id: p.id, title: p.title, icon: p.icon, region: p.region, weight: p.weight, closable: p.closable, onDemand: p.onDemand });
       if (p.onDemand && !openBefore.has(p.id)) useLayoutStore.getState().closePanel(p.id);
     }
+    // A pre-2026-09-15 layout was migrated at load (its tab lists dropped), so
+    // the panels above registered into the new defaults. If the user had a
+    // specialised builtin workspace active, put ITS panels back — Color should
+    // still open on Scopes — rather than silently demoting them to Default.
+    if (consumeLayoutMigration()) reconcileActiveWorkspace();
   }, [registerPanel]);
 
   // The panels that are NOT known at build time: one per plugin panel that asked
@@ -997,6 +1004,11 @@ function EditorShellInner(): JSX.Element {
         if (animated) clearMaskAnim(trackId);
         else keyframeMask(trackId, getRemappedTime(trackId, playheadNow()));
       });
+      return;
+    }
+    // A shape's Path row: a whole-outline data track, like the mask row above.
+    if (props[0] === PATH_ANIM_PROP) {
+      togglePathAnimation(trackId);
       return;
     }
     // The stopwatch is lit when animated, so clicking it means "turn this off" —

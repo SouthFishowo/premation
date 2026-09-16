@@ -102,7 +102,10 @@ for (const [, src] of all) for (const [k, v] of dispatchMap(src)) if (!dispatch.
 // The population, from the predicate's own list.
 const c2d = all.get('canvas2dEffects.ts');
 const at = c2d.indexOf('const CANVAS2D_ONLY');
-const CPU = [...c2d.slice(at, c2d.indexOf('])', at)).matchAll(/'([a-z0-9-]+)'/g)].map((m) => m[1]);
+// Comments stripped first: the list keeps retired members as commented-out
+// lines with their reasons, and counting those reported 28 CPU-only effects
+// when the live set was 9 — the number an effect-port plan was then sized on.
+const CPU = [...stripComments(c2d.slice(at, c2d.indexOf('])', at))).matchAll(/'([a-z0-9-]+)'/g)].map((m) => m[1]);
 
 /** The pure kernel a handler delegates to, if it has one. */
 function kernelOf(type) {

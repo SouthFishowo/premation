@@ -1512,15 +1512,17 @@ export function packNoise(
  * reuse that buffer across frames, and writing a per-frame transform into it
  * would make the plugin's parameters depend on where the layer happened to be.
  *
- * ── The host pass block, at floats 16..23 (bytes 64..95) ─────────────────────
+ * ── The host pass block, at floats 16..35 (bytes 64..143) ────────────────────
  *
  * Between the renderer's header and the plugin's parameters sits a block this
- * function owns entirely:
+ * function owns entirely (block-relative float indices below):
  *
- *   16,17  texelSize : vec2<f32>   one over the target's dimensions
- *   18     passScale : f32
- *   19     passIndex : f32
- *   20..23 _reserved : vec4<f32>   zeroed
+ *   0,1    texelSize : vec2<f32>   one over the target's dimensions
+ *   2      passScale : f32
+ *   3      passIndex : f32
+ *   4..14  the host inputs the app computed (sizes, time, rate, seed)
+ *   15     _reserved : f32         zeroed
+ *   16..19 layerRect : vec4<f32>   the layer's box in `uv` units
  *
  * `texelSize` is the reason a separable blur can be written at all — `uv +
  * vec2(texelSize.x, 0)` is one pixel to the right at whatever resolution the
@@ -1534,6 +1536,34 @@ export function packNoise(
  * same texel 65 times.
  */
 const PASS_BLOCK_FLOAT = MAT3_STD140_FLOATS + 4;
+/**
+ * Floats in the host block. Twenty: sixteen since it grew to carry the values a
+ * plugin effect had no way to read at all — the time, the sizes, the rate, a
+ * seed — and four more for `layerRect`, without which a kernel could not find
+ * its own layer inside a target that is the whole viewport.
+ *
+ * ★ These offsets are the renderer's half of a layout the APP generates (see
+ * `effectSchema.parameterBlock` / `HOST_BLOCK_FLOAT_OFFSET`). The two are
+ * checked against each other in `src/core/plugins/hostBlockPacking.test.ts`;
+ * there is no import, because this package must not depend on the app, and
+ * there is no third copy.
+ */
+const PASS_BLOCK_FLOATS = 20;
+
+/** What the app knows and this function writes. See `FrameScene`'s `hostInputs`. */
+export interface PluginHostInputs {
+  compWidth: number;
+  compHeight: number;
+  layerWidth: number;
+  layerHeight: number;
+  time: number;
+  compTime: number;
+  frame: number;
+  fps: number;
+  pixelScale: number;
+  downsample: number;
+  seed: number;
+}
 
 export function packPluginEffect(
   mvp: Mat3,
@@ -1544,8 +1574,28 @@ export function packPluginEffect(
   targetHeight: number,
   passScale: number,
   passIndex: number,
+  /**
+   * The host-filled inputs, when the app supplied them.
+   *
+   * Optional, and zeros when absent, rather than required: a scene built
+   * without a composition context — a test, a probe — must still draw, and a
+   * kernel reading a zero comp size gets an obviously wrong number instead of
+   * a stale one from whatever was rendered before.
+   */
+  host?: PluginHostInputs,
+  /**
+   * Where the layer sits in the target, as a [0,1] fraction of the quad — the
+   * chain's `fxBox`, in the same top-down space the built-in box-relative
+   * effects read. Absent means the layer IS the target.
+   *
+   * Written as `layerRect` AFTER being pushed through `uvRect`, so it is in the
+   * units of the `uv` the kernel receives — including the vertical flip on a
+   * backend whose targets run bottom-up, which makes its height negative there.
+   * `(uv - layerRect.xy) / layerRect.zw` is then top-down layer-local on both.
+   */
+  layerBox: Rect = { x: 0, y: 0, width: 1, height: 1 },
 ): Float32Array {
-  const out = new Float32Array(Math.max(params.length, PASS_BLOCK_FLOAT + 8));
+  const out = new Float32Array(Math.max(params.length, PASS_BLOCK_FLOAT + PASS_BLOCK_FLOATS));
   out.set(params);
   const o = packMat3(mvp, out, 0);
   packRect(uvRect, out, o);
@@ -1557,12 +1607,28 @@ export function packPluginEffect(
   out[PASS_BLOCK_FLOAT + 1] = targetHeight > 0 ? 1 / targetHeight : 0;
   out[PASS_BLOCK_FLOAT + 2] = passScale;
   out[PASS_BLOCK_FLOAT + 3] = passIndex;
+  out[PASS_BLOCK_FLOAT + 4] = host?.compWidth ?? 0;
+  out[PASS_BLOCK_FLOAT + 5] = host?.compHeight ?? 0;
+  out[PASS_BLOCK_FLOAT + 6] = host?.layerWidth ?? 0;
+  out[PASS_BLOCK_FLOAT + 7] = host?.layerHeight ?? 0;
+  out[PASS_BLOCK_FLOAT + 8] = host?.time ?? 0;
+  out[PASS_BLOCK_FLOAT + 9] = host?.compTime ?? 0;
+  out[PASS_BLOCK_FLOAT + 10] = host?.frame ?? 0;
+  out[PASS_BLOCK_FLOAT + 11] = host?.fps ?? 0;
+  // 1 rather than 0 for the two scale factors: a kernel dividing by either gets
+  // the identity instead of an infinity when nobody supplied them.
+  out[PASS_BLOCK_FLOAT + 12] = host?.pixelScale ?? 1;
+  out[PASS_BLOCK_FLOAT + 13] = host?.downsample ?? 1;
+  out[PASS_BLOCK_FLOAT + 14] = host?.seed ?? 0;
   // `_reserved`, zeroed explicitly. It is the part a later version will start
   // using, and a plugin reading stale bytes from it today would break on the
   // day it becomes meaningful.
-  out[PASS_BLOCK_FLOAT + 4] = 0;
-  out[PASS_BLOCK_FLOAT + 5] = 0;
-  out[PASS_BLOCK_FLOAT + 6] = 0;
-  out[PASS_BLOCK_FLOAT + 7] = 0;
+  out[PASS_BLOCK_FLOAT + 15] = 0;
+  // `layerRect`: the box through the same map the vertex stage applies to the
+  // quad (`uv = uvRect.xy + pos * uvRect.zw`), so it lands in `uv` units.
+  out[PASS_BLOCK_FLOAT + 16] = uvRect.x + layerBox.x * uvRect.width;
+  out[PASS_BLOCK_FLOAT + 17] = uvRect.y + layerBox.y * uvRect.height;
+  out[PASS_BLOCK_FLOAT + 18] = layerBox.width * uvRect.width;
+  out[PASS_BLOCK_FLOAT + 19] = layerBox.height * uvRect.height;
   return out;
 }

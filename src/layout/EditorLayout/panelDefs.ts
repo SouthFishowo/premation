@@ -26,6 +26,12 @@ export interface PanelDef {
   closable: boolean;
   /** Registered, then closed on a fresh session — opened via menu/shortcut. */
   onDemand?: boolean;
+  /**
+   * The rail label, when `title` is too long for the rail's one short line.
+   * The tooltip and header still say `title`; this only spares the rail an
+   * ellipsis that would cut "Effect Controls" to "Effect C…".
+   */
+  shortTitle?: string;
 }
 
 /**
@@ -50,58 +56,57 @@ export interface PanelDef {
  *    or stretched layer. Its trim in/out already existed in three other places
  *    including Alt+[ / Alt+].
  */
+/**
+ * FEWER PERMANENT PANELS (2026-09-15). Array order is rail order.
+ *
+ * This file used to argue, panel by panel, that Transcript, Plugins, Swatches,
+ * Scopes, Source and Audio must be permanent because "an on-demand panel is a
+ * panel nobody finds". The sum of those arguments was a left rail of 7
+ * unlabelled icons and a right rail of 14, which a user could only read by
+ * hovering every one — and four of them duplicated another surface (Layers vs
+ * the timeline's layer list, Effect Controls vs Effects, Graph vs the
+ * timeline's Graph Editor, Info & Audio vs Audio). Discoverability by sheer
+ * presence stopped working once everything was present.
+ *
+ * So the permanent set is now what nearly every session uses — Project,
+ * Library and AI on the left, Properties and Audio on the right — and the
+ * discoverability those arguments wanted comes from three places instead:
+ * rails that print each panel's NAME, a "+" at the foot of each rail listing
+ * that side's closed panels, and Window ▸ Panels. Specialised workspaces
+ * (Animation, Color, Color & VFX) open the panels their job needs.
+ *
+ * Ids never change — saved workspaces and persisted layouts hold them — and
+ * `layoutStore`'s LAYOUT_SCHEMA_VERSION drops an older persisted tab order once
+ * so these defaults actually reach existing users.
+ */
 export const PANEL_DEFS: readonly PanelDef[] = [
   // ── Left sidebar ─────────────────────────────────────────────────
-  // NOTE: there is deliberately no 'project' panel any more (removed
-  // 2026-08-20). It listed the same assets the Assets panel owns plus a comp
-  // list nobody needed a second surface for — a duplicate bin whose Import
-  // button, unlike the Assets panel's, did not place the footage in the open
-  // composition, which read as "my video didn't import". Comps are managed
-  // from the Composition panel menu and the timeline's comp tabs.
-  // Titled "Layers" (2026-09-03), id kept: the panel is the layer tree with
-  // the comp list above it, and "Scene" named the document, not the surface.
-  // Saved workspaces and persisted layouts hold the id, so it cannot move.
-  { id: 'scene',       title: 'Layers',    icon: 'layers',      region: 'leftSidebar', weight: 10,  closable: false },
-  // AE's Effect Controls: the applied-effect stack for the selected layer.
-  // Lives on the LEFT because the right inspector's Effects tab is the library
-  // you add FROM — putting both in one tab buried the browser under every
-  // effect you applied. `stopwatch` is the glyph AE uses on every animatable
-  // parameter in this panel, and no other tab already speaks it.
-  { id: 'effectControls', title: 'Effect Controls', icon: 'stopwatch', region: 'leftSidebar', weight: 9, closable: false },
-  { id: 'assets',      title: 'Assets',    icon: 'image',       region: 'leftSidebar', weight: 8,   closable: false },
+  // The Layers panel: hosts document compositions and the layer hierarchy tree.
+  { id: 'scene',       title: 'Layers',    icon: 'layers',      region: 'leftSidebar', weight: 10,  closable: true },
   /**
-   * Text-based editing: the composition's spoken words, as chips you can seek
-   * to, select in runs and DELETE — which cuts that time out of every layer and
-   * closes the gap.
-   *
-   * NOT `onDemand`, and the argument is the one `marketplace` and
-   * `sourceMonitor` already made in this file: the routes that open an
-   * on-demand panel all live in a menu, so a surface nobody knows exists is a
-   * surface nobody summons. This one has the additional problem that its whole
-   * premise — that you can edit video by editing text — is not something a user
-   * goes looking for unless they have already seen it.
-   *
-   * `mic` because it is the only unclaimed glyph that names SPEECH. `type` and
-   * `text-left` are the Character and Paragraph tabs', `audio` and `waves` name
-   * a waveform rather than words, and `voice` aliases the same Phosphor
-   * component as `mic`.
+   * The Assets panel: imported files, media browser, and asset management.
+   * Dedicated to imported assets (images, video, audio).
    */
-  { id: 'transcript',  title: 'Transcript', icon: 'mic',        region: 'leftSidebar', weight: 7,   closable: false },
+  { id: 'assets',      title: 'Assets',    icon: 'folder',      region: 'leftSidebar', weight: 8,   closable: false },
   { id: 'library',     title: 'Library',   icon: 'component',   region: 'leftSidebar', weight: 6,   closable: false },
   // Both editions — see PANEL_AVAILABILITY / `aiEnabled()`. Local runs BYOK;
   // server runs through the hosted gateway.
   { id: 'ai',          title: 'AI',        icon: 'ai',          region: 'leftSidebar', weight: 4,   closable: false },
-  // The marketplace. Distinct from the `plugins` panel in the right inspector,
-  // which HOSTS the interfaces plugins provide — this one is where you find,
-  // install and manage them. Two different jobs that were easy to conflate
-  // under one name, so only this one is titled "Plugins".
-  //
-  // PERMANENT and NOT closable, like Scene and Assets. It shipped `onDemand`
-  // first, which meant it did not exist until the user went to the menu bar and
-  // asked for it — so finding a plugin required already knowing the panel was
-  // there to be summoned. A marketplace nobody can see is not discoverable by
-  // definition, and that is the one job it has.
-  { id: 'marketplace', title: 'Plugins',   icon: 'plugin',      region: 'leftSidebar', weight: 5,   closable: false },
+  // AE's Effect Controls: the applied-effect stack for the selected layer. On
+  // demand like AE's own — F3, Window ▸ Effect Controls, and every "edit this
+  // effect" route (`revealEffectControls`, the Properties panel) open it.
+  // `stopwatch` is the glyph AE uses on every animatable parameter in it.
+  { id: 'effectControls', title: 'Effect Controls', shortTitle: 'Controls', icon: 'stopwatch', region: 'leftSidebar', weight: 9, closable: true, onDemand: true },
+  /**
+   * Text-based editing: the composition's spoken words, as chips you can seek
+   * to, select in runs and DELETE — which cuts that time out of every layer and
+   * closes the gap. Window ▸ Transcript and the Transcribe commands open it.
+   *
+   * `mic` because it is the only unclaimed glyph that names SPEECH. `type` is
+   * the Text tab's, `audio` and `waves` name a waveform rather than words, and
+   * `voice` aliases the same Phosphor component as `mic`.
+   */
+  { id: 'transcript',  title: 'Transcript', icon: 'mic',        region: 'leftSidebar', weight: 7,   closable: true, onDemand: true },
   // ── Right inspector ──────────────────────────────────────────────
   /**
    * Merged 2026-08-03: `style` (Style) and `misc` (Settings) folded into this
@@ -115,64 +120,56 @@ export const PANEL_DEFS: readonly PanelDef[] = [
    * (a curve graph, an effect stack, a rig, a render queue) rather than
    * properties of the current selection.
    */
-  { id: 'properties',  title: 'Properties', icon: 'sliders-h',  region: 'rightInspector', weight: 5,   closable: false },
-  { id: 'character',   title: 'Text',      icon: 'type',        region: 'rightInspector', weight: 4.8, closable: false },
-  { id: 'align',       title: 'Align',     icon: 'align-center', region: 'rightInspector', weight: 4.6, closable: false },
-  // The project palette. NOT `onDemand`: a palette nobody can see is a palette
-  // nobody fills, and the swatches it holds are document state that has to be
-  // discoverable from the file rather than from a menu the user has to already
-  // know about — the same argument that made `marketplace` permanent.
-  { id: 'swatches',    title: 'Swatches',  icon: 'palette',     region: 'rightInspector', weight: 4.55, closable: false },
-  { id: 'info',        title: 'Info & Audio', icon: 'info',     region: 'rightInspector', weight: 4.5, closable: false },
+  { id: 'properties',  title: 'Properties', icon: 'sliders-h',  region: 'rightInspector', weight: 5,    closable: false },
+  { id: 'effects',     title: 'Effects',   icon: 'magic-wand',  region: 'rightInspector', weight: 4.8,  closable: true },
+  { id: 'presets',     title: 'Presets',   icon: 'zap',         region: 'rightInspector', weight: 4.7,  closable: true },
+  // The marketplace: find, install and manage plugins.
+  { id: 'marketplace', title: 'Plugins',   icon: 'plugin',      region: 'rightInspector', weight: 4.6,  closable: false },
   /**
-   * AE's Audio panel (Ctrl+4). Distinct from `info`, which MONITORS the master
-   * bus and edits nothing: this one's faders write the selected layer's level
-   * and pan, so the meter and the control that answers it finally live
-   * together. NOT `onDemand` — a mixer the user has to already know about is a
-   * mixer nobody balances against, the same argument that keeps `scopes` and
-   * `swatches` permanent.
+   * AE's Audio panel (Ctrl+4): the master meter, the selected layer's level and
+   * pan faders, and — since 2026-09-15 — the pointer / composition readout that
+   * used to be a separate "Info & Audio" tab beside it (`InfoReadout`). Two
+   * tabs that both drew a master meter was one too many.
    */
   { id: 'audio',       title: 'Audio',     icon: 'audio',       region: 'rightInspector', weight: 4.48, closable: false },
-  // Video scopes: waveform, RGB parade, vectorscope, histogram. NOT `onDemand`
-  // — an on-demand panel needs something that opens it (see
-  // `onDemandPanelsReachable.test.ts`), and a measurement surface you have to
-  // already know exists before you can find it is a measurement surface nobody
-  // grades against. `waves` is the one unclaimed glyph that reads as a signal
-  // trace; every other candidate (`graph-value`, `graph-speed`) is already the
-  // Graph panel's, and a tab whose icon names another tab is worse than none.
-  { id: 'scopes',      title: 'Scopes',    icon: 'waves',       region: 'rightInspector', weight: 4.45, closable: false },
-  { id: 'preview',     title: 'Preview',   icon: 'play',        region: 'rightInspector', weight: 4.4, closable: false },
+  // ── Right inspector, on demand (Window ▸ Panels, the rail's "+") ─────
+  // Each of these is a specialist surface; the workspaces that need one open
+  // it (Color → Scopes, Animation → Graph + Rigging).
+  { id: 'character',   title: 'Text',      icon: 'type',        region: 'rightInspector', weight: 4.4,  closable: true, onDemand: true },
+  { id: 'align',       title: 'Align',     icon: 'align-center', region: 'rightInspector', weight: 4.3, closable: true, onDemand: true },
+  // The project palette. The swatches are document state and the colour picker
+  // offers them wherever a colour is edited, so the panel is the bulk editor.
+  { id: 'swatches',    title: 'Swatches',  icon: 'palette',     region: 'rightInspector', weight: 4.25, closable: true, onDemand: true },
+  // The pointer / composition readout plus a simple master meter — the same
+  // readout Audio now carries at its top, kept for layouts that want it alone.
+  { id: 'info',        title: 'Info',      icon: 'info',        region: 'rightInspector', weight: 4.2,  closable: true, onDemand: true },
+  // Video scopes: waveform, RGB parade, vectorscope, histogram. The Color
+  // workspaces lead with it. `waves` is the one unclaimed glyph that reads as a
+  // signal trace; `graph-value` / `graph-speed` are the Graph panel's.
+  { id: 'scopes',      title: 'Scopes',    icon: 'waves',       region: 'rightInspector', weight: 4.15, closable: true, onDemand: true },
+  { id: 'preview',     title: 'Preview',   icon: 'play',        region: 'rightInspector', weight: 4.1,  closable: true, onDemand: true },
   /**
    * The SOURCE viewer — one clip, before it is in the edit, with in/out points
-   * and the four verbs that put the marked range into a comp.
+   * and the four verbs that put the marked range into a comp. Every route that
+   * hands it a clip (the Project panel's context menu, the footage dialog's
+   * "Open in Source Monitor") goes through `openSourceMonitor`, which opens the
+   * panel first — so on demand costs those routes nothing.
    *
-   * NOT `onDemand`, and the reason is the same one that made `marketplace`
-   * permanent: every route that opens an on-demand panel lives in a menu model
-   * or a command registration, and a viewer nobody can see is a viewer nobody
-   * loads a clip into. It is also the panel the Assets context menu and the
-   * footage dialog's "Open in Source Monitor" hand a clip to — `openPanel` on
-   * a registered-but-closed panel would work, but the first time a user meets
-   * this surface should not require already knowing to summon it.
-   *
-   * `tv` because every other glyph in this rail is spoken for and a monitor is
-   * what this is: `video` and `image` name media KINDS (the Assets panel), and
-   * `play` is the Preview panel's.
+   * `tv` because a monitor is what this is: `video` and `image` name media
+   * KINDS, and `play` is the Preview panel's.
    */
-  { id: 'sourceMonitor', title: 'Source',  icon: 'tv',          region: 'rightInspector', weight: 4.42, closable: false },
-  { id: 'tracker',     title: 'Tracker',   icon: 'crosshair',   region: 'rightInspector', weight: 4.2, closable: false },
-  { id: 'rig',         title: 'Rigging',   icon: 'bone',        region: 'rightInspector', weight: 3.5, closable: false },
-  // `magic-wand`, not `zap`: Lightning is the app's speed/quick-action glyph and
-  // it was already carrying the Presets tab's meaning here. A tab icon that
-  // names a different tab's job is worse than a generic one.
-  { id: 'effects',     title: 'Effects',   icon: 'magic-wand',  region: 'rightInspector', weight: 3,   closable: false },
-  // The graph editor + EXPRESSION editor. Its renderer has always existed in
-  // getAllPanelRenderers, but it was never registered and nothing called
-  // openPanel('motion') — so the entire expressions feature had no way in.
-  { id: 'motion',      title: 'Graph',     icon: 'graph-value', region: 'rightInspector', weight: 1.4, closable: false },
-  // Was `keyframe` — the same diamond the timeline draws on every animated
-  // property, so the tab read as "keyframes" rather than "motion presets".
-  { id: 'presets',     title: 'Presets',   icon: 'zap',         region: 'rightInspector', weight: 1,   closable: false },
-  { id: 'history',     title: 'History',   icon: 'history',     region: 'rightInspector', weight: 0.8, closable: true, onDemand: true },
+  { id: 'sourceMonitor', title: 'Source',  icon: 'tv',          region: 'rightInspector', weight: 4.05, closable: true, onDemand: true },
+  { id: 'tracker',     title: 'Tracker',   icon: 'crosshair',   region: 'rightInspector', weight: 4.0,  closable: true, onDemand: true },
+  { id: 'rig',         title: 'Rigging',   icon: 'bone',        region: 'rightInspector', weight: 3.5,  closable: true, onDemand: true },
+  // The graph + EXPRESSION editor. On demand beside the timeline's own Graph
+  // Editor (Shift+G); the Animation and Motion Design workspaces open it.
+  { id: 'motion',      title: 'Graph',     icon: 'graph-value', region: 'rightInspector', weight: 1.4,  closable: true, onDemand: true },
+  { id: 'history',     title: 'History',   icon: 'history',     region: 'rightInspector', weight: 0.8,  closable: true, onDemand: true },
+  // AE's Paint (Ctrl+8) and Brushes (Ctrl+9). On demand like AE's own: the
+  // compact Tool Options bar covers everyday painting, and both commands plus
+  // the Window menu open them (`layout/Paint/paintCommands.ts`).
+  { id: 'paint',       title: 'Paint',     icon: 'brush',       region: 'rightInspector', weight: 0.78, closable: true, onDemand: true },
+  { id: 'brushes',     title: 'Brushes',   icon: 'circle',      region: 'rightInspector', weight: 0.76, closable: true, onDemand: true },
   // `closable: true` like every other on-demand panel. It was the one exception,
   // so PanelHeader drew no ✕ and the only way to dismiss it was F6 or the Window
   // menu — for a panel that opens on demand and is empty most of the time.

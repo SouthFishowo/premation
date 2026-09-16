@@ -105,6 +105,26 @@ describe('export refuses frames the renderer could not honour', () => {
     ).rejects.toThrow(/Media offline|could not be honoured/i);
   });
 
+  it('names a lost GPU device, not a video decode, when both are true of the frame', async () => {
+    // A device loss mid-export leaves the frame's footage unconverged too. The
+    // exactness gate used to run first and blamed the decode — sending the user
+    // to transcode footage that was never the problem.
+    const be = {
+      ...fakeBackend([[{ code: 'device-lost', detail: 'The GPU device was lost while rendering this frame' }]]),
+      lastFrameMediaExact: () => false,
+    };
+    (globalThis as { __fakeBackend?: unknown }).__fakeBackend = be;
+    const run = renderOffline(params as never, async () => {});
+    await expect(run).rejects.toThrow(/GPU device was lost/);
+    await expect(run).rejects.not.toThrow(/video decode/);
+  });
+
+  it('still refuses an unconverged frame when nothing else is wrong with it', async () => {
+    const be = { ...fakeBackend([[]]), lastFrameMediaExact: () => false };
+    (globalThis as { __fakeBackend?: unknown }).__fakeBackend = be;
+    await expect(renderOffline(params as never, async () => {})).rejects.toThrow(/video decode/);
+  });
+
   it('tolerates a backend with no diagnostics support at all', async () => {
     // lastFrameDiagnostics is optional on the interface; a backend without it
     // must not make export throw on every frame.

@@ -15,9 +15,24 @@
  * status bar and the Files tab show, on top of whatever `onSaved` the caller
  * passed. How many snapshots are kept, and whether a copy also lands in a
  * folder, is `recovery.ts`'s business.
+ *
+ * ── Main-thread cost ─────────────────────────────────────────────────────
+ * An interval tick waits for an idle period before capturing, and hands the
+ * snapshot to the recovery worker, which serialises, compresses and skips an
+ * unchanged document off the main thread. Only the window closing writes
+ * synchronously, because nothing runs after it.
  */
 
 import { captureRecovery, persistRecovery } from './recovery';
+
+/** An interval tick runs by then even if the main thread never goes idle. */
+const IDLE_TIMEOUT_MS = 5000;
+
+function whenIdle(fn: () => void): void {
+  const g = globalThis as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number };
+  if (typeof g.requestIdleCallback === 'function') g.requestIdleCallback(fn, { timeout: IDLE_TIMEOUT_MS });
+  else setTimeout(fn, 0);
+}
 
 export interface AutosaveOptions {
   /** Fallback interval when no preference is readable. */
@@ -83,8 +98,9 @@ export class AutosaveController {
   private timer: ReturnType<typeof setInterval> | null = null;
   private opts: AutosaveOptions | null = null;
   private unsubscribePrefs: (() => void) | null = null;
+  private idlePending = false;
   private readonly onHide = (): void => { if (document.hidden) this.flush(); };
-  private readonly onUnload = (): void => this.flush();
+  private readonly onUnload = (): void => this.write({ sync: true });
 
   start(opts: AutosaveOptions): void {
     this.stop();
@@ -102,18 +118,32 @@ export class AutosaveController {
 
   private arm(): void {
     if (this.timer) clearInterval(this.timer);
-    this.timer = setInterval(() => this.flush(), this.intervalMs());
+    this.timer = setInterval(() => this.flushWhenIdle(), this.intervalMs());
+  }
+
+  /** The interval tick: capture in the next idle period, not mid-frame. */
+  private flushWhenIdle(): void {
+    if (this.idlePending) return;
+    this.idlePending = true;
+    whenIdle(() => {
+      this.idlePending = false;
+      this.flush();
+    });
   }
 
   /** Capture + persist a snapshot now, if dirty. Non-blocking, best-effort. */
   flush(): void {
+    this.write({ sync: false });
+  }
+
+  private write(opts: { sync: boolean }): void {
     const o = this.opts;
     if (!o || !o.isDirty()) return;
     try {
       const snap = captureRecovery(o.getTime());
       if (snap) {
         snap.savedAt = o.now();
-        persistRecovery(snap);
+        persistRecovery(snap, { sync: opts.sync });
         stampLastAutosave(snap.savedAt);
         o.onSaved?.(snap.savedAt);
       }
@@ -134,7 +164,8 @@ export class AutosaveController {
       const snap = captureRecovery(o.getTime());
       if (!snap) return null;
       snap.savedAt = o.now();
-      persistRecovery(snap);
+      // Forced: the person asked, so an unchanged document is written anyway.
+      persistRecovery(snap, { force: true });
       stampLastAutosave(snap.savedAt);
       o.onSaved?.(snap.savedAt);
       return snap.savedAt;

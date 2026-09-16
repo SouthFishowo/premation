@@ -337,7 +337,9 @@
   font-size: var(--font-size-sm);
   color: var(--color-text-secondary);
   font-weight: 500;
-  min-width: 76px;
+  /* The compact property rows' label column, so Align / Cap / Join labels in
+     Appearance start their controls on the same x as the numeric rows. */
+  min-width: var(--prop-label-col, 64px);
   flex-shrink: 0;
 }
 
@@ -396,6 +398,83 @@
 
 .cornerGrid .popoverLabel {
   min-width: 28px;
+}
+
+/* ── Transform section list (compact inspector rows) ── */
+/* Tighter than `.inlineRows`: the rows are single-line and carry their own
+   hover background, so an 8px gap read as a list of separate cards. */
+.rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* The "More" disclosure — sentence case, the weight of a row label, so it
+   reads as part of the list rather than a heading over it. */
+.moreToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  align-self: flex-start;
+  height: var(--control-height-xs);
+  margin-top: var(--space-1);
+  padding: 0 var(--space-2) 0 var(--space-1);
+  border: none;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  transition: var(--motion-hover-transition);
+}
+
+.moreToggle:hover {
+  color: var(--color-text-primary);
+  background: var(--color-hover);
+}
+
+.moreToggle:focus-visible {
+  outline: 1px solid var(--color-primary);
+  outline-offset: 1px;
+}
+
+.moreBody {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* The anchor-presets trigger after the Anchor fields. */
+.anchorButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-height-xs);
+  height: var(--control-height-xs);
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition: var(--motion-hover-transition);
+}
+
+.anchorButton:hover,
+.anchorButton[data-open] {
+  color: var(--color-text-primary);
+  background: var(--color-surface-2);
+}
+
+.anchorButton:focus-visible {
+  outline: 1px solid var(--color-primary);
+  outline-offset: 1px;
+}
+
+.anchorPopover {
+  padding: var(--space-2);
 }
 
 /* ── 3x3 Anchor Origin Selector Matrix ── */

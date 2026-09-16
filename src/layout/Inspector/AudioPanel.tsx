@@ -52,6 +52,7 @@ import { runAnimEdit } from '@core/animation/animationCommands';
 import { compToKeyframeTime } from '@core/timeline/TimelineController';
 import { applyFade, DEFAULT_FADE_SEC } from '@core/audio/audioFades';
 import { channelDb, fromChannelDb, CLIP_DB } from './faderMath';
+import { InfoReadout } from './InfoReadout';
 import { Icon } from '@components/Icon';
 import { cn } from '@utils/cn';
 import styles from './AudioPanel.module.css';
@@ -273,6 +274,9 @@ export function AudioPanel(): JSX.Element {
           </label>
         </div>
       )}
+
+      {/* ── Pointer + composition readout (the old Info & Audio tab) ── */}
+      <InfoReadout compact />
 
       {/* ── Meter + faders, sharing one dB scale ───────────────────── */}
       <div className={styles.deck}>

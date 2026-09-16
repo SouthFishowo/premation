@@ -4,7 +4,7 @@
  * memoised because neither depends on the playhead.
  */
 
-import { forwardRef, memo, useCallback, useEffect, useRef, type ForwardedRef, type PointerEvent as ReactPointerEvent } from 'react';
+import { forwardRef, memo, useCallback, useEffect, useRef, type ForwardedRef, type Ref, type PointerEvent as ReactPointerEvent } from 'react';
 import { cn } from '@utils/cn';
 import styles from './Timeline.module.css';
 import { TIMELINE_LEFT_OFFSET, TIMELINE_TOP_PADDING, type Row } from './timelineShared';
@@ -116,6 +116,7 @@ function RulerImpl({
   duration = 0,
   pixelsPerSecond = 80,
   leftOffset = TIMELINE_LEFT_OFFSET,
+  fillRef,
 }: {
   ticks: { x: number; major: boolean; label: string }[];
   height: number;
@@ -125,8 +126,14 @@ function RulerImpl({
   duration?: number;
   pixelsPerSecond?: number;
   leftOffset?: number;
+  /**
+   * When given, the progress fill's WIDTH belongs to the owner of this ref (a
+   * live playhead subscription) and React leaves it alone — `currentTime` is
+   * then a throttled value that must not overwrite the live one.
+   */
+  fillRef?: Ref<HTMLDivElement>;
 }): JSX.Element {
-  const progressWidth = Math.max(0, Math.min(duration * pixelsPerSecond, currentTime * pixelsPerSecond));
+  const progressWidth = rulerProgressWidth(currentTime, duration, pixelsPerSecond);
   const trackWidth = duration > 0 ? duration * pixelsPerSecond : width;
 
   return (
@@ -140,8 +147,9 @@ function RulerImpl({
 
       {/* Video progress fill with primary color as video passes */}
       <div
+        ref={fillRef}
         className={styles.rulerProgressFill}
-        style={{ left: leftOffset, width: progressWidth }}
+        style={fillRef ? { left: leftOffset } : { left: leftOffset, width: progressWidth }}
         aria-hidden
       />
 
@@ -160,6 +168,11 @@ function RulerImpl({
 }
 
 export const Ruler = memo(RulerImpl);
+
+/** The ruler's progress-fill width in px: the playhead's x, clamped to the comp. */
+export function rulerProgressWidth(time: number, duration: number, pixelsPerSecond: number): number {
+  return Math.max(0, Math.min(duration * pixelsPerSecond, time * pixelsPerSecond));
+}
 
 export function generateRulerTicks(durationSec: number, pps: number, fps: number, startSec = 0, offset = 0): { x: number; major: boolean; label: string }[] {
   const targetPxBetweenMajor = 100;

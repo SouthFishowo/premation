@@ -1,7 +1,7 @@
 /**
- * PropertiesPanel — the inspector for whatever is selected, in sub-tabs.
+ * PropertiesPanel — the inspector for whatever is selected, as one list.
  *
- * ## History, because the shape has flipped twice
+ * ## History, because the shape has flipped three times
  *
  * This was once three dock tabs — Transform, Style, Settings — and each was an
  * accordion of property sections with its own search box that could not see
@@ -10,25 +10,35 @@
  * (2026-08-03) to end the guessing.
  *
  * The merge over-corrected: a plain shape then showed EIGHT section headers in
- * one column, and the section you wanted was below the fold behind a wall of
- * uppercase titles. So the sections are grouped again — but INSIDE the panel,
- * under one header and one search box, and with the two failure modes of the
- * old split designed out:
+ * one column, so sub-tabs came back inside the panel (Transform · Style ·
+ * Layer · Animation, plus Pinned). Measured with a plain shape selected, those
+ * tabs mostly held what did not apply — "Layer" opened on a disabled
+ * Pathfinder, "Animation" held two advanced tools — and the header above them
+ * was nine unlabelled switch icons squeezing the title to "PR…".
  *
- *   • a sub-tab is only offered when the selected layer has a section in it,
- *     and a remembered tab the new layer lacks falls back to the first it has,
- *     so a selection never lands on an empty screen;
- *   • the search box reads across every sub-tab, and each hit is badged with
- *     the tab it lives in — so "where is X" is answered by typing X.
+ * ## One list, done properly (2026-09-15)
+ *
+ *   • ONE scrolling accordion, in the registry's editing order, with
+ *     sentence-case names;
+ *   • a section that does not apply to the selection is not drawn at all —
+ *     including whole-selection rules, so Pathfinder appears only once two
+ *     shapes are selected;
+ *   • only the sections about what the layer IS and how it looks open by
+ *     default; everything else starts collapsed;
+ *   • the first row names the selection (`SelectionHeader`), and the six layer
+ *     switches are labelled checkbox rows in the ⋯ menu instead of glyphs in
+ *     the dock header. The dock header keeps its title and only the search
+ *     toggle is portalled into it;
+ *   • two or more layers selected puts align / distribute on a row above the
+ *     sections; nothing selected shows the composition summary.
  *
  * ## The selection, not the first selected layer (2026-09-04)
  *
- * The panel used to read `selected[0]` and stop. Now every section is drawn for
- * the PRIMARY layer and edits ALL selected layers, through
- * `InspectorSelectionProvider`: a row whose values disagree shows `—`, a drag
- * offsets every layer, a typed `+10` is evaluated per layer, and every gesture
- * is one undo entry (`core/inspector/multiSelection.ts`). A section only some
- * of the selection has is badged "2 of 3" in its header.
+ * Every section is drawn for the PRIMARY layer and edits ALL selected layers,
+ * through `InspectorSelectionProvider`: a row whose values disagree shows `—`,
+ * a drag offsets every layer, a typed `+10` is evaluated per layer, and every
+ * gesture is one undo entry (`core/inspector/multiSelection.ts`). A section
+ * only some of the selection has is badged "2 of 3" in its header.
  *
  * ## What re-renders when
  *
@@ -38,9 +48,9 @@
  * in a memoised host (`InspectorContent`), so a keystroke in the search box
  * does not run twenty section renders.
  *
- * The panel is the SHELL only: the sticky selection header, the tab strip, the
- * search and the scroller. Which sections exist, in what order and in which
- * tab is `inspectorSections.ts`; how they render is `InspectorContent`.
+ * The panel is the SHELL only: the identity row, the search, the align row and
+ * the scroller. Which sections exist and in what order is
+ * `inspectorSections.ts`; how they render is `InspectorContent`.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -61,12 +71,12 @@ import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { useNodesRevision } from '@core/inspector/nodeRevision';
 import { InspectorContent } from '@layout/Inspector/InspectorContent';
 import { InspectorSelectionProvider } from '@layout/Inspector/inspectorSelection';
-import { SelectionHeader } from '@layout/Inspector/SelectionHeader';
 import {
-  INSPECTOR_CATEGORIES,
-  inspectorCategoriesFor,
-  type InspectorCategory,
-} from '@layout/Inspector/inspectorSections';
+  SelectionHeader,
+  layerSwitchMenuItems,
+  layerSwitchSignature,
+} from '@layout/Inspector/SelectionHeader';
+import { SelectionAlignRow } from '@layout/Inspector/SelectionAlignRow';
 import { MographParamsSection } from '@layout/Inspector/MographParamsSection';
 import { ActiveTemplateFields } from '@layout/Templates/TemplateFieldsPanel';
 import { cn } from '@utils/cn';
@@ -80,24 +90,13 @@ function TemplateFieldsSection(): JSX.Element | null {
 }
 
 /**
- * The sub-tabs the SELECTION offers: the union over every selected layer, in
- * display order. A tab the primary lacks still lists — its sections apply to
- * the other layers — but the accordion inside draws the primary's sections,
- * so such a tab shows the "no … properties for this layer" state with the
- * coverage badges explaining why.
+ * Open the Properties panel with the Pinned section expanded. There is no tab
+ * to switch to any more, so "show pinned" means writing the section's
+ * remembered open state — the same preference a click on its header writes.
  */
-function categoriesForSelection(nodeIds: ReadonlyArray<string>): InspectorCategory[] {
-  const present = new Set<InspectorCategory>();
-  for (const id of nodeIds) {
-    if (!defaultSceneGraph.getNode(id)) continue;
-    for (const c of inspectorCategoriesFor(id)) present.add(c);
-  }
-  return INSPECTOR_CATEGORIES.map((c) => c.id).filter((id) => present.has(id));
-}
-
-/** Show the Properties panel on a given sub-tab — the commands below. */
-function showInspectorTab(tab: InspectorCategory): void {
-  usePreferenceStore.getState().set('inspectorTab', tab);
+function showPinnedSection(): void {
+  const prefs = usePreferenceStore.getState();
+  prefs.set('inspectorSections', { ...prefs.inspectorSections, pinned: true });
   useLayoutStore.getState().openPanel('properties');
 }
 
@@ -107,8 +106,8 @@ function showInspectorTab(tab: InspectorCategory): void {
  * Providers registers during boot.
  *
  * Menu rows wanted (menuModel.ts is not this file's to edit):
- *   View ▸ Inspector ▸ Keyframe Lanes           → inspector.toggleKeyframeLanes
- *   Window ▸ Properties ▸ Pinned / Effects tab  → inspector.showPinned / inspector.showEffects
+ *   View ▸ Inspector ▸ Keyframe Lanes             → inspector.toggleKeyframeLanes
+ *   Window ▸ Properties ▸ Pinned / Effect Controls → inspector.showPinned / inspector.showEffects
  */
 function registerInspectorCommands(): void {
   try {
@@ -127,11 +126,11 @@ function registerInspectorCommands(): void {
     });
     reg.register({
       id: asCommandId('inspector.showPinned'),
-      label: 'Properties: Pinned Tab',
-      description: 'Show the selected layer’s pinned and essential properties',
+      label: 'Properties: Show Pinned',
+      description: 'Open Properties with the selected layer’s pinned and essential properties expanded',
       icon: 'push-pin',
       enabled: () => true,
-      execute: () => showInspectorTab('pinned'),
+      execute: showPinnedSection,
     });
     reg.register({
       id: asCommandId('inspector.showEffects'),
@@ -156,15 +155,11 @@ export function PropertiesPanel(): JSX.Element {
   // The SELECTION's revisions, not the scene's — see the module note.
   useNodesRevision(selected);
   const node = primary ? defaultSceneGraph.getNode(primary) : null;
+  const hasLayer = !!(primary && node);
+  const liveCount = hasLayer ? selected.filter((id) => !!defaultSceneGraph.getNode(id)).length : 0;
 
-  // The remembered sub-tab, resolved against what THIS selection offers.
-  const preferredTab = usePreferenceStore((s) => s.inspectorTab);
   const showLane = usePreferenceStore((s) => s.inspectorShowLane);
   const setPref = usePreferenceStore((s) => s.set);
-  const available: InspectorCategory[] = primary && node ? categoriesForSelection(selected) : [];
-  const activeTab: InspectorCategory | null = available.length === 0
-    ? null
-    : available.includes(preferredTab) ? preferredTab : available[0]!;
 
   // Closing the search clears it; a hidden non-empty query would silently keep
   // the panel in search view with no field on screen to say so.
@@ -174,27 +169,41 @@ export function PropertiesPanel(): JSX.Element {
 
   const searching = query.trim().length > 0;
 
+  // The switch rows' every input, flattened to a string. Re-read each render
+  // (a toggle bumps the selection's revision, which re-renders this), but a
+  // string compares by value, so the memo below only rebuilds when a row's
+  // checked state or the applicable set actually moved.
+  const switchSig = hasLayer ? layerSwitchSignature(selected) : '';
+
   // Memoised, and it has to be: the effect below hands this list to the
   // DockPanel header, which is a state update THERE and so a re-render HERE. A
   // fresh array per render re-ran the effect on every pass — the v0.8.1
   // "Maximum update depth exceeded" loop, hundreds of warnings a second.
-  const menuItems: DropdownItem[] = useMemo(() => [
-    {
-      type: 'checkbox',
-      id: 'lanes',
-      label: 'Keyframe lanes under animated rows',
-      checked: showLane,
-      onChange: (v) => setPref('inspectorShowLane', v),
-    },
-    { type: 'separator' },
-    {
-      type: 'item',
-      id: 'effect-controls',
-      label: 'Open Effect Controls panel',
-      icon: 'sparkles',
-      onSelect: () => useLayoutStore.getState().openPanel('effectControls'),
-    },
-  ], [showLane, setPref]);
+  const menuItems: DropdownItem[] = useMemo(() => {
+    const switches = hasLayer ? layerSwitchMenuItems(selected) : [];
+    return [
+      ...switches,
+      ...(switches.length > 0 ? [{ type: 'separator' } as const] : []),
+      {
+        type: 'checkbox',
+        id: 'lanes',
+        label: 'Keyframe lanes under animated rows',
+        checked: showLane,
+        onChange: (v) => setPref('inspectorShowLane', v),
+      },
+      { type: 'separator' },
+      {
+        type: 'item',
+        id: 'effect-controls',
+        label: 'Open Effect Controls panel',
+        icon: 'sparkles',
+        onSelect: () => useLayoutStore.getState().openPanel('effectControls'),
+      },
+    ];
+    // `switchSig` is listed because it IS the switch rows' input: the layers'
+    // switch states live on scene nodes, which no other dependency here tracks.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasLayer, selected, switchSig, showLane, setPref]);
 
   const dockHeader = useDockPanelHeader();
   const setCustomMenuItems = dockHeader?.setCustomMenuItems;
@@ -218,25 +227,22 @@ export function PropertiesPanel(): JSX.Element {
     </button>
   );
 
-  const fallbackActions = (
+  // Outside a dock (a standalone mount, a test) there is no dock header to
+  // carry search and ⋯, so they sit at the end of the identity row instead.
+  const fallbackActions = dockHeader?.target ? undefined : (
     <>
       {searchButton}
-      {!dockHeader?.target && (
-        <Dropdown
-          items={menuItems}
-          placement="bottom-end"
-          trigger={
-            <button type="button" className={styles.layerHeadBtn} aria-label="Properties panel options" title="Options">
-              <Icon name="more-horizontal" size="sm" />
-            </button>
-          }
-        />
-      )}
+      <Dropdown
+        items={menuItems}
+        placement="bottom-end"
+        trigger={
+          <button type="button" className={styles.layerHeadBtn} aria-label="Properties panel options" title="Options">
+            <Icon name="more-horizontal" size="sm" />
+          </button>
+        }
+      />
     </>
   );
-
-  const headerActions = dockHeader?.target ? searchButton : fallbackActions;
-  const headerContent = <SelectionHeader nodeIds={selected} actions={headerActions} />;
 
   return (
     <Panel
@@ -248,14 +254,15 @@ export function PropertiesPanel(): JSX.Element {
       onClose={() => getEventBus().emit('PanelClosed', { panelId: 'properties' })}
     >
       <div className={styles.inspectorShell}>
-        {/* Layer switch buttons moved to the Properties sidebar title at the top.
-            If rendered without a DockPanel (e.g. standalone test), falls back to layerHead. */}
-        {primary && node && (
-          dockHeader?.target
-            ? createPortal(headerContent, dockHeader.target)
-            : <div className={styles.layerHead}>{headerContent}</div>
+        {/* Only the search toggle rides in the dock header, beside the panel's
+            own title and ⋯ — one glyph, so the title is never truncated. */}
+        {hasLayer && dockHeader?.target && createPortal(searchButton, dockHeader.target)}
+        {hasLayer && (
+          <div className={styles.layerHead}>
+            <SelectionHeader nodeIds={selected} actions={fallbackActions} />
+          </div>
         )}
-        {primary && node && searchOpen && (
+        {hasLayer && searchOpen && (
           <div className={styles.searchRow}>
             <SearchField
               placeholder="Search all properties…"
@@ -266,32 +273,10 @@ export function PropertiesPanel(): JSX.Element {
             />
           </div>
         )}
-        {/* The sub-tabs. Hidden while a search is live: the results span every
-            tab and are badged with their own, so a strip claiming one tab is
-            active would be telling a lie about what is on screen. */}
-        {primary && node && !searching && available.length > 1 && (
-          <div className={styles.inspectorTabs} role="tablist" aria-label="Property groups">
-            {INSPECTOR_CATEGORIES.filter((c) => available.includes(c.id)).map((c) => {
-              const isActive = c.id === activeTab;
-              return (
-                <button
-                  key={c.id}
-                  type="button"
-                  role="tab"
-                  aria-selected={isActive}
-                  tabIndex={isActive ? 0 : -1}
-                  className={cn(styles.inspectorTab, isActive && styles.inspectorTabActive)}
-                  onClick={() => setPref('inspectorTab', c.id)}
-                >
-                  {c.label}
-                </button>
-              );
-            })}
-          </div>
-        )}
         <div className={styles.inspectorBody}>
+          {liveCount > 1 && !searching && <SelectionAlignRow nodeIds={selected} />}
           <InspectorSelectionProvider nodeIds={selected}>
-            <InspectorContent nodeId={primary} nodeIds={selected} query={query} category={activeTab ?? 'all'} />
+            <InspectorContent nodeId={primary} nodeIds={selected} query={query} />
           </InspectorSelectionProvider>
           {/* Not sections of the SELECTION: mograph parameters belong to the
               mograph player and template fields to the applied template, so

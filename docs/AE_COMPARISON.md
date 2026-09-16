@@ -29,7 +29,7 @@
 | **Source Monitor** | In/out in source seconds, JKL shuttle (1×/2×/4×), frame stepping, Insert / Overwrite / Add to end / New comp from range (`SourceMonitorPanel.tsx`, `sourceMonitorOps.ts`) | Footage panel with in/out; no three-point edit | Parity, closer to an NLE than AE is |
 | **Assemble / new comp from clips** | Assemble from Footage — detect cuts, split, drop the runts, sequence with dissolves, **one undo** (`assembleFromFootage.ts`); New Composition from Selected Clips (`compFromClips.ts`) | Scene Edit Detection + manual precomp | Parity+ (one gesture vs several) |
 | **Clip-edge snapping / fit** | Clips snap to other clips, playhead, markers, work area and comp bounds with a guide line; Fit Composition (`;`) / Fit Work Area (`Alt+;`) | Snapping + zoom-to-fit | Parity |
-| Time remapping | `remapTime` curve, freeze, reverse, sequence bars | Time Remap + speed graph, stretch, freeze | Parity |
+| Time remapping | Speed section: **Normal / Speed % / Frame Number** (Twixtor / Timewarp's two modes), in-inspector speed curve, per-point ramp style, 7 velocity presets, footage budget + Fit to footage; freeze, reverse, stretch | Time Remap + speed graph, Timewarp effect, stretch, freeze | Parity+ |
 | Frame blending | Frame Mix + **Pixel Motion** (deterministic optical-flow warp) | Frame Mix + Pixel Motion | Parity |
 | Responsive/protected time | `responsiveTime.ts` regions | Responsive Design — Time | Parity |
 | Markers | Comp + layer markers, duration, color (`layerMarkers`, `markerShortcuts`) | Comp + layer markers, cue points | Parity |

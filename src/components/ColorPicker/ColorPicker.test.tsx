@@ -64,6 +64,17 @@ function open(): void {
 }
 
 describe('the Swatches strip', () => {
+  it('shows the project palette where colours are chosen, labelled as such', () => {
+    useSwatchStore.getState().addSwatch('#00ff00', 'Brand Green');
+    render(<ColorPicker value="#123456" onChange={jest.fn()} />);
+
+    open();
+
+    expect(screen.getByText('Project swatches')).toBeTruthy();
+    const strip = screen.getByLabelText('Project swatches');
+    expect(within(strip).getByLabelText('Use Brand Green')).toBeTruthy();
+  });
+
   it('applies a project swatch through onChange', () => {
     useSwatchStore.getState().addSwatch('#ff0000', 'Brand Red');
     const onChange = jest.fn();

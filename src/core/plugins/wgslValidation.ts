@@ -73,6 +73,52 @@ export const MAX_LOOP_ITERATIONS = 256;
 export const MAX_LOOP_NESTING = 3;
 
 /**
+ * The ceilings a shader is checked against, as a value rather than as constants.
+ *
+ * ── Why this became a parameter ──────────────────────────────────────────────
+ *
+ * The numbers above are sized for code the user did not write and cannot read:
+ * a registry plugin arrives compiled-in-spirit, and the only thing standing
+ * between a hostile loop and a TDR is this scan. A plugin the user wrote, or
+ * dropped into their own Plugins folder, is a different trust relationship —
+ * refusing it a 512-tap kernel protects nobody from anything.
+ *
+ * So the RULES stay identical for both tiers (no `while`, literal bounds only,
+ * no author bindings) and only the NUMBERS move. That distinction is the whole
+ * argument: an unbounded loop is refused at every tier because the host cannot
+ * cost it, whoever wrote it — raising a literal bound merely lets a trusted
+ * author spend their own frame time.
+ */
+export interface ShaderLimits {
+  sourceBytes: number;
+  statements: number;
+  loopIterations: number;
+  loopNesting: number;
+}
+
+/** What a registry-published plugin is held to — today's numbers, unchanged. */
+export const STANDARD_SHADER_LIMITS: ShaderLimits = {
+  sourceBytes: MAX_SOURCE_BYTES,
+  statements: MAX_STATEMENTS,
+  loopIterations: MAX_LOOP_ITERATIONS,
+  loopNesting: MAX_LOOP_NESTING,
+};
+
+/**
+ * What a LOCAL or developer-mode plugin may ask for.
+ *
+ * Nesting does NOT rise with the rest. Bounds multiply, so a fourth level at
+ * the raised per-loop bound is 10¹² iterations per pixel — a number no trust
+ * relationship makes survivable, because the machine that hangs is the user's.
+ */
+export const EXTENDED_SHADER_LIMITS: ShaderLimits = {
+  sourceBytes: 256 * 1024,
+  statements: 8000,
+  loopIterations: 1024,
+  loopNesting: MAX_LOOP_NESTING,
+};
+
+/**
  * Constructs refused outright.
  *
  * Each is refused for a specific reason, not on general suspicion:
@@ -149,24 +195,21 @@ export function stripWgslComments(src: string): string {
  * step and because the driver's own error messages are not something an author
  * can act on.
  */
-export function validateWgsl(source: string): WgslCheck {
+export function validateWgsl(
+  source: string,
+  limits: ShaderLimits = STANDARD_SHADER_LIMITS,
+): WgslCheck {
   const problems: WgslProblem[] = [];
 
   if (typeof source !== 'string' || !source.trim()) {
     return { ok: false, problems: [{ rule: 'empty', detail: 'The shader source is empty.' }] };
   }
 
-  // Byte length, not character count: a source of astral-plane characters is
-  // twice the bytes it looks like, and this bound exists to cap work.
-  const bytes = new TextEncoder().encode(source).length;
-  if (bytes > MAX_SOURCE_BYTES) {
-    problems.push({
-      rule: 'too-large',
-      detail: `The shader is ${Math.round(bytes / 1024)} KB; the limit is ${MAX_SOURCE_BYTES / 1024} KB.`,
-    });
+  const size = checkSourceSize(source, limits);
+  if (size) {
     // Returned early. Everything below scans the source, and scanning an
     // oversized source is the cost this rule exists to refuse.
-    return { ok: false, problems };
+    return { ok: false, problems: [size] };
   }
 
   const code = stripWgslComments(source);
@@ -177,22 +220,7 @@ export function validateWgsl(source: string): WgslCheck {
     if (index !== -1) problems.push({ rule, detail, line: index + 1 });
   }
 
-  problems.push(...checkLoops(lines));
-
-  /*
-    Statement count as a cost proxy.
-
-    Counting semicolons is crude and deliberately so — see the header. It is
-    measured on comment-stripped source so a documented shader is not penalised
-    for being documented.
-  */
-  const statements = (code.match(/;/g) ?? []).length;
-  if (statements > MAX_STATEMENTS) {
-    problems.push({
-      rule: 'too-complex',
-      detail: `The shader has about ${statements} statements; the limit is ${MAX_STATEMENTS}. This ceiling exists because a fragment shader runs once per pixel and cannot be interrupted.`,
-    });
-  }
+  problems.push(...checkCost(code, lines, limits));
 
   /*
     Not cost rules — correctness ones, and both are refusals an author can act
@@ -229,6 +257,54 @@ export function validateWgsl(source: string): WgslCheck {
 }
 
 /**
+ * The size rule, shared with the GLSL validator.
+ *
+ * Returns the problem rather than pushing it, because both callers must STOP on
+ * it: the scans below walk the source, and walking an oversized source is the
+ * exact cost this refuses.
+ */
+export function checkSourceSize(source: string, limits: ShaderLimits): WgslProblem | null {
+  // Byte length, not character count: a source of astral-plane characters is
+  // twice the bytes it looks like, and this bound exists to cap work.
+  const bytes = new TextEncoder().encode(source).length;
+  if (bytes <= limits.sourceBytes) return null;
+  return {
+    rule: 'too-large',
+    detail: `The shader is ${Math.round(bytes / 1024)} KB; the limit is ${Math.round(limits.sourceBytes / 1024)} KB.`,
+  };
+}
+
+/**
+ * The cost rules — loops and statement count — shared by both languages.
+ *
+ * Shared deliberately rather than reimplemented per language. A GLSL kernel
+ * hangs the same GPU as a WGSL one, and two copies of "is this loop bounded"
+ * is two places that can be relaxed independently until one of them is wrong.
+ * The SYNTAX both languages use for a counted loop is identical, which is what
+ * makes one scanner honest for both.
+ */
+export function checkCost(code: string, lines: string[], limits: ShaderLimits): WgslProblem[] {
+  const problems = checkLoops(lines, limits);
+
+  /*
+    Statement count as a cost proxy.
+
+    Counting semicolons is crude and deliberately so — see the header. It is
+    measured on comment-stripped source so a documented shader is not penalised
+    for being documented.
+  */
+  const statements = (code.match(/;/g) ?? []).length;
+  if (statements > limits.statements) {
+    problems.push({
+      rule: 'too-complex',
+      detail: `The shader has about ${statements} statements; the limit is ${limits.statements}. This ceiling exists because a fragment shader runs once per pixel and cannot be interrupted.`,
+    });
+  }
+
+  return problems;
+}
+
+/**
  * Every `for` loop must have a literal bound, and loops may not nest deeply.
  *
  * The bound rule is the load-bearing one. `for (var i = 0; i < n; i++)` where
@@ -240,7 +316,7 @@ export function validateWgsl(source: string): WgslCheck {
  * per-loop maximum is already 16 million iterations per pixel, which is a hung
  * GPU on any hardware.
  */
-function checkLoops(lines: string[]): WgslProblem[] {
+function checkLoops(lines: string[], limits: ShaderLimits): WgslProblem[] {
   const problems: WgslProblem[] = [];
   let deepest = 0;
   /** Brace depth at which each open loop's body sits. */
@@ -258,11 +334,11 @@ function checkLoops(lines: string[]): WgslProblem[] {
           detail:
             'This loop’s bound is not a literal. A fragment shader runs once per pixel and cannot be interrupted, so its cost has to be knowable before it runs — a bound that comes from a uniform lets a slider hang the GPU.',
         });
-      } else if (bound > MAX_LOOP_ITERATIONS) {
+      } else if (bound > limits.loopIterations) {
         problems.push({
           rule: 'loop-too-long',
           line: i + 1,
-          detail: `This loop runs ${bound} times; the limit is ${MAX_LOOP_ITERATIONS} per loop. Per-pixel cost multiplies by this, and a 4K frame is 8.3 million pixels.`,
+          detail: `This loop runs ${bound} times; the limit is ${limits.loopIterations} per loop. Per-pixel cost multiplies by this, and a 4K frame is 8.3 million pixels.`,
         });
       }
       loopDepths.push(braces);
@@ -281,10 +357,10 @@ function checkLoops(lines: string[]): WgslProblem[] {
     }
   });
 
-  if (deepest > MAX_LOOP_NESTING) {
+  if (deepest > limits.loopNesting) {
     problems.push({
       rule: 'loops-too-deep',
-      detail: `Loops are nested ${deepest} deep; the limit is ${MAX_LOOP_NESTING}. Bounds multiply, so nesting is where a shader stops being costable.`,
+      detail: `Loops are nested ${deepest} deep; the limit is ${limits.loopNesting}. Bounds multiply, so nesting is where a shader stops being costable.`,
     });
   }
 

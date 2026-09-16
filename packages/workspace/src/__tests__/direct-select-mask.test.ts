@@ -48,7 +48,7 @@ function makeCtx(n: WorkspaceNode): { ctx: ToolContext; executed: WorkspaceComma
   return { ctx, executed };
 }
 
-const down = (x: number, y: number, mods: Partial<{ alt: boolean; shift: boolean }> = {}): ToolPointerEvent =>
+const down = (x: number, y: number, mods: Partial<{ alt: boolean; shift: boolean; ctrl: boolean; mod: boolean }> = {}): ToolPointerEvent =>
   ({ world: { x, y }, modifiers: { alt: false, shift: false, ctrl: false, meta: false, mod: false, ...mods } }) as unknown as ToolPointerEvent;
 
 const drag = (x: number, y: number, mods: Partial<{ alt: boolean }> = {}): ToolDragEvent =>
@@ -112,17 +112,26 @@ describe('DirectSelectionTool — masks', () => {
     expect(p.points[0]!.outX).toBe(-15);
   });
 
-  it('deletes a mask vertex with Alt+click', () => {
+  it('deletes a mask vertex with Alt+click (on release — a drag converts instead)', () => {
     const { ctx, executed } = makeCtx(masked());
-    new DirectSelectionTool().onPointerDown(down(-30, -30, { alt: true }), ctx);
+    const tool = new DirectSelectionTool();
+    tool.onPointerDown(down(-30, -30, { alt: true }), ctx);
+    expect(executed).toHaveLength(0);
+    tool.onClick!(down(-30, -30, { alt: true }), ctx);
 
     expect(executed[0]!.type).toBe(WorkspaceCommandType.UpdateMaskPath);
-    expect((executed[0]!.payload as { points: unknown[] }).points).toHaveLength(3);
+    const p = executed[0]!.payload as { points: unknown[]; topology?: unknown };
+    expect(p.points).toHaveLength(3);
+    // Topology travels with the edit so an animated mask loses the vertex in
+    // every keyframe, not just the one at the playhead.
+    expect(p.topology).toEqual({ op: 'delete', index: 0 });
   });
 
   it('refuses to delete below a drawable outline', () => {
     const { ctx, executed } = makeCtx(node({ maskPaths: [{ id: 'm', points: [corner(0, 0), corner(10, 10)] }] }));
-    new DirectSelectionTool().onPointerDown(down(0, 0, { alt: true }), ctx);
+    const tool = new DirectSelectionTool();
+    tool.onPointerDown(down(0, 0, { alt: true }), ctx);
+    tool.onClick!(down(0, 0, { alt: true }), ctx);
     expect(executed).toHaveLength(0);
   });
 
@@ -153,6 +162,113 @@ describe('DirectSelectionTool — masks', () => {
     const handles = tool.getHandles(ctx);
     expect(handles.filter((h) => h.kind === 'tangent-in')).toHaveLength(1);
     expect(handles.filter((h) => h.kind === 'tangent-out')).toHaveLength(1);
+  });
+});
+
+type Pts = Array<{ x: number; y: number; inX: number; inY: number; outX: number; outY: number }>;
+const lastPoints = (executed: WorkspaceCommand[]): Pts => (executed[executed.length - 1]!.payload as { points: Pts }).points;
+
+describe('DirectSelectionTool — handles on corners (Convert Vertex)', () => {
+  it('Alt-drag on a CORNER pulls out fresh symmetric handles', () => {
+    // The bug: corner tangents coincide with the vertex, and the first-hit scan
+    // always found the vertex first — a corner could never get handles.
+    const { ctx, executed } = makeCtx(node({ maskPaths: [{ id: 'm', points: square(30) }] }));
+    const tool = new DirectSelectionTool();
+    tool.onPointerDown(down(-30, -30, { alt: true }), ctx);
+    tool.onDrag(drag(-10, -30, { alt: true }), ctx);
+
+    expect(lastPoints(executed)[0]).toMatchObject({ x: -30, y: -30, outX: -10, outY: -30, inX: -50, inY: -30 });
+    tool.onPointerUp!(down(-10, -30), ctx);
+    // A drag is not a click: nothing was deleted.
+    expect(lastPoints(executed)).toHaveLength(4);
+  });
+
+  it('Ctrl+Alt-click toggles corner → smooth → corner', () => {
+    let n = node({ maskPaths: [{ id: 'm', points: square(30) }] });
+    const run = (): Pts => {
+      const { ctx, executed } = makeCtx(n);
+      const tool = new DirectSelectionTool();
+      tool.onPointerDown(down(-30, -30, { alt: true, ctrl: true, mod: true }), ctx);
+      tool.onClick!(down(-30, -30, { alt: true, ctrl: true, mod: true }), ctx);
+      return lastPoints(executed);
+    };
+    const smooth = run();
+    expect(smooth).toHaveLength(4); // toggled, not deleted
+    const v = smooth[0]!;
+    // Along the chord from its neighbours (-30,30) → (30,-30), a third of 60 each way.
+    expect(v.outX - v.x).toBeCloseTo(20 / Math.SQRT2);
+    expect(v.outY - v.y).toBeCloseTo(-(20 / Math.SQRT2));
+    expect(v.inX - v.x).toBeCloseTo(-(20 / Math.SQRT2));
+
+    n = node({ maskPaths: [{ id: 'm', points: smooth }] });
+    expect(run()[0]).toMatchObject(corner(-30, -30));
+  });
+
+  it('grabs a pulled-out tangent over its vertex when the tangent is nearer', () => {
+    const pts = [{ x: 0, y: 0, inX: -6, inY: 0, outX: 6, outY: 0 }, corner(100, 0), corner(50, 80)];
+    const { ctx, executed } = makeCtx(node({ maskPaths: [{ id: 'm', points: pts }] }));
+    const tool = new DirectSelectionTool();
+    tool.onPointerDown(down(0, 0), ctx); // activate → tangents shown
+    tool.onPointerDown(down(5, 0), ctx); // vertex 5 away, out-tangent 1 away
+    tool.onDrag(drag(6, 20), ctx);
+    const v = lastPoints(executed)[0]!;
+    expect(v).toMatchObject({ x: 0, y: 0, outX: 6, outY: 20 }); // the handle moved, not the vertex
+  });
+
+  it('dragging one handle of a smooth vertex keeps the OTHER handle\'s length', () => {
+    const pts = [{ x: 0, y: 0, inX: -10, inY: 0, outX: 30, outY: 0 }, corner(100, 0), corner(50, 80)];
+    const { ctx, executed } = makeCtx(node({ maskPaths: [{ id: 'm', points: pts }] }));
+    const tool = new DirectSelectionTool();
+    tool.onPointerDown(down(0, 0), ctx);
+    tool.onPointerDown(down(30, 0), ctx);
+    tool.onDrag(drag(0, 30), ctx);
+    const v = lastPoints(executed)[0]!;
+    expect(v.outX).toBeCloseTo(0);
+    expect(v.outY).toBeCloseTo(30);
+    // Direction mirrored, length kept at 10 (was reset to 30).
+    expect(v.inX).toBeCloseTo(0);
+    expect(v.inY).toBeCloseTo(-10);
+  });
+});
+
+describe('DirectSelectionTool — Shift-click adds a vertex ON the outline', () => {
+  it('splits the segment under the click, preserving the curve, with a replayable topology', () => {
+    const { ctx, executed } = makeCtx(node({ maskPaths: [{ id: 'm', points: square(30) }] }));
+    new DirectSelectionTool().onPointerDown(down(0, -31, { shift: true }), ctx);
+    const payload = executed[0]!.payload as { points: Pts; topology: { op: string; segment: number; u: number } };
+    expect(payload.points).toHaveLength(5);
+    expect(payload.points[1]!.x).toBeCloseTo(0);
+    expect(payload.points[1]!.y).toBeCloseTo(-30);
+    expect(payload.topology).toMatchObject({ op: 'insert', segment: 0 });
+    expect(payload.topology.u).toBeCloseTo(0.5, 3);
+  });
+
+  it('closes the loop: a click on the closing segment inserts at the end', () => {
+    const { ctx, executed } = makeCtx(node({ maskPaths: [{ id: 'm', points: square(30) }] }));
+    new DirectSelectionTool().onPointerDown(down(-30, 0, { shift: true }), ctx);
+    const pts = lastPoints(executed);
+    expect(pts).toHaveLength(5);
+    expect(pts[4]!.x).toBeCloseTo(-30);
+    expect(pts[4]!.y).toBeCloseTo(0);
+  });
+
+  it('does NOT append a vertex far from the outline — it is an ordinary Shift-click', () => {
+    const { ctx, executed } = makeCtx(node({ maskPaths: [{ id: 'm', points: square(30) }] }));
+    let clicked = 0;
+    (ctx.selection as unknown as { clickAt: () => void }).clickAt = () => { clicked += 1; };
+    const tool = new DirectSelectionTool();
+    tool.onPointerDown(down(0, 0, { shift: true }), ctx);
+    // With an editable outline selected, empty-space presses resolve on
+    // release: a drag marquees vertices, a click is the layer click.
+    tool.onClick!(down(0, 0, { shift: true }), ctx);
+    expect(executed).toHaveLength(0);
+    expect(clicked).toBe(1);
+  });
+
+  it('an OPEN geometry path has no closing segment to split', () => {
+    const { ctx, executed } = makeCtx(node({ pathPoints: square(30), pathClosed: false }));
+    new DirectSelectionTool().onPointerDown(down(-30, 0, { shift: true }), ctx);
+    expect(executed).toHaveLength(0);
   });
 });
 

@@ -28,7 +28,8 @@
 
 import { useMemo, useRef } from 'react';
 import { ValueField } from '@components/ValueField';
-import { AnimToggle } from '../AnimToggle';
+import { PropertyRow } from '@components/PropertyRow';
+import { useTrackNavigator } from '../AnimToggle';
 import { defaultAnimation } from '@motion/animation';
 import { applyValueExpression } from '@utils/evalMath';
 import { resolvePropertyMeta } from '@core/inspector/propertyMeta';
@@ -41,10 +42,9 @@ import {
   toggleAnimationGroup,
   type PropertyAccess,
 } from '@core/inspector/multiSelection';
-import { useCurrentTime } from '@stores/playbackClockStore';
+import { useThrottledTime } from '@stores/playbackClockStore';
 import { usePreferenceStore } from '@stores/preferenceStore';
-import { useInspectorSelection } from '../inspectorSelection';
-import styles from '../TransformSection.module.css';
+import { useInspectorHosted, useInspectorSelection } from '../inspectorSelection';
 
 export type PaintProp =
   | 'fillAngle' | 'fillCenterX' | 'fillCenterY' | 'fillRadius' | 'strokeWidth' | 'strokeDashOffset'
@@ -63,7 +63,16 @@ const CORNER_TRACKS: ReadonlyArray<string> = [
 export interface AnimatablePaintRowProps {
   /** The PRIMARY layer; the selection comes from context. */
   nodeId: string;
-  prop: PaintProp;
+  /**
+   * A `PaintProp`, or any registered track path — every stroke's parameters
+   * (`stroke.<i>.<param>`, see `strokeTracks.ts`) ride this same row.
+   */
+  prop: PaintProp | (string & {});
+  /**
+   * Decimals SHOWN. Unset keeps the historical whole-number display; Miter
+   * Limit and a wave's cycle count set 1, where 1.5 is a different value from 2.
+   */
+  precision?: number;
   /** Overrides the registry label — the panel shows "Angle" under a Fill
    *  heading where the timeline needs the unambiguous "Fill Angle". */
   label?: string;
@@ -79,12 +88,14 @@ export function AnimatablePaintRow({
   prop,
   label: labelOverride,
   access,
+  precision,
 }: AnimatablePaintRowProps): JSX.Element {
   const nodeIds = useInspectorSelection(nodeId);
   const rev = useNodesRevision(nodeIds);
-  const time = useCurrentTime();
+  const time = useThrottledTime();
   const autoKeyframe = usePreferenceStore((s) => s.timelineAutoKeyframe);
   const starts = useRef<Map<string, number>>(new Map());
+  const hosted = useInspectorHosted();
 
   // Label, unit, range, step and the stored→displayed scale all come from the
   // property registry, so this row and the timeline row for the same track
@@ -103,6 +114,9 @@ export function AnimatablePaintRow({
     [nodeIds, prop, time, access, rev],
   );
   const animated = nodeIds.some((id) => tracked.some((p) => defaultAnimation.isAnimated(id, p)));
+  // The same stopwatch + navigator wiring `AnimToggle` drew, now laid out by
+  // `PropertyRow` so this row shares the inspector grid with Transform's rows.
+  const navigator = useTrackNavigator(nodeId, tracked, label);
 
   const opts = { compTime: time, autoKeyframe, ...access };
   const mergeKey = `paint:${prop}:${nodeIds.join(',')}:${time}`;
@@ -150,37 +164,33 @@ export function AnimatablePaintRow({
   };
 
   return (
-    <div className={styles.popoverRow}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1 }}>
-        <AnimToggle
-          nodeId={nodeId}
-          tracks={tracked}
-          label={label}
-          animated={animated}
-          onToggle={() => toggleAnimationGroup(nodeIds, tracked, time, label, access)}
-        />
-        <span className={styles.popoverLabel}>
-          {label}
-          {nodeIds.length > 1 && agg.present < nodeIds.length && (
-            <span className={styles.popoverHint}>{` ${agg.present} of ${nodeIds.length}`}</span>
-          )}
-        </span>
-      </div>
+    <PropertyRow
+      label={label}
+      layout={hosted ? 'inspector' : undefined}
+      compact
+      animated={animated}
+      mixed={agg.mixed}
+      hint={nodeIds.length > 1 && agg.present < nodeIds.length ? `${agg.present} of ${nodeIds.length}` : undefined}
+      onStopwatch={() => toggleAnimationGroup(nodeIds, tracked, time, label, access)}
+      navigator={navigator}
+    >
       <ValueField
-        value={Math.round(agg.value * scale)}
+        value={precision !== undefined
+          ? Number((agg.value * scale).toFixed(precision))
+          : Math.round(agg.value * scale)}
         mixed={agg.mixed}
         unit={unit}
         {...(min !== undefined ? { min } : {})}
         {...(max !== undefined ? { max } : {})}
         step={meta.step * scale}
-        precision={meta.precision}
+        precision={precision ?? meta.precision}
         onChange={(v) => onChange(Number(v))}
         onScrubStart={onScrubStart}
         onRelative={onRelative}
         onCommitText={onCommitText}
         aria-label={label}
       />
-    </div>
+    </PropertyRow>
   );
 }
 

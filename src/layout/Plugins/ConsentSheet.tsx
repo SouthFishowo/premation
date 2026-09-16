@@ -28,10 +28,20 @@ export function ConsentSheet({
   pkg,
   source,
   origin,
+  native,
   onDone,
 }: {
   pkg: PluginPackage;
   source?: 'folder' | 'file' | 'registry';
+  /**
+   * A FOLDER candidate's compiled modules — where they are, and what the scan
+   * measured them to hash to.
+   *
+   * Set by the local-plugins panel and by nobody else. An archive's binary is
+   * not a file yet, so `install` stages it out of the package instead; passing
+   * nothing here is what asks for that, not what turns the native tier off.
+   */
+  native?: { dir: string; hashes: Record<string, string> };
   /** Set for a registry install: the key it was verified against, plus the
    *  successor the listing advertised. Recorded now so a later rotation can be
    *  judged against what this machine already knew. */
@@ -77,6 +87,7 @@ export function ConsentSheet({
       ...(origin?.nextPublisherKeyMethod
         ? { nextPublisherKeyMethod: origin.nextPublisherKeyMethod }
         : {}),
+      ...(native ? { native } : {}),
     });
     setBusy(false);
     if (err) { void customAlert('Could not install plugin', err, { isDanger: true }); return; }

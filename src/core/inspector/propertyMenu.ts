@@ -20,6 +20,11 @@ import { runAnimEdit } from '@core/animation/animationCommands';
 import { applyEasingToKeyframes, type EasingPreset } from '@core/animation/keyframeAssistants';
 import { copyKeyframes, pasteKeyframes, hasClipboard } from '@core/animation/keyframeClipboard';
 import { convertExpressionToKeyframes } from '@core/animation/convertExpressionToKeyframes';
+import {
+  addExpression,
+  removeExpression,
+  requestExpressionEditor,
+} from '@core/animation/expressionCommands';
 import { keyframeToCompTime } from '@core/timeline/TimelineController';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { resolvePropertyMeta } from './propertyMeta';
@@ -44,6 +49,12 @@ export interface PropertyMenuContext {
   value: number;
   /** Write a plain (un-keyframed) value. Omitted → no reset entry. */
   setValue?: (v: number) => void;
+  /**
+   * Every layer the row edits (a multi-selection), primary first. Only the
+   * expression entries read it — Add / Remove act on the whole selection like
+   * the row's own `=` toggle does. Omitted → just `nodeId`.
+   */
+  nodeIds?: ReadonlyArray<string>;
 }
 
 /**
@@ -155,8 +166,12 @@ export function buildPropertyMenu(ctx: PropertyMenuContext): ContextMenuItem[] {
    * else here is unconditional: a menu full of no-ops teaches people not to
    * open it.
    */
-  if (defaultAnimation.isExpressionEnabled(nodeId, prop)) {
+  const exprItems = expressionPropMenuItems(nodeId, prop, ctx.nodeIds);
+  if (exprItems.length > 0 || defaultAnimation.isExpressionEnabled(nodeId, prop)) {
     items.push({ id: 'sep-expr', separator: true });
+    items.push(...exprItems);
+  }
+  if (defaultAnimation.isExpressionEnabled(nodeId, prop)) {
     items.push({
       id: 'expr-bake',
       label: 'Convert Expression to Keyframes',
@@ -191,6 +206,50 @@ export function buildPropertyMenu(ctx: PropertyMenuContext): ContextMenuItem[] {
   items.push(...pinPropMenuItems(nodeId, prop));
 
   return items;
+}
+
+/**
+ * "Add Expression", or "Edit Expression" + "Remove Expression", for one row.
+ *
+ * Why these live in the ROW menu now: the inspector's compact rows show the
+ * `=` toggle only on hover, and a two-field row (Position X/Y) has no per-field
+ * `=` at all. The menu is the one place every field can always reach.
+ *
+ * Add is the shared `addExpression` (AE's default `value`, one undo step, then
+ * the editor-open request); Edit is only that request, which the mounted row
+ * answers by opening its inline editor — the same plumbing Alt+Shift+= uses,
+ * so there is no second way to open an editor to keep in step.
+ *
+ * Empty when the id names no node, like the pin entries, so the bare-id unit
+ * tests of this builder stay free of it.
+ */
+export function expressionPropMenuItems(
+  nodeId: string,
+  prop: string,
+  nodeIds: ReadonlyArray<string> = [nodeId],
+): ContextMenuItem[] {
+  if (!defaultSceneGraph.getNode(nodeId)) return [];
+  const refs = (nodeIds.length > 0 ? nodeIds : [nodeId]).map((id) => ({ nodeId: id, prop }));
+  if (!defaultAnimation.hasExpression(nodeId, prop)) {
+    return [{
+      id: 'expr-add',
+      label: 'Add Expression',
+      onSelect: () => { addExpression(refs); },
+    }];
+  }
+  return [
+    {
+      id: 'expr-edit',
+      label: 'Edit Expression',
+      onSelect: () => { requestExpressionEditor({ nodeId, prop }); },
+    },
+    {
+      id: 'expr-remove',
+      label: 'Remove Expression',
+      danger: true,
+      onSelect: () => { removeExpression(refs); },
+    },
+  ];
 }
 
 /**

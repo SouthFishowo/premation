@@ -9,6 +9,7 @@ import type { Vec2 } from '../math/Vec2';
 import type { Rect } from '../math/Rect';
 import type { NodeId, WorkspaceCommand } from '../ports';
 import type { BezierPoint } from '../math/BezierPoint';
+import type { PathTopologyEdit } from '../math/pathTopology';
 
 export const WorkspaceCommandType = {
   MoveNodes: 'workspace.moveNodes',
@@ -137,22 +138,48 @@ export interface CreateNodePayload {
   points?: BezierPoint[];
   /** Optional ID of the node to mask (if drawing a mask). */
   maskTargetId?: NodeId;
+  /**
+   * The pen closed the outline (clicked its first vertex). A closed path is a
+   * filled shape like any other; an open one is a stroke. Masks are always
+   * closed, so this only changes what a path LAYER becomes.
+   */
+  closed?: boolean;
 }
 
 export interface DeleteNodesPayload {
   ids: readonly NodeId[];
 }
 
-export interface UpdateNodePathPayload {
+/**
+ * Outline-level switches a path edit may also flip. Both are STRUCTURAL — true
+ * in every keyframe or in none — so the binding writes them once, never per
+ * keyframe.
+ */
+export interface PathEditFlags {
+  /** AE Layer ▸ Mask and Shape Path ▸ Closed. */
+  closed?: boolean;
+  /** AE RotoBezier: handles are computed from the vertices (see `rotoBezierPoints`). */
+  rotoBezier?: boolean;
+}
+
+export interface UpdateNodePathPayload extends PathEditFlags {
   id: NodeId;
   points: BezierPoint[];
+  /**
+   * Set when the edit added or removed a vertex. `points` is the result at the
+   * playhead; the binding replays `topology` on every keyframe of an animated
+   * outline so the keyframes keep one vertex count (see `pathTopology.ts`).
+   */
+  topology?: PathTopologyEdit;
 }
 
 /** Reshape one of a layer's masks. `id` is the layer; `maskId` the outline. */
-export interface UpdateMaskPathPayload {
+export interface UpdateMaskPathPayload extends PathEditFlags {
   id: NodeId;
   maskId: string;
   points: BezierPoint[];
+  /** As on `UpdateNodePathPayload`. */
+  topology?: PathTopologyEdit;
 }
 
 /**
@@ -211,21 +238,25 @@ export const commands = {
   moveAnchor(id: NodeId, anchor: Vec2): WorkspaceCommand {
     return { type: WorkspaceCommandType.MoveAnchor, payload: { id, anchor } satisfies MoveAnchorPayload };
   },
-  createNode(kind: string, bounds: Rect, points?: BezierPoint[], maskTargetId?: NodeId): WorkspaceCommand {
+  createNode(kind: string, bounds: Rect, points?: BezierPoint[], maskTargetId?: NodeId, closed?: boolean): WorkspaceCommand {
     const payload: CreateNodePayload = points ? { kind, bounds, points, maskTargetId } : { kind, bounds, maskTargetId };
+    if (closed) payload.closed = true;
     return { type: WorkspaceCommandType.CreateNode, payload };
   },
   deleteNodes(ids: readonly NodeId[]): WorkspaceCommand {
     return { type: WorkspaceCommandType.DeleteNodes, payload: { ids } satisfies DeleteNodesPayload };
   },
-  updateNodePath(id: NodeId, points: BezierPoint[]): WorkspaceCommand {
-    return { type: WorkspaceCommandType.UpdateNodePath, payload: { id, points } satisfies UpdateNodePathPayload };
+  updateNodePath(id: NodeId, points: BezierPoint[], topology?: PathTopologyEdit, flags?: PathEditFlags): WorkspaceCommand {
+    const payload: UpdateNodePathPayload = topology ? { id, points, topology } : { id, points };
+    if (flags?.closed !== undefined) payload.closed = flags.closed;
+    if (flags?.rotoBezier !== undefined) payload.rotoBezier = flags.rotoBezier;
+    return { type: WorkspaceCommandType.UpdateNodePath, payload };
   },
-  updateMaskPath(id: NodeId, maskId: string, points: BezierPoint[]): WorkspaceCommand {
-    return {
-      type: WorkspaceCommandType.UpdateMaskPath,
-      payload: { id, maskId, points } satisfies UpdateMaskPathPayload,
-    };
+  updateMaskPath(id: NodeId, maskId: string, points: BezierPoint[], topology?: PathTopologyEdit, flags?: PathEditFlags): WorkspaceCommand {
+    const payload: UpdateMaskPathPayload = topology ? { id, maskId, points, topology } : { id, maskId, points };
+    if (flags?.closed !== undefined) payload.closed = flags.closed;
+    if (flags?.rotoBezier !== undefined) payload.rotoBezier = flags.rotoBezier;
+    return { type: WorkspaceCommandType.UpdateMaskPath, payload };
   },
   /** Knife: cut every listed layer's outline along the world-space line a→b. */
   cutPaths(ids: readonly NodeId[], a: Vec2, b: Vec2): WorkspaceCommand {

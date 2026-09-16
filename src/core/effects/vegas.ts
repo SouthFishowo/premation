@@ -24,6 +24,7 @@
 
 import type { Effect } from './effects';
 import { effectNumber, paramsOf } from './effects';
+import { unpackMaskPaths } from './strokePaint';
 
 export interface ContourPoint {
   x: number;
@@ -247,12 +248,20 @@ function rotateToCanonicalStart(loop: ContourPoint[]): ContourPoint[] {
 export interface ArcTable {
   /** Cumulative length from vertex 0 to vertex i, length n. */
   cum: number[];
-  /** Total perimeter, INCLUDING the closing edge back to vertex 0. */
+  /** Total length — for a closed contour INCLUDING the closing edge back to vertex 0. */
   total: number;
+  /** False for an OPEN mask path: no closing edge, and arc positions do not wrap. */
+  closed: boolean;
 }
 
-/** Cumulative arc lengths around a CLOSED contour. */
-export function arcTable(pts: ReadonlyArray<ContourPoint>): ArcTable {
+/**
+ * Cumulative arc lengths along a contour — closed unless told otherwise.
+ *
+ * Alpha contours are always closed. A mask path need not be: an open one used to
+ * be walked as a loop, so its perimeter gained the chord from its last vertex
+ * back to its first, and lights ran along that chord where no path exists.
+ */
+export function arcTable(pts: ReadonlyArray<ContourPoint>, closed = true): ArcTable {
   const n = pts.length;
   const cum = new Array<number>(n).fill(0);
   let acc = 0;
@@ -263,11 +272,12 @@ export function arcTable(pts: ReadonlyArray<ContourPoint>): ArcTable {
   // The closing edge is part of the perimeter — a loop's last vertex joins its
   // first. Omitting it would make every dash drift by that edge's length per
   // lap, which reads as the lights slowly sliding out of phase.
-  const total = n > 1 ? acc + Math.hypot(pts[0]!.x - pts[n - 1]!.x, pts[0]!.y - pts[n - 1]!.y) : 0;
-  return { cum, total };
+  const closing = closed && n > 1 ? Math.hypot(pts[0]!.x - pts[n - 1]!.x, pts[0]!.y - pts[n - 1]!.y) : 0;
+  const total = n > 1 ? acc + closing : 0;
+  return { cum, total, closed };
 }
 
-/** The point at arc position `s` (wrapping) around a closed contour. */
+/** The point at arc position `s` — wrapping around a closed contour, clamped to an open one. */
 export function pointAtArc(
   pts: ReadonlyArray<ContourPoint>,
   t: ArcTable,
@@ -276,7 +286,9 @@ export function pointAtArc(
   const n = pts.length;
   if (n === 0) return { x: 0, y: 0 };
   if (t.total <= 0) return { x: pts[0]!.x, y: pts[0]!.y };
-  const u = ((s % t.total) + t.total) % t.total;
+  // Open: a position AT the end must stay at the end, not wrap to vertex 0 —
+  // it then falls to the last-vertex branch below with a zero-length segment.
+  const u = t.closed ? ((s % t.total) + t.total) % t.total : clamp(s, 0, t.total);
   // Last vertex first: `cum` has no entry for the closing edge, so a position
   // beyond cum[n-1] belongs to it and the loop below would never find a match.
   let i = n - 1;
@@ -305,6 +317,19 @@ export function walkArc(
 ): ContourPoint[] {
   const n = pts.length;
   if (n < 2 || t.total <= 0 || len <= 0) return [];
+  if (!t.closed) {
+    // An open path has no seam to cross: the run is clipped to [0, total], and
+    // `vegasSegments` splits a light that runs off the end into two.
+    const s0 = clamp(from, 0, t.total);
+    const s1 = clamp(from + len, 0, t.total);
+    if (s1 <= s0) return [];
+    const run: ContourPoint[] = [pointAtArc(pts, t, s0)];
+    for (let k = 0; k < n; k++) {
+      if (t.cum[k]! > s0 && t.cum[k]! < s1) run.push({ x: pts[k]!.x, y: pts[k]!.y });
+    }
+    run.push(pointAtArc(pts, t, s1));
+    return run;
+  }
   const span = Math.min(len, t.total);
   const out: ContourPoint[] = [pointAtArc(pts, t, from)];
   const start = ((from % t.total) + t.total) % t.total;
@@ -340,26 +365,153 @@ export function walkArc(
  * contour, a full lap per 360 degrees. That mapping is the one worth stating:
  * it makes a linear keyframe on `rotation` a constant-speed chase whatever the
  * shape is, which is the thing this effect exists to do.
+ *
+ * On an OPEN path (`closed` false) the pattern still cycles with `rotation`, but
+ * a light reaching the end leaves there and re-enters at the start as a second
+ * run — it never draws the chord between the two ends.
  */
 export function vegasSegments(
   contour: ReadonlyArray<ContourPoint>,
   segments: number,
   lengthPct: number,
   rotationDeg: number,
+  closed = true,
 ): ContourPoint[][] {
+  return vegasRuns(contour, segments, lengthPct, rotationDeg, closed).map((r) => r.points);
+}
+
+/**
+ * One lit run, and which part of its LIGHT it is: `u0..u1` along the light,
+ * 0 at its head end and 1 at its tail. A whole light is 0..1; a light split at
+ * an open path's end is two runs that share the boundary between them. The
+ * Start / Mid-point / End Opacity profile is a function of this `u`.
+ */
+export interface VegasRun {
+  points: ContourPoint[];
+  u0: number;
+  u1: number;
+}
+
+/**
+ * Gap between neighbouring lights under Segment Distribution ▸ Bunched, as a
+ * fraction of one light's length. AE's Bunched packs the lights into a group
+ * that travels together; Even spreads them one per slot. Capped by the slot, so
+ * at Length 100 % the two distributions meet in an unbroken ring.
+ */
+export const VEGAS_BUNCH_GAP = 0.5;
+
+/**
+ * The lit runs for one contour — `vegasSegments` with the AE additions:
+ * Bunched distribution and an extra phase in ARC px (Random Phase). With
+ * neither, the runs are exactly the ones `vegasSegments` always produced.
+ */
+export function vegasRuns(
+  contour: ReadonlyArray<ContourPoint>,
+  segments: number,
+  lengthPct: number,
+  rotationDeg: number,
+  closed = true,
+  bunched = false,
+  phaseArc = 0,
+): VegasRun[] {
   const n = Math.max(1, Math.round(segments));
-  const t = arcTable(contour);
+  const t = arcTable(contour, closed);
   if (t.total <= 0) return [];
   const slot = t.total / n;
   const lit = clamp(lengthPct / 100, 0, 1) * slot;
   if (lit <= 0) return [];
-  const phase = (rotationDeg / 360) * t.total;
-  const out: ContourPoint[][] = [];
+  const pitch = bunched ? lit + Math.min(slot - lit, lit * VEGAS_BUNCH_GAP) : slot;
+  const phase = (rotationDeg / 360) * t.total + phaseArc;
+  const out: VegasRun[] = [];
+  const push = (run: ContourPoint[], u0: number, u1: number): void => { if (run.length >= 2) out.push({ points: run, u0, u1 }); };
   for (let k = 0; k < n; k++) {
-    const run = walkArc(contour, t, phase + k * slot, lit);
-    if (run.length >= 2) out.push(run);
+    if (closed) {
+      push(walkArc(contour, t, phase + k * pitch, lit), 0, 1);
+      continue;
+    }
+    const s = (((phase + k * pitch) % t.total) + t.total) % t.total;
+    // A small tolerance so a light ending exactly at the end is one run, not a
+    // run plus a zero-length sliver at the start.
+    if (s + lit <= t.total + 1e-9) {
+      push(walkArc(contour, t, s, lit), 0, 1);
+    } else {
+      const split = (t.total - s) / lit;
+      push(walkArc(contour, t, s, t.total - s), 0, split);
+      push(walkArc(contour, t, 0, s + lit - t.total), split, 1);
+    }
   }
   return out;
+}
+
+/**
+ * Stroke Sequentially: ONE set of lights running through several paths in
+ * order, as if they were one path — a light leaving the end of one mask
+ * continues at the start of the next, and never draws the gap between them.
+ * The sequence is cyclic, so `rotation` still laps it.
+ */
+export function vegasSequentialRuns(
+  paths: ReadonlyArray<{ points: ReadonlyArray<ContourPoint>; closed: boolean }>,
+  segments: number,
+  lengthPct: number,
+  rotationDeg: number,
+  bunched = false,
+  phaseArc = 0,
+): VegasRun[] {
+  // Each path as an OPEN polyline — a closed one with its first point repeated
+  // — so a light is clipped to [0, length] on it rather than wrapping inside it.
+  const opens = paths.map((p) => {
+    const pts = p.closed && p.points.length > 1 ? [...p.points, p.points[0]!] : [...p.points];
+    return { pts, table: arcTable(pts, false) };
+  });
+  const total = opens.reduce((s, o) => s + o.table.total, 0);
+  if (total <= 0) return [];
+  const n = Math.max(1, Math.round(segments));
+  const slot = total / n;
+  const lit = clamp(lengthPct / 100, 0, 1) * slot;
+  if (lit <= 0) return [];
+  const pitch = bunched ? lit + Math.min(slot - lit, lit * VEGAS_BUNCH_GAP) : slot;
+  const phase = (rotationDeg / 360) * total + phaseArc;
+  const out: VegasRun[] = [];
+  const emit = (a: number, b: number, uBase: number): void => {
+    let base = 0;
+    for (const o of opens) {
+      const len = o.table.total;
+      const lo = Math.max(a, base);
+      const hi = Math.min(b, base + len);
+      if (hi > lo) {
+        const run = walkArc(o.pts, o.table, lo - base, hi - lo);
+        if (run.length >= 2) out.push({ points: run, u0: uBase + (lo - a) / lit, u1: uBase + (hi - a) / lit });
+      }
+      base += len;
+    }
+  };
+  for (let k = 0; k < n; k++) {
+    const s = (((phase + k * pitch) % total) + total) % total;
+    if (s + lit <= total + 1e-9) emit(s, s + lit, 0);
+    else {
+      emit(s, total, 0);
+      emit(0, s + lit - total, (total - s) / lit);
+    }
+  }
+  return out;
+}
+
+/** 0..1 hash of two integers — Random Phase's per-contour offset. */
+function hash01(a: number, b: number): number {
+  let x = (Math.imul(a | 0, 374761393) + Math.imul(b | 0, 668265263)) | 0;
+  x = Math.imul(x ^ (x >>> 13), 1274126177);
+  return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+}
+
+/**
+ * Opacity along a light, 0..1: Start → Mid-point at `midPosition` → End, each
+ * leg linear. AE's three-point profile; all three at 100 is a flat light.
+ */
+export function vegasOpacityAt(u: number, start: number, mid: number, end: number, midPosition: number): number {
+  const m = clamp(midPosition / 100, 0.001, 0.999);
+  const uu = clamp(u, 0, 1);
+  const v = uu <= m ? start + ((mid - start) * uu) / m : mid + ((end - mid) * (uu - m)) / (1 - m);
+  return clamp(v / 100, 0, 1);
 }
 
 // ── The effect ───────────────────────────────────────────────────────
@@ -399,15 +551,35 @@ export function drawVegas(oc: CanvasRenderingContext2D, w: number, h: number, e:
   // contours along its own interior.
   const threshold = clamp(effectNumber(e, 'threshold'), 1, 254);
   const color = str(e, 'color', '#ffffff');
+  const p = paramsOf(e);
+  const bunched = Math.round(effectNumber(e, 'segmentDistribution')) === 0;
+  const randomPhase = p.randomPhase === true;
+  const seed = Math.floor(effectNumber(e, 'randomSeed'));
+  const blend = Math.round(effectNumber(e, 'blendMode'));
+  const startOp = effectNumber(e, 'startOpacity');
+  const midOp = effectNumber(e, 'midOpacity');
+  const endOp = effectNumber(e, 'endOpacity');
+  const midPos = effectNumber(e, 'midPosition');
+  const flatProfile = startOp === 100 && midOp === 100 && endOp === 100;
 
   // A resolved mask-path polyline replaces the alpha contour outright — the
   // AE "Stroke: Mask/Path" reading. It arrives in layer-local centred px
   // (buildSnapshot fills it from `pathMaskId` at this frame's time, so a
   // TRACKED mask moves the lights with the object); shift to raster space and
   // the arc-length machinery below neither knows nor cares where it came from.
-  const flat = paramsOf(e).pathPoints;
+  const flat = p.pathPoints;
   const contours: ContourPoint[][] = [];
-  if (Array.isArray(flat) && flat.length >= 6) {
+  // Alpha contours are always closed; a mask path says (`pathClosed`, resolved
+  // beside `pathPoints`). Absent reads closed, which is what every mask path was
+  // assumed to be before the flag existed.
+  let pathClosed = true;
+  // All Masks: every mask, each with its OWN closed flag.
+  const maskPaths = p.allMasks === true
+    ? unpackMaskPaths(p.maskPathsMeta, p.maskPathsXY, w, h).filter((m) => m.points.length >= 2)
+    : null;
+  if (maskPaths) {
+    // Nothing to read from the pixels: the masks are the geometry.
+  } else if (Array.isArray(flat) && flat.length >= 6) {
     const loop: ContourPoint[] = [];
     for (let i = 0; i + 1 < flat.length; i += 2) {
       const x = flat[i];
@@ -415,29 +587,114 @@ export function drawVegas(oc: CanvasRenderingContext2D, w: number, h: number, e:
       if (typeof x === 'number' && typeof y === 'number') loop.push({ x: w / 2 + x, y: h / 2 + y });
     }
     if (loop.length >= 3) contours.push(loop);
+    pathClosed = p.pathClosed !== false;
   } else {
     const img = oc.getImageData(0, 0, w, h);
     contours.push(...extractAlphaContours(alphaPlane(img.data, w, h), w, h, threshold));
   }
-  if (contours.length === 0) return;
 
-  oc.save();
-  oc.globalAlpha = Math.min(1, opacity);
-  oc.strokeStyle = color;
-  oc.lineWidth = width;
-  oc.lineCap = 'round';
-  oc.lineJoin = 'round';
+  const runs: VegasRun[] = [];
+  if (maskPaths) {
+    if (p.strokeSequentially === true) {
+      const total = maskPaths.reduce((s, m) => s + arcTable(m.points, m.closed).total, 0);
+      runs.push(...vegasSequentialRuns(maskPaths, segments, lengthPct, rotation, bunched, randomPhase ? hash01(seed, 0) * total : 0));
+    } else {
+      maskPaths.forEach((m, i) => {
+        const phaseArc = randomPhase ? hash01(seed, i) * arcTable(m.points, m.closed).total : 0;
+        runs.push(...vegasRuns(m.points, segments, lengthPct, rotation, m.closed, bunched, phaseArc));
+      });
+    }
+  } else {
+    contours.forEach((contour, i) => {
+      const phaseArc = randomPhase ? hash01(seed, i) * arcTable(contour, pathClosed).total : 0;
+      runs.push(...vegasRuns(contour, segments, lengthPct, rotation, pathClosed, bunched, phaseArc));
+    });
+  }
+
+  // Blend Mode. Over draws straight onto the layer, exactly as Vegas always
+  // did. Transparent keeps only the lights. Under and Stencil need the lights
+  // as their own image first — behind the layer, or as the layer's matte.
+  const needsScratch = blend === 2 || blend === 3;
+  const scratchCanvas = needsScratch ? vegasScratch(w, h) : null;
+  const scratchCtx = scratchCanvas?.getContext('2d') ?? null;
+  // No 2D context (no DOM, or a canvas-less test environment): draw Over.
+  const scratch = scratchCtx ? scratchCanvas : null;
+  const dc = scratchCtx ?? oc;
+  if (blend === 0) {
+    oc.save();
+    oc.setTransform(1, 0, 0, 1, 0, 0);
+    oc.clearRect(0, 0, w, h);
+    oc.restore();
+  }
+  if (runs.length === 0) {
+    // Stencil with no lights leaves nothing of the layer; the rest draw nothing.
+    if (blend === 3 && scratch) {
+      oc.save();
+      oc.setTransform(1, 0, 0, 1, 0, 0);
+      oc.clearRect(0, 0, w, h);
+      oc.restore();
+    }
+    return;
+  }
+  if (dc !== oc) {
+    dc.setTransform(1, 0, 0, 1, 0, 0);
+    dc.clearRect(0, 0, w, h);
+  }
+
+  dc.save();
+  dc.globalAlpha = Math.min(1, opacity);
+  dc.strokeStyle = color;
+  dc.lineWidth = width;
+  dc.lineCap = 'round';
+  dc.lineJoin = 'round';
   // Hardness feathers the light's edge. 100 is a hard stroke; below that the
   // blur is proportional to the stroke's own width, so softening does not
   // change how thick the lights read.
-  if (hardness < 100) oc.filter = `blur(${((100 - hardness) / 100) * width * 0.5}px)`;
-  for (const contour of contours) {
-    for (const run of vegasSegments(contour, segments, lengthPct, rotation)) {
-      oc.beginPath();
-      oc.moveTo(run[0]!.x, run[0]!.y);
-      for (let i = 1; i < run.length; i++) oc.lineTo(run[i]!.x, run[i]!.y);
-      oc.stroke();
+  if (hardness < 100) dc.filter = `blur(${((100 - hardness) / 100) * width * 0.5}px)`;
+  const strokeRun = (pts: ReadonlyArray<ContourPoint>): void => {
+    dc.beginPath();
+    dc.moveTo(pts[0]!.x, pts[0]!.y);
+    for (let i = 1; i < pts.length; i++) dc.lineTo(pts[i]!.x, pts[i]!.y);
+    dc.stroke();
+  };
+  for (const run of runs) {
+    if (flatProfile) {
+      strokeRun(run.points);
+      continue;
+    }
+    // A varying opacity cannot be one stroke: cut the run into short pieces,
+    // each at the profile's opacity at its middle. Butt-capped inside the light
+    // so neighbours do not double up; round only where the light really ends.
+    const table = arcTable(run.points, false);
+    const pieces = Math.max(2, Math.min(96, Math.ceil(table.total / Math.max(1, width * 0.5))));
+    for (let j = 0; j < pieces; j++) {
+      const a = (table.total * j) / pieces;
+      const piece = walkArc(run.points, table, a, table.total / pieces);
+      if (piece.length < 2) continue;
+      const u = run.u0 + (run.u1 - run.u0) * ((j + 0.5) / pieces);
+      dc.globalAlpha = Math.min(1, opacity) * vegasOpacityAt(u, startOp, midOp, endOp, midPos);
+      dc.lineCap = (j === 0 && run.u0 <= 0) || (j === pieces - 1 && run.u1 >= 1) ? 'round' : 'butt';
+      strokeRun(piece);
     }
   }
-  oc.restore();
+  dc.restore();
+
+  if (scratch) {
+    oc.save();
+    oc.setTransform(1, 0, 0, 1, 0, 0);
+    oc.globalAlpha = 1;
+    oc.globalCompositeOperation = blend === 2 ? 'destination-over' : 'destination-in';
+    oc.drawImage(scratch, 0, 0);
+    oc.restore();
+  }
+}
+
+let vegasCanvas: HTMLCanvasElement | null = null;
+/** A same-size scratch canvas for the Under / Stencil blends; null without a DOM. */
+function vegasScratch(w: number, h: number): HTMLCanvasElement | null {
+  if (typeof document === 'undefined') return null;
+  vegasCanvas ??= document.createElement('canvas');
+  if (vegasCanvas.width !== w) vegasCanvas.width = w;
+  if (vegasCanvas.height !== h) vegasCanvas.height = h;
+  return vegasCanvas;
 }

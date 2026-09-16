@@ -22,7 +22,7 @@ import {
   type ColorStop,
   type OpacityStop,
 } from '@core/paint/fill';
-import { updateNodeStroke } from '@core/paint/stroke';
+import { updateNodeStrokeAt } from '@core/paint/stroke';
 import { defaultAnimation } from '@motion/animation';
 import { runAnimEdit } from '@core/animation/animationCommands';
 import { compToKeyframeTime } from '@core/timeline/TimelineController';
@@ -128,7 +128,14 @@ export function StopList({
   nodeId,
   paint,
   target = 'fill',
-}: { nodeId: string; paint: FillPaint; target?: 'fill' | 'stroke' }): JSX.Element | null {
+  strokeIndex = 0,
+}: {
+  nodeId: string;
+  paint: FillPaint;
+  target?: 'fill' | 'stroke';
+  /** Which stroke of the stack a `stroke` write lands on (0 = primary). */
+  strokeIndex?: number;
+}): JSX.Element | null {
   const time = useActiveWorkspace()?.time ?? 0;
   if (paint.type === 'solid') return null;
   const layerT = compToKeyframeTime(nodeId, time);
@@ -154,7 +161,7 @@ export function StopList({
         );
       }, `gradStops:${nodeId}`);
     } else if (target === 'stroke') {
-      updateNodeStroke(nodeId, { paint: { ...paint, stops: next } });
+      updateNodeStrokeAt(nodeId, strokeIndex, { paint: { ...paint, stops: next } });
     } else {
       setNodeFill(nodeId, { ...paint, stops: next });
     }

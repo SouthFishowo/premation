@@ -35,6 +35,8 @@ import {
   subscribeToEffects,
   type EffectCompiler,
 } from '@core/plugins/pluginEffects';
+import type { EffectBackend } from '@core/plugins/effectSchema';
+import { warmRegisteredKernels } from '@core/effects/pluginCpuEffect';
 import { registerPluginShaders, type ShaderRegistryLike } from '@core/plugins/pluginEffectMaterial';
 
 /**
@@ -44,6 +46,18 @@ import { registerPluginShaders, type ShaderRegistryLike } from '@core/plugins/pl
  */
 export interface ShaderValidator {
   shaderDiagnostics?(label: string, wgsl: string): Promise<string[]>;
+  /**
+   * The GLSL twin, implemented by the WebGL2 backend.
+   *
+   * Separate from `shaderDiagnostics` rather than a language flag on it,
+   * because the two take different inputs: WGSL is one source with two entry
+   * points, a GLSL program is two sources that must LINK, and a link error
+   * (mismatched varyings, mostly) is invisible to anything that compiles the
+   * stages independently.
+   */
+  glslDiagnostics?(label: string, vertex: string, fragment: string): Promise<string[]>;
+  /** Which tier is live, so the right kernel is the one compiled. */
+  tier?: string;
 }
 
 /** What this needs from a renderer. Narrow on purpose — it is a seam. */
@@ -60,7 +74,21 @@ export interface PluginEffectTarget {
  * attribution.
  */
 export function backendCompiler(backend: ShaderValidator): EffectCompiler {
+  /*
+    Which kernel gets compiled, decided from what the backend can actually do.
+
+    Read from the CAPABILITY rather than from a tier string where possible: a
+    backend that can link a GLSL program is the WebGL2 one, and asking it that
+    question directly survives a tier being renamed. The `tier` hint is the
+    tie-breaker for a backend that implements neither, which is every fake in
+    the test suite — and the answer there ("webgpu") is what every caller
+    before this meant.
+  */
+  const live: EffectBackend = backend.glslDiagnostics && !backend.shaderDiagnostics
+    ? 'webgl2'
+    : (backend.tier === 'webgl2' ? 'webgl2' : 'webgpu');
   return {
+    backend: live,
     async compile(id, wgsl) {
       const errors = await backend.shaderDiagnostics?.(id, wgsl);
       // `undefined` is "this backend cannot check", which is not a failure.
@@ -69,6 +97,14 @@ export function backendCompiler(backend: ShaderValidator): EffectCompiler {
       // WebGL2, where they are inert but not broken.
       if (errors && errors.length > 0) throw new Error(errors.join('; '));
     },
+    ...(backend.glslDiagnostics
+      ? {
+        async compileGlsl(id: string, vertex: string, fragment: string): Promise<void> {
+          const errors = await backend.glslDiagnostics!(id, vertex, fragment);
+          if (errors && errors.length > 0) throw new Error(errors.join('; '));
+        },
+      }
+      : {}),
   };
 }
 
@@ -90,6 +126,15 @@ export function attachPluginEffects(
 
   const sync = (): void => {
     if (detached) return;
+    /*
+      CPU kernels are warmed here, beside the shader compiles, and for the same
+      reason those are here: this is the moment the set of effects is known.
+
+      Without it the first frame an effect appears on renders without it —
+      which on a paused playhead means "until the user touches something", and
+      for a single-frame render (a thumbnail, the golden harness) means never.
+    */
+    warmRegisteredKernels(registeredEffects());
     for (const effect of registeredEffects()) {
       /*
         Registration first, and unconditionally.

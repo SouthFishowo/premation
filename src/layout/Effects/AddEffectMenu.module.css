@@ -1,0 +1,81 @@
+/* The header "+" — same box as the section preset trigger beside it, square. */
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-height-md);
+  height: var(--control-height-md);
+  padding: 0;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-2);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: all var(--motion-duration-fast) var(--motion-ease-standard);
+}
+
+.trigger:hover:not(:disabled) {
+  color: var(--color-text-primary);
+  background: var(--color-surface-3);
+  border-color: var(--color-border);
+}
+
+.trigger:disabled {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+.menu {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 260px;
+  max-width: calc(100vw - 24px);
+  padding: var(--space-2);
+  box-sizing: border-box;
+}
+
+.list {
+  max-height: 320px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.groupLabel {
+  padding: var(--space-2) var(--space-2) var(--space-1);
+  font-size: var(--font-size-micro);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-tertiary);
+  user-select: none;
+}
+
+.item {
+  display: block;
+  width: 100%;
+  height: var(--control-height-row);
+  padding: 0 var(--space-2);
+  border: none;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--color-text-primary);
+  font-family: inherit;
+  font-size: var(--font-size-xs);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.item:hover,
+.item:focus-visible {
+  background: var(--color-hover);
+  outline: none;
+}
+
+.empty {
+  margin: 0;
+  padding: var(--space-2);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}

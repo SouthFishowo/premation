@@ -86,6 +86,10 @@ const PIXEL_SOURCE = PIXEL_PATH.flatMap((d) => readAll(join(REPO_ROOT, d))).join
 const EXPLAINED: Record<string, string> = {
   // Decomposed into per-axis tracks; the group path itself is never sampled.
   scale: "'scaleX'",
+  // Speed % is a RATE: it is never sampled where a layer draws, it is
+  // INTEGRATED (core/animation/retime.ts) and reaches the pixels as the
+  // layer's source time through this helper.
+  timeSpeed: 'retimedSourceAt',
   // Material Options are sampled as a SET: buildSnapshot hands the frame's
   // animated-value map to `readNodeMaterial(node, a)`, which overrides each
   // stored option with its track (material.ts, MATERIAL_ANIMATABLE). The

@@ -3,7 +3,7 @@
  * selected layer, designed authentically after Adobe After Effects.
  */
 
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { useSelectionStore } from '@stores/selectionStore';
 import { useSceneRevision } from '@stores/sceneStore';
 import { useLayoutStore } from '@stores/layoutStore';
@@ -28,6 +28,35 @@ const QUICK_CATEGORIES = [
   { name: 'Stylize', icon: 'sparkles' as const, effectId: 'drop-shadow' },
 ];
 
+/**
+ * What Effect Controls lists for one layer: its applied effects, then the path
+ * operators, Cloner and Physics attached from Effects ▸ Shape / Simulation.
+ *
+ * Shared with the Properties panel's Effects section, so the stack has ONE
+ * implementation whichever surface draws it. `empty` is the host's own
+ * nothing-here line — a panel has room for a call to action, a section does not.
+ */
+export function EffectControlsBody({ nodeId, empty }: { nodeId: string; empty: ReactNode }): JSX.Element {
+  useSceneRevision((s) => s.rev);
+  // `primary`: the layer Effect Controls is showing — the selection's, or the
+  // locked one. Named so here too; clonerExpand.test follows it by that name.
+  const primary = nodeId;
+  const node = defaultSceneGraph.getNode(primary);
+  const count = node ? getNodeEffects(primary).length : 0;
+  const hasPathOps = node ? readPathOps(node).length > 0 : false;
+  const hasCloner = node ? nodeHasCloner(node) : false;
+  const hasPhysics = node ? nodeHasPhysics(node) : false;
+  if (!node || !(count > 0 || hasPathOps || hasCloner || hasPhysics)) return <>{empty}</>;
+  return (
+    <>
+      {count > 0 && <EffectStack nodeId={primary} />}
+      {hasPathOps && <PathOpControls nodeId={primary} />}
+      {hasCloner && <ClonerSection nodeId={primary} />}
+      {hasPhysics && <PhysicsSection nodeId={primary} />}
+    </>
+  );
+}
+
 export function EffectControlsPanel(): JSX.Element {
   const selected = useSelectionStore((s) => s.primary);
   useSceneRevision((s) => s.rev);
@@ -48,12 +77,7 @@ export function EffectControlsPanel(): JSX.Element {
   const setLocked = (on: boolean): void => setLockedId(on && selected ? selected : null);
 
   const node = primary ? defaultSceneGraph.getNode(primary) : undefined;
-  const count = primary ? getNodeEffects(primary).length : 0;
   const layerName = node?.name?.trim() || (primary ? `Layer: ${primary}` : 'No Layer Selected');
-  const hasPathOps = node ? readPathOps(node).length > 0 : false;
-  const hasCloner = node ? nodeHasCloner(node) : false;
-  const hasPhysics = node ? nodeHasPhysics(node) : false;
-  const hasAnything = count > 0 || hasPathOps || hasCloner || hasPhysics;
 
   return (
     <div className={styles.controlsRoot}>
@@ -118,27 +142,25 @@ export function EffectControlsPanel(): JSX.Element {
               ))}
             </div>
           </div>
-        ) : !hasAnything ? (
-          <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 10, textAlign: 'center' }}>
-            <p style={{ margin: 0, fontSize: 'var(--font-size-xs)', color: 'var(--color-text-secondary)', lineHeight: 1.4 }}>
-              No effects currently applied to “{layerName}”.
-            </p>
-            <Button
-              size="sm"
-              variant="primary"
-              onClick={() => useLayoutStore.getState().openPanel('effects')}
-              style={{ alignSelf: 'center' }}
-            >
-              Browse Effects &amp; Presets
-            </Button>
-          </div>
         ) : (
-          <>
-            {count > 0 && <EffectStack nodeId={primary} />}
-            <PathOpControls nodeId={primary} />
-            {hasCloner && <ClonerSection nodeId={primary} />}
-            {hasPhysics && <PhysicsSection nodeId={primary} />}
-          </>
+          <EffectControlsBody
+            nodeId={primary}
+            empty={
+              <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 10, textAlign: 'center' }}>
+                <p style={{ margin: 0, fontSize: 'var(--font-size-xs)', color: 'var(--color-text-secondary)', lineHeight: 1.4 }}>
+                  No effects currently applied to “{layerName}”.
+                </p>
+                <Button
+                  size="sm"
+                  variant="primary"
+                  onClick={() => useLayoutStore.getState().openPanel('effects')}
+                  style={{ alignSelf: 'center' }}
+                >
+                  Browse Effects &amp; Presets
+                </Button>
+              </div>
+            }
+          />
         )}
       </div>
     </div>

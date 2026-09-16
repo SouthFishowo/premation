@@ -527,6 +527,8 @@ export const addEffectDef: AiToolDef = {
           'color-offset', 'threshold-rgb', 'cineon-converter',
           // Round seven — Stylize / Perspective / Generate / Simulation
           'block-load', 'kernel', '3d-glasses', 'fractal', 'particle-systems', 'cc-bubbles',
+          // Stroke-like paint effects (2026-09-15) — AE Stroke and Scribble
+          'path-stroke', 'scribble',
         ],
       },
       amount: { type: 'number', description: 'Initial value for the primary param. Omit for the effect default.' },

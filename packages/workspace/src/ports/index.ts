@@ -27,6 +27,10 @@ export type NodeId = string;
 export interface WorkspaceMaskPath {
   readonly id: string;
   readonly points: readonly BezierPoint[];
+  /** Whether the outline wraps back to its first vertex. Absent = closed. */
+  readonly closed?: boolean;
+  /** AE RotoBezier: the handles are derived from the vertices, not dragged. */
+  readonly rotoBezier?: boolean;
 }
 
 export interface WorkspaceNode {
@@ -87,6 +91,10 @@ export interface WorkspaceNode {
   readonly hitTestLocal?: (localPoint: Vec2) => boolean;
   /** Bezier path points in LOCAL space (only for shapes with custom paths). */
   readonly pathPoints?: readonly BezierPoint[];
+  /** Whether `pathPoints` wraps back to its first vertex. Absent = closed, as the renderer reads it. */
+  readonly pathClosed?: boolean;
+  /** RotoBezier on the layer's own outline (see `WorkspaceMaskPath.rotoBezier`). */
+  readonly pathRotoBezier?: boolean;
   /**
    * The layer's mask outlines in LOCAL space, if any.
    *
@@ -207,15 +215,30 @@ export interface WorkspaceOverlay {
    * nothing is being Alt-measured, which is what keeps the canvas quiet.
    */
   smartGuides?: SmartGuideOverlayData | null;
+  /**
+   * Free Transform Points: the box around the selected vertices and its
+   * (draggable) anchor, screen space. Null/absent when not transforming.
+   */
+  pathTransformBox?: { corners: Corners; anchor: Vec2 } | null;
 }
 
 export interface OverlayHandle {
   id: string;
   position: Vec2;
-  /** 'resize' | 'rotate' = bounding box handle, 'point' = vertex, 'tangent-in' | 'tangent-out' = bezier handle, 'anchor' = pan-behind pivot */
-  kind: 'resize' | 'rotate' | 'point' | 'tangent-in' | 'tangent-out' | 'anchor';
+  /**
+   * 'resize' | 'rotate' = bounding box handle, 'point' = vertex, 'tangent-in' |
+   * 'tangent-out' = bezier handle, 'anchor' = pan-behind pivot, 'feather' = a
+   * mask vertex's variable-feather grip (drawn at `origin` + its width)
+   */
+  kind: 'resize' | 'rotate' | 'point' | 'tangent-in' | 'tangent-out' | 'anchor' | 'feather';
   /** Under the cursor right now — the painter lights it up. */
   hovered?: boolean;
+  /** A vertex in the Direct Selection's vertex selection — drawn filled (AE), others hollow. */
+  selected?: boolean;
+  /** The outline's FIRST vertex — drawn larger (AE Set First Vertex). */
+  first?: boolean;
+  /** Where a tangent / feather grip hangs from (its vertex), for the arm line. */
+  origin?: Vec2;
 }
 
 export interface OverlayGuide {

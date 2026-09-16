@@ -124,6 +124,25 @@ describe('PropertiesPanel in a DockPanel with a layer selected', () => {
     expect(screen.getByText('Open Effect Controls panel')).toBeInTheDocument();
   });
 
+  it('keeps the dock header to the search toggle — no switch glyphs beside the title', () => {
+    renderDock();
+    expect(screen.queryByRole('group', { name: 'Layer switches' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Solo' })).not.toBeInTheDocument();
+  });
+
+  it('lists the layer switches as labelled menu rows, and settles after one is toggled', () => {
+    // The switch rows are derived from scene state, so toggling one MUST
+    // change the menu — the case the memo has to get right without looping.
+    renderDock();
+    openHeaderMenu();
+    for (const label of ['Visible', 'Solo', 'Lock']) expect(screen.getByText(label)).toBeInTheDocument();
+    act(() => {
+      fireEvent.click(screen.getByText('Solo'));
+    });
+    expect(defaultSceneGraph.getNode(ID)?.solo).toBe(true);
+    expect(loopWarnings).toEqual([]);
+  });
+
   it('takes its rows back out when another panel becomes active', () => {
     renderDock();
     act(() => useLayoutStore.getState().openPanel(OTHER));

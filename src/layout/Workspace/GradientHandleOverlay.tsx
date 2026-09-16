@@ -71,6 +71,8 @@ import {
   type ColorStop,
   type FillPaint,
 } from '@core/paint/fill';
+import { getNodeStrokeAt, updateNodeStrokeAt, type StrokeGradientGeometry } from '@core/paint/stroke';
+import { strokeGradientGeometryFor, strokeTrackPath } from '@core/rendering/strokeTracks';
 import { useGradientEditStore, type GradientEditTarget } from './gradientEditStore';
 import { layerScreenMapping } from './layerScreen';
 import { beginViewportGesture, endViewportGesture } from '@core/workspace/viewportGesture';
@@ -85,6 +87,8 @@ import {
   paintFromGripDrag,
   pointAtOffset,
   removeStopById,
+  strokeGradientAxisLocal,
+  strokeGradientFromGripDrag,
   type GradientGripKind,
   type GradientPaint,
   type GradientScreenView,
@@ -102,8 +106,10 @@ const AXIS_COLOR = '#4c8dff';
 /** Which paint the gizmo edits: the layer's fill, or a text layer's stroke gradient. */
 type PaintChannel = GradientEditTarget;
 
-/** The keyframeable geometry scalars of each channel — the names the renderer samples. */
-const GEOMETRY_TRACKS: Readonly<Record<PaintChannel, GradientTrackNames>> = {
+/** The keyframeable geometry scalars of each angle/centre channel — the names the
+ *  renderer samples. A shape stroke's gradient has POINTS instead (see
+ *  `writeStrokeGradientPoints`). */
+const GEOMETRY_TRACKS: Readonly<Record<'fill' | 'stroke', GradientTrackNames>> = {
   fill: FILL_GRADIENT_TRACKS,
   stroke: TEXT_STROKE_GRADIENT_TRACKS,
 };
@@ -119,6 +125,10 @@ interface EditTarget {
   /** The Text component a stroke write lands on (stroke channel only). */
   textComponentId: string | null;
   fillIndex: number;
+  /** The shape stroke's index in its stack (shapeStroke channel only). */
+  strokeIndex: number;
+  /** The shape stroke's Start/End points as the frame shows them (shapeStroke only). */
+  strokePoints: StrokeGradientGeometry | null;
   fills: FillPaint[];
   /** The STORED paint — what a static write spreads over. */
   paint: GradientPaint;
@@ -136,11 +146,61 @@ interface EditTarget {
 
 /** One gesture, one undo entry: the debounce key the whole drag shares. */
 const historyKey = (t: EditTarget): string =>
-  t.channel === 'stroke' ? `gradient:${t.nodeId}:stroke` : `gradient:${t.nodeId}`;
+  t.channel === 'stroke'
+    ? `gradient:${t.nodeId}:stroke`
+    : t.channel === 'shapeStroke'
+      ? `gradient:${t.nodeId}:shapeStroke:${t.strokeIndex}`
+      : `gradient:${t.nodeId}`;
+
+/**
+ * A shape stroke's Start/End points from a grip drag — `AnimatablePaintRow`'s
+ * rule per coordinate: a live track (or Auto-Keyframe) takes a keyframe on the
+ * stroke's own `gradientStartX…` path, everything else lands in ONE static write
+ * of the whole geometry. One `batchHistory`, so a drag that moves X and Y is one
+ * undo step.
+ */
+function writeStrokeGradientPoints(t: EditTarget, next: StrokeGradientGeometry, grip: GradientGripKind): void {
+  const props: Array<{ prop: string; value: number }> = grip === 'start'
+    ? [
+        { prop: strokeTrackPath(t.strokeIndex, 'gradientStartX'), value: next.startX },
+        { prop: strokeTrackPath(t.strokeIndex, 'gradientStartY'), value: next.startY },
+      ]
+    : [
+        { prop: strokeTrackPath(t.strokeIndex, 'gradientEndX'), value: next.endX },
+        { prop: strokeTrackPath(t.strokeIndex, 'gradientEndY'), value: next.endY },
+      ];
+  const autoKey = usePreferenceStore.getState().timelineAutoKeyframe;
+  batchHistory(historyKey(t), () => {
+    let anyStatic = false;
+    for (const { prop, value } of props) {
+      if (defaultAnimation.isAnimated(t.nodeId, prop) || autoKey) {
+        const at = compToKeyframeTime(t.nodeId, t.time, prop);
+        runAnimEdit(`Set ${prop}`, () => defaultAnimation.setKeyframe(t.nodeId, prop, at, value), `gradGeom:${t.nodeId}:${prop}`);
+      } else {
+        anyStatic = true;
+      }
+    }
+    if (!anyStatic) return;
+    // Only the dragged end goes onto the STORED points — the other end and the
+    // highlight keep their stored values, not the keyframed ones on screen.
+    const stored = getNodeStrokeAt(t.nodeId, t.strokeIndex);
+    const base = stored?.gradient ?? strokeGradientGeometryFor(stored?.paint, t.width, t.height);
+    updateNodeStrokeAt(t.nodeId, t.strokeIndex, {
+      gradient: grip === 'start'
+        ? { ...base, startX: next.startX, startY: next.startY }
+        : { ...base, endX: next.endX, endY: next.endY },
+    });
+  });
+}
 
 /** The paint itself — the text stroke, the fill stack's slot, or the primary-fill shortcut. */
 function writePaintStatic(t: EditTarget, paint: GradientPaint): void {
   batchHistory(historyKey(t), () => {
+    if (t.channel === 'shapeStroke') {
+      // A shape stroke's gradient (colour stops) lives on its stack entry.
+      updateNodeStrokeAt(t.nodeId, t.strokeIndex, { paint });
+      return;
+    }
     if (t.channel === 'stroke') {
       // A text stroke gradient lives on the Text component, where the stroke
       // rows write it (`TextStrokeRows`).
@@ -200,7 +260,7 @@ function writeGradientStops(t: EditTarget, next: ColorStop[]): void {
 function writeGradientGeometry(t: EditTarget, next: GradientPaint, grip: GradientGripKind): void {
   // The channel's own track names: `fillAngle`… for a fill, `strokeAngle`… for
   // a text stroke gradient — the names the renderer samples.
-  const names = GEOMETRY_TRACKS[t.channel];
+  const names = GEOMETRY_TRACKS[t.channel === 'stroke' ? 'stroke' : 'fill'];
   const props: Array<{ prop: string; value: number }> =
     next.type === 'linear'
       ? [{ prop: names.angle, value: next.angle }]
@@ -271,11 +331,16 @@ export function GradientHandleOverlay(): JSX.Element | null {
   const strokePaint: GradientPaint | null = node ? readTextStrokePaint(node) ?? null : null;
   const textComponentId = node?.components.find((c) => c.type === 'Text')?.id ?? null;
   const armedTarget = useGradientEditStore((s) => s.target);
+  // A SHAPE stroke's gradient, only when armed on it from its stroke rows —
+  // `fillIndex` then names the stroke's index in the stack.
+  const shapeStroke = armed && armedTarget === 'shapeStroke' && nodeId ? getNodeStrokeAt(nodeId, fillIndexRaw) : undefined;
+  const shapeStrokePaint: GradientPaint | null = isGradient(shapeStroke?.paint) ? (shapeStroke!.paint as GradientPaint) : null;
   // The stroke when armed on it (the Fill/Stroke chip, or the stroke rows'
   // "Edit on canvas"), or when it is the layer's only gradient; else the fill.
-  const channel: PaintChannel =
-    strokePaint && textComponentId && ((armed && armedTarget === 'stroke') || !fillPaint) ? 'stroke' : 'fill';
-  const storedPaint = channel === 'stroke' ? strokePaint : fillPaint;
+  const channel: PaintChannel = shapeStrokePaint
+    ? 'shapeStroke'
+    : strokePaint && textComponentId && ((armed && armedTarget === 'stroke') || !fillPaint) ? 'stroke' : 'fill';
+  const storedPaint = channel === 'shapeStroke' ? shapeStrokePaint : channel === 'stroke' ? strokePaint : fillPaint;
 
   const layerT = nodeId ? compToKeyframeTime(nodeId, time) : 0;
   // Stop KEYFRAMES bind to the primary FILL only — the same gating the panel
@@ -290,7 +355,8 @@ export function GradientHandleOverlay(): JSX.Element | null {
    * as the renderer reads them.
    */
   const paint = useMemo<GradientPaint | null>(() => {
-    if (!storedPaint || !nodeId || (channel === 'fill' && fillIndex !== 0)) return storedPaint;
+    // A shape stroke's geometry is its POINTS (sampled below), not these tracks.
+    if (!storedPaint || !nodeId || channel === 'shapeStroke' || (channel === 'fill' && fillIndex !== 0)) return storedPaint;
     const names = GEOMETRY_TRACKS[channel];
     const sampled = new Map<string, number>();
     for (const prop of [names.angle, names.centerX, names.centerY, names.radius]) {
@@ -330,9 +396,36 @@ export function GradientHandleOverlay(): JSX.Element | null {
 
   const width = geom?.width ?? 0;
   const height = geom?.height ?? 0;
+
+  /**
+   * A shape stroke's Start/End points as the FRAME shows them: its stored points
+   * (or those its angle/centre model implies), with any `gradientStartX…` track
+   * sampled at the playhead — the same fold `resolveStrokeTracks` renders.
+   */
+  const strokePoints = useMemo<StrokeGradientGeometry | null>(() => {
+    if (channel !== 'shapeStroke' || !nodeId || !shapeStroke || !shapeStrokePaint) return null;
+    const base = shapeStroke.gradient ?? strokeGradientGeometryFor(shapeStrokePaint, width, height);
+    const read = (param: 'gradientStartX' | 'gradientStartY' | 'gradientEndX' | 'gradientEndY', fallback: number): number => {
+      const prop = strokeTrackPath(fillIndexRaw, param);
+      if (!defaultAnimation.isAnimated(nodeId, prop)) return fallback;
+      const v = defaultAnimation.sample(nodeId, prop, compToKeyframeTime(nodeId, time, prop));
+      return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+    };
+    return {
+      ...base,
+      startX: read('gradientStartX', base.startX),
+      startY: read('gradientStartY', base.startY),
+      endX: read('gradientEndX', base.endX),
+      endY: read('gradientEndY', base.endY),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- anim rev drives this
+  }, [channel, nodeId, shapeStroke, shapeStrokePaint, width, height, fillIndexRaw, time, sceneTick]);
+
   const axis = useMemo(
-    () => (paint ? gradientAxisLocal(paint, width, height) : null),
-    [paint, width, height],
+    () => (strokePoints
+      ? strokeGradientAxisLocal(strokePoints, width, height)
+      : paint ? gradientAxisLocal(paint, width, height) : null),
+    [paint, strokePoints, width, height],
   );
 
   /** The axis and every stop, projected — the input the hit test wants. */
@@ -360,6 +453,8 @@ export function GradientHandleOverlay(): JSX.Element | null {
           channel,
           textComponentId,
           fillIndex,
+          strokeIndex: fillIndexRaw,
+          strokePoints,
           fills,
           paint: storedPaint,
           shown: paint,
@@ -482,6 +577,15 @@ export function GradientHandleOverlay(): JSX.Element | null {
       if (drag.kind === 'grip') {
         if (!s.mapping) return;
         const l = s.mapping.screenToLocal(p.x, p.y);
+        // A shape stroke's gradient: the grip IS a point, moved where it is put.
+        if (s.target.channel === 'shapeStroke' && s.target.strokePoints) {
+          writeStrokeGradientPoints(
+            s.target,
+            strokeGradientFromGripDrag(s.target.strokePoints, drag.grip, { x: l.x, y: l.y }, s.target.width, s.target.height),
+            drag.grip,
+          );
+          return;
+        }
         // From the geometry as SHOWN (keyframes applied): a radius grip measures
         // from the centre the frame draws, not from the static one.
         const next = paintFromGripDrag(

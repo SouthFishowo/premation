@@ -20,6 +20,7 @@ import { cloudProjectsEnabled } from '@core/config/edition';
 // /dashboard, where the core has not booted. `coreServices()` throws there.
 import { tryCoreServices } from '@core/services/coreServices';
 import { buildWorkspaceMenuItems } from './workspaceMenu';
+import { pluginPanelMenuItems } from './pluginPanelsMenu';
 
 /** Project-lifecycle command ids (registered against ProjectManager at boot). */
 export const ProjectCommands = {
@@ -367,6 +368,22 @@ export const APP_MENU: MenuGroupModel[] = [
           { commandId: 'text.sourceTextExpression', label: 'Source Text Expression…' },
         ],
       },
+      {
+        // AE's Layer ▸ Mask and Shape Path. Acts on the vertices selected with
+        // Direct Selection, else on the selected layers' paths (pathCommands.ts).
+        label: 'Mask and Shape Path',
+        children: [
+          { commandId: 'path.toggleClosed', label: 'Closed' },
+          { commandId: 'path.setFirstVertex', label: 'Set First Vertex' },
+          { commandId: 'path.toggleRotoBezier', label: 'RotoBezier' },
+          { commandId: 'path.reverse', label: 'Reverse Path Direction' },
+          { separator: true },
+          { commandId: 'path.freeTransformPoints', label: 'Free Transform Points' },
+          { commandId: 'path.keyframe', label: 'Set Mask / Path Keyframe' },
+          { separator: true },
+          { commandId: 'path.convertMaskToShape', label: 'Convert Mask to Shape Layer' },
+        ],
+      },
       // AE's Layer ▸ Guide Layer. Registered, with no menu line until now.
       { commandId: 'layer.toggleGuide', label: 'Guide Layer' },
       {
@@ -540,8 +557,11 @@ export const APP_MENU: MenuGroupModel[] = [
           { commandId: 'time.freezeFrame', label: 'Freeze Frame' },
           { commandId: 'time.freezeOnLastFrame', label: 'Freeze On Last Frame' },
           { separator: true },
+          // Twixtor / Timewarp's two modes. The one-click ramps and the seven
+          // velocity presets stay in the command palette and the Speed section.
+          { commandId: 'time.retime.speed', label: 'Retime: Speed %' },
+          { commandId: 'time.retime.frames', label: 'Retime: Frame Number' },
           { commandId: 'time.speedRamp.quarter', label: 'Speed Ramp to 25%' },
-          { commandId: 'time.speedRamp.normal', label: 'Speed Ramp back to 100%' },
           { separator: true },
           { commandId: 'time.frameBlend.none', label: 'Frame Blend: Off' },
           { commandId: 'time.frameBlend.mix', label: 'Frame Blend: Frame Mix' },
@@ -739,12 +759,43 @@ export const APP_MENU: MenuGroupModel[] = [
       { commandId: 'view.presentation', label: 'Present (Preview)' },
       { separator: true },
       { commandId: 'view.audio', label: 'Audio' },
+      { commandId: 'view.paint', label: 'Paint' },
+      { commandId: 'view.brushes', label: 'Brushes' },
       { commandId: 'view.history', label: 'History' },
       { commandId: 'view.transcript', label: 'Transcript' },
       { commandId: 'view.effectControls', label: 'Effect Controls' },
       { commandId: 'view.renderQueue', label: 'Render Queue' },
       { commandId: 'view.export', label: 'Export' },
       { commandId: 'view.graphEditor', label: 'Graph Editor' },
+      // Every other dock panel (2026-09-15). The rails now carry only the
+      // everyday set, so this submenu is the complete list of what else can be
+      // docked — alphabetical, because a user scanning it knows the name, not
+      // the rail it lands on. One container, since this group sits at the
+      // 14-entry cap (`menuSubmenus.test.ts`). Commands: Providers.tsx.
+      {
+        label: 'Panels',
+        // A THUNK, not a list: the app's own panels are fixed, and a plugin's
+        // are not — they appear and disappear with what the user has installed,
+        // and the renderer re-evaluates this every time the menu is drawn.
+        // `pluginPanelMenuItems` returns nothing when no plugin declares a
+        // panel, which is the overwhelmingly common case.
+        children: () => [
+          { commandId: 'view.align', label: 'Align' },
+          { commandId: 'view.effects', label: 'Effects' },
+          { commandId: 'view.motion', label: 'Graph Panel' },
+          { commandId: 'view.info', label: 'Info' },
+          { commandId: 'view.scene', label: 'Layers' },
+          { commandId: 'view.presets', label: 'Presets' },
+          { commandId: 'view.preview', label: 'Preview' },
+          { commandId: 'view.rig', label: 'Rigging' },
+          { commandId: 'view.scopes', label: 'Scopes' },
+          { commandId: 'view.sourceMonitor', label: 'Source Monitor' },
+          { commandId: 'view.swatches', label: 'Swatches' },
+          { commandId: 'view.character', label: 'Text' },
+          { commandId: 'view.tracker', label: 'Tracker' },
+          ...pluginPanelMenuItems(),
+        ],
+      },
       { separator: true },
       // Built per render from WorkspaceManager — half of it is user data. See
       // workspaceMenu.ts.

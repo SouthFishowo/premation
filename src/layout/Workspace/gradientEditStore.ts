@@ -23,8 +23,12 @@
 
 import { create } from 'zustand';
 
-/** Which paint the gizmo edits: the fill, or a text layer's stroke gradient. */
-export type GradientEditTarget = 'fill' | 'stroke';
+/**
+ * Which paint the gizmo edits: the fill, a text layer's stroke gradient, or a
+ * SHAPE stroke's gradient (`shapeStroke` — AE's Gradient Stroke Start/End
+ * points; `fillIndex` then names the stroke's index in the stack).
+ */
+export type GradientEditTarget = 'fill' | 'stroke' | 'shapeStroke';
 
 interface GradientEditStore {
   /** The layer whose gradient axis is showing, or null when disarmed. */

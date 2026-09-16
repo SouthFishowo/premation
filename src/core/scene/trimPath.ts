@@ -30,8 +30,12 @@ export interface Pt {
  * the offset makes it wrap past the end of the path. Pure.
  */
 export function trimSegments(startPct: number, endPct: number, offsetPct: number): Array<[number, number]> {
-  const s = startPct / 100;
-  const e = endPct / 100;
+  // Start past End shows the span BETWEEN them, as AE and lottie-web do — an
+  // End animating back past Start used to make the whole stroke vanish.
+  const lo = Math.min(startPct, endPct);
+  const hi = Math.max(startPct, endPct);
+  const s = lo / 100;
+  const e = hi / 100;
   const o = offsetPct / 100;
   const len = e - s;
   if (len <= 0) return [];

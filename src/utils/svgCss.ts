@@ -97,6 +97,8 @@ function hasAnimationDecl(decls: Decls): boolean {
  */
 const PRESENTATION_PROPS = new Set([
   'fill', 'stroke', 'stroke-width', 'opacity', 'fill-opacity', 'stroke-opacity',
+  'stroke-linecap', 'stroke-linejoin', 'stroke-miterlimit', 'stroke-dasharray', 'stroke-dashoffset',
+  'vector-effect',
   'color', 'display', 'visibility',
   'font-size', 'font-family', 'font-weight', 'font-style', 'text-anchor',
 ]);

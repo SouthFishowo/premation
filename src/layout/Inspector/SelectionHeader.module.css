@@ -1,22 +1,14 @@
 /*
- * SelectionHeader — the layer action buttons (swatch, switches, search)
- * rendered directly in the Properties sidebar title row at the top.
+ * SelectionHeader — the identity row at the top of the Properties body: label
+ * colour, kind glyph, name (double-click to rename) and the muted kind text.
+ * The layer switches are rows in the panel's ⋯ menu, not buttons here.
  */
-.headerButtons {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-}
-
-.head {
-  flex: none;
+.header {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  min-height: var(--bar-height-panel);
-  padding: 0 var(--space-3) 0 var(--space-4);
-  border-bottom: 1px solid var(--color-border-subtle);
-  background: var(--color-panel);
+  flex: 1;
+  min-width: 0;
 }
 
 .swatchBtn {
@@ -41,52 +33,65 @@
   background: var(--color-hover);
 }
 
+.swatchBtn:focus-visible {
+  outline: 1px solid var(--color-focus-ring);
+  outline-offset: 1px;
+}
+
 .colorItem {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
 }
 
-.switches {
-  display: inline-flex;
-  align-items: center;
-  gap: 1px;
+.kindIcon {
   flex: none;
+  color: var(--color-text-tertiary);
 }
 
-.switch {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: var(--control-height-sm);
-  height: var(--control-height-sm);
-  padding: 0;
-  border: none;
-  border-radius: var(--radius-control);
-  background: transparent;
-  color: var(--color-text-muted);
-  cursor: pointer;
-  transition:
-    background-color var(--motion-duration-fast) var(--motion-ease-standard),
-    color var(--motion-duration-fast) var(--motion-ease-standard);
-}
-
-.switch:hover {
+.name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
   color: var(--color-text-primary);
-  background: var(--color-hover);
+  cursor: default;
+  user-select: none;
 }
 
-.switchOn {
-  color: var(--color-primary);
-}
-
-/* Mixed: lit but hollow — "some of them". */
-.switchMixed {
-  color: var(--color-primary);
-  opacity: 0.55;
-}
-
-.switch:focus-visible {
+.name:focus-visible {
   outline: 1px solid var(--color-focus-ring);
   outline-offset: 1px;
+  border-radius: var(--radius-control);
+}
+
+.nameInput {
+  flex: 1;
+  min-width: 0;
+  height: var(--control-height-sm);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--color-focus-ring);
+  border-radius: var(--radius-control);
+  background: var(--color-surface-0);
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: var(--font-size-sm);
+}
+
+.nameInput:focus {
+  outline: none;
+}
+
+/* Muted and allowed to shrink first: the name is what you came to read. */
+.kind {
+  flex: 0 1 auto;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
 }

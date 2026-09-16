@@ -183,9 +183,11 @@ describe('Unified Text Panel (Character + Paragraph)', () => {
       expect(availableIds).not.toContain('paragraph');
     });
 
-    it('PANEL_COMPONENTS maps both character and paragraph to CharacterPanel', () => {
+    it('PANEL_COMPONENTS maps character (and paragraph, while it is still mapped) to CharacterPanel', () => {
       expect(PANEL_COMPONENTS.character).toBe(CharacterPanel);
-      expect(PANEL_COMPONENTS.paragraph).toBe(CharacterPanel);
+      // `paragraph` had no def and was dropped from the renderer map; if it is
+      // ever mapped again it must be the same shared panel, never a copy.
+      expect([undefined, CharacterPanel]).toContain(PANEL_COMPONENTS.paragraph);
     });
   });
 });

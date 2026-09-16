@@ -26,9 +26,22 @@ import {
   type FillPaint,
 } from '@core/paint/fill';
 import type { PropertyAccess } from '@core/inspector/multiSelection';
+import { normalizePaintOpOptions, type PaintOpOptions } from '@core/paint/stroke';
 import { useGradientEditStore } from '@layout/Workspace/gradientEditStore';
 import { ColorKfRow } from '../ColorKfRow';
 import { AnimatablePaintRow } from './AnimatablePaintRow';
+import { PaintOpRows } from './PaintOpRows';
+
+/**
+ * A fill with its Composite/Blend Mode replaced — defaults normalised AWAY, so a
+ * fill set back to Below/Normal is the exact object (and raster cache key) it
+ * was before. The fields ride the paint object structurally; `FillPaint` itself
+ * does not declare them.
+ */
+function withPaintOp<T extends FillPaint>(paint: T, opts: PaintOpOptions): T {
+  const { composite: _c, blendMode: _b, ...rest } = paint as T & PaintOpOptions;
+  return { ...rest, ...normalizePaintOpOptions(opts) } as T;
+}
 import { StopList } from './StopLists';
 import styles from '../TransformSection.module.css';
 import effStyles from '../../Effects/EffectsPanel.module.css';
@@ -96,7 +109,10 @@ export function FillRows({ nodeId }: { nodeId: string }): JSX.Element | null {
       if (fill) setSavedFill(fill);
       setNodeFill(nodeId, undefined);
     } else {
-      setNodeFill(nodeId, convertFill(fill, type));
+      // Composite / blend survive a type switch — they belong to the paint
+      // operation, not to whichever kind of paint it currently is.
+      const next = convertFill(fill, type);
+      setNodeFill(nodeId, fill ? withPaintOp(next, fill as PaintOpOptions) : next);
       setSavedFill(null);
     }
   };
@@ -137,6 +153,14 @@ export function FillRows({ nodeId }: { nodeId: string }): JSX.Element | null {
                 <option value="radial">Radial</option>
               </select>
             </div>
+
+            {fill && (
+              <PaintOpRows
+                label="Fill 1"
+                value={fill as PaintOpOptions}
+                onChange={(next) => setNodeFill(nodeId, withPaintOp(fill, next))}
+              />
+            )}
 
             {fill && fill.type === 'solid' && (
               <ColorKfRow
@@ -183,7 +207,8 @@ export function FillRows({ nodeId }: { nodeId: string }): JSX.Element | null {
         {/* Extra fills (multi-fill stack, drawn over the primary). Animated
             fill tracks bind to the primary only, so extras stay simple rows. */}
         {fills.slice(1).map((f, i) => (
-          <div key={`xfill_${i}`} className={styles.popoverRow}>
+          <div key={`xfill_${i}`} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div className={styles.popoverRow}>
             <span className={styles.popoverLabel}>Fill {i + 2}</span>
             <select
               className={styles.select}
@@ -221,6 +246,16 @@ export function FillRows({ nodeId }: { nodeId: string }): JSX.Element | null {
             >
               <Icon name="close" size="sm" />
             </button>
+          </div>
+          <PaintOpRows
+            label={`Fill ${i + 2}`}
+            value={f as PaintOpOptions}
+            onChange={(opts) => {
+              const next = [...fills];
+              next[i + 1] = withPaintOp(f, opts);
+              setNodeFills(nodeId, next);
+            }}
+          />
           </div>
         ))}
         {fill && (

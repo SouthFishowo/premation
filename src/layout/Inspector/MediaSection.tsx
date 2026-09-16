@@ -28,7 +28,7 @@ import {
   AUDIO_PAN_PROP, MIN_PAN, MAX_PAN,
 } from '@core/audio/audioParams';
 import { KeyframeRow } from './KeyframeRow';
-import { TimeRemapRow } from './PrecompControl';
+import { RetimeSection } from './RetimeSection';
 import { ProxyRow } from './ProxyRow';
 import { customPrompt } from '@components/Modal';
 import styles from './TransformSection.module.css';
@@ -207,8 +207,7 @@ export function MediaSection({ nodeId }: { nodeId: string }): JSX.Element | null
 
       {isVideo && (
         <>
-          <h4 className={styles.title} style={{ marginTop: 12 }}>Playback</h4>
-          <TimeRemapRow nodeId={nodeId} />
+          <RetimeSection nodeId={nodeId} />
 
           {!silent && (
             <>

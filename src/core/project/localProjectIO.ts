@@ -117,12 +117,20 @@ function materializeAssets(unpacked: UnpackResult): { document: EditorDocument; 
   for (const a of unpacked.assets) {
     const url = URL.createObjectURL(new Blob([a.bytes as BlobPart], { type: a.mime }));
     const packaged = `assets/${a.fileName}`;
+    let referenced = false;
     for (const node of doc.scene?.nodes ?? []) {
       for (const c of node.components) {
         const src = (c.props as Record<string, unknown>).src;
-        if (src === packaged) (c.props as Record<string, unknown>).src = url;
+        if (src === packaged) {
+          (c.props as Record<string, unknown>).src = url;
+          referenced = true;
+        }
       }
     }
+    // A packaged asset no layer points at (a leftover from a deleted layer)
+    // was still minted a URL that nothing could ever load or revoke — its
+    // bytes stayed pinned for the session. Nothing holds it, so release it.
+    if (!referenced) URL.revokeObjectURL(url);
   }
   return { document: doc, missing: findMissingAssets(doc) };
 }

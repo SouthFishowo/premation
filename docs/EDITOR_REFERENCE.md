@@ -61,7 +61,7 @@ rediscovered in git history and believed a second time.
 
 | Registry | Count | Source of truth |
 |---|---|---|
-| Effects | 204 | `src/core/effects/effects.ts` → `EffectType` |
+| Effects | 206 | `src/core/effects/effects.ts` → `EffectType` |
 | Blend modes | 38 | `src/core/effects/blendMode.ts` → `LayerBlendMode` |
 | Layer styles | 10 | `layerStyles.ts` → `LAYER_STYLE_LABEL` + `BACKDROP_STYLES` |
 | Path operators | 9 | `src/core/scene/pathOps.ts` → `PathOpType` (less `none`) |
@@ -71,7 +71,7 @@ rediscovered in git history and believed a second time.
 | AI tools | 65 | `packages/ai-tools/src/tools/{read,write,craft,compose}.ts` |
 | Export formats | 18 | `videoSink.ts` → `VideoFormat` + `exportManager.ts` → `ExportFormat` |
 | Stores | 64 | `src/stores/*.ts` |
-| Packages | 13 | `packages/*` |
+| Packages | 14 | `packages/*` |
 
 <!-- /FEATURE-COUNTS -->
 
@@ -722,6 +722,23 @@ building it is greenfield work rather than a remainder.
 
 ### The shell
 
+**Sidebars: fewer, labelled panels** (2026-09-15, `panelDefs.ts`,
+`DockPanel.tsx`). The rails carried 7 icons on the left and 14 on the right,
+unlabelled, and four of them duplicated another surface. The permanent sets are
+now **Project** (compositions above media — the Assets panel, id `assets`, with
+the comp list moved in from Layers), **Library** and **AI** on the left, and
+**Properties** and **Audio** (which absorbed the pointer / composition readout
+of Info & Audio) on the right. Every other panel — Layers, Effect Controls,
+Transcript, Plugins, Text, Align, Swatches, Info, Scopes, Preview, Source,
+Tracker, Rigging, Effects, Graph, Presets, plus History, Paint, Brushes, Render
+and Export — is on demand: **Window ▸ Panels** (or its own Window entry /
+shortcut), and the **"+"** at the foot of each rail, which lists that side's
+closed panels. Rail tabs print the panel's name under its glyph. Workspaces
+open what their job needs (Animation → Graph + Rigging, Color → Scopes). A
+persisted layout from before the change is migrated once (`LAYOUT_SCHEMA_VERSION`
+2): sizes, sides and splits kept, tab lists reset to the new defaults, and an
+active builtin workspace's panels re-applied.
+
 **Smart guides** (`packages/workspace/src/snap/smartGuides.ts` +
 `SmartGuideOverlay.tsx`) are the measuring half of snapping. `SnapEngine` has
 always answered "where does this edge want to land" — alignment, a pink line with
@@ -973,8 +990,8 @@ output.
 
 ### Tier 2 — ceilings on visual density
 
-**Effect breadth: 204 effects vs AE's 400+.** The raw count misleads in both
-directions — nobody uses 400, and the 204 effects present are properly
+**Effect breadth: 206 effects vs AE's 400+.** The raw count misleads in both
+directions — nobody uses 400, and the 206 effects present are properly
 parameterised (Levels, Curves, Channel Mixer, Keylight with
 despill/choke/softness). What matters is the missing *classes*, not the delta:
 no 3D Stroke, no Form/Plexus, no Element 3D. The dense, expensive-looking AE
@@ -987,7 +1004,7 @@ written against this document inherited. And the missing *classes* named "no
 volumetric light rays (Shine)" and "no optical-flare system worth the name":
 `light-rays`, `lens-flare`, `light-sweep` and `beam` all ship, each with a
 registry def, a Canvas2D reference, a Generate entry, and (as of 2026-08-14) a
-GPU shader. The count is now phrased as "204 effects" rather than as a bare
+GPU shader. The count is now phrased as "206 effects" rather than as a bare
 figure specifically so that `docPropagatedCounts.test.ts` can check it.
 
 **Variable-width mask feather LANDED** (2026-08-20). `MaskPoint` gained an
@@ -2199,7 +2216,7 @@ needing a 39-entry allow-list is one that gets silenced the first time it fires.
 The cost of the narrowness is that an oblique phrasing still escapes, and §4's
 did — "Effect breadth: 73 vs AE's 400+" puts no noun after the number. That was
 rewritten into the checkable form rather than the regex being widened to chase
-it. Prose stating a count should say "204 effects".
+it. Prose stating a count should say "206 effects".
 
 Ledger table ROWS in this section are exempt, structurally rather than by a list
 of phrases: quoting a superseded number is what a corrections ledger is for, and
@@ -2793,7 +2810,7 @@ coverage (summed over ranks on the ids' bit patterns, so shared edges split)
 to a grey matte layer above the EXR, wired as its luma matte. A file with a
 stripped manifest lists its ids by hex.
 
-**Plexus** (`plexus`, Generate; `EffectType` 203 → **204 effects**): the
+**Plexus** (`plexus`, Generate; `EffectType` 203 → **204**): the
 point/line network. A deterministic point cloud drifting on value noise with
 Evolution — or a mask path's vertices, so a tracked mask carries the network
 — with every pair inside Max Distance linked by a distance-faded line,
@@ -2802,9 +2819,46 @@ engines bake the same pass (golden `effect-plexus`). The same network is a
 Particle-section option (Plexus Distance) over a system's live particles,
 drawn under the sprites at their projected positions.
 
+### Built 2026-09-15 — AE's stroke-like paint effects
+
+Two effects, `EffectType` 204 → **206 effects**, and two upgrades — all four
+lay a round brush along the layer's MASKS, which `buildSnapshot` now resolves
+per frame as the whole stack (`maskPathsMeta` / `maskPathsXY`, mask order,
+closed flag, mode, inversion; `packMaskPaths` in `strokePaint.ts`), so tracked
+and keyframed masks carry them. Shared dab / paint-style maths:
+`src/core/effects/strokePaint.ts`.
+
+**Stroke** (`path-stroke`, Generate) is AE's: Path (empty = first mask), All
+Masks, Stroke Sequentially, Color, Brush Size, Brush Hardness, Opacity,
+Start/End (percent of arc length), Spacing (percent of the brush), Paint Style
+On Original / On Transparent / Reveal Original Image. The alpha-outline effect
+that held the name keeps its id `stroke` and is now labelled Alpha Stroke.
+**Scribble** (`scribble`, Generate): Single Mask / All Masks / All Masks Using
+Modes; Fill Type Inside, Centered / Inside / Outside / Left / Right Edge with
+End Cap, Join and Miter Limit shaping the band; Angle, Stroke Width, Curviness,
+Spacing and Path Overlap with their variations; Start/End with Fill Paths
+Sequentially; Wiggle Static / Jumpy / Smooth from a wiggle state quantised from
+the layer clock in `buildSnapshot` (static and jumpy scribbles keep their
+cache); Composite. Both are Canvas2D-only buffer kernels (`pathStroke.ts`,
+`scribble.ts`).
+
+**Write-on** gained AE's brush form (Mode ▸ Brush Position, the default for new
+instances): a dab every Brush Spacing seconds along the keyframed Brush
+Position, Stroke Length, Brush Hardness / Opacity, Paint and Brush Time
+Properties, Paint Style — the dab history is sampled from the tracks in
+`buildSnapshot` (`writeOnBrush.ts`) and bakes on the CPU. Stored documents have
+no `writeOnMode` and read Classic Line / Path, which keeps its shader.
+`EffectDef.newInstanceParams` is how a fresh instance and a stored one can
+default differently without a migration. **Vegas** gained All Masks, Stroke
+Sequentially, Segment Distribution, Random Phase + seed, Blend Mode
+Transparent / Over / Under / Stencil and the Start / Mid-point / End opacity
+profile, all defaulting to its previous look. Resolved geometry params declared
+`unit: 'px'` now scale with the bake's raster scale (`scaleEffectLengths`),
+which also fixes Vegas / Write-on mask paths drawn off-centre on a 2x bake.
+
 ### Built 2026-09-08 — Deep Glow (`deep-glow`) and Energy Beam (`beam-path`)
 
-Two effects, `EffectType` 201 → 203 (Plexus on 09-09 makes it **204 effects**): the physically based glow and the Saber-class beam from
+Two effects, `EffectType` 201 → 203 (Plexus on 09-09 makes it **204**): the physically based glow and the Saber-class beam from
 `docs/ENGINE_STRENGTH_PLAN.md` A1 and A2.
 
 **Energy Beam** (`beam-path`, Generate) draws a lit core stroke with an
@@ -2836,7 +2890,7 @@ Quality (4/6/8 octaves).
 
 ### Built 2026-09-07 — effects round seven, and a miscount inside the counter
 
-Eighteen effects, taking `EffectType` from 183 to 201 (Deep Glow and Energy Beam, 2026-09-08, make it **203**; Plexus, 2026-09-09, **204 effects**). Fifteen ship
+Eighteen effects, taking `EffectType` from 183 to 201 (Deep Glow and Energy Beam, 2026-09-08, make it **203**; Plexus, 2026-09-09, **204**; Stroke and Scribble, 2026-09-15, **206 effects**). Fifteen ship
 as a GPU shader in both dialects plus a retained Canvas2D kernel, which is the
 shape every port since round six has held; three ship as per-channel transfer
 tables and no shader at all.

@@ -113,7 +113,12 @@ export async function ensureEnvironmentSh(assetId: string): Promise<boolean> {
       return true;
     }
     const asset = useAssetStore.getState().assets.find((a) => a.id === assetId);
-    if (!asset || asset.type !== 'image' || !asset.src) {
+    // Not loaded YET is not a failure: a project opens its assets from
+    // IndexedDB in the background, and a frame that asked first used to mark
+    // the sky failed for the whole session (only tests ever reset the set).
+    // `pending` already stops a frame storm; the next frame simply asks again.
+    if (!asset || !asset.src) return false;
+    if (asset.type !== 'image') {
       failed.add(assetId);
       return false;
     }

@@ -156,18 +156,23 @@ export interface PathOp {
   /** Trim only — end of the visible range, percent 0..100. */
   end?: number;
   /**
-   * Trim only — AE's "Trim Multiple Shapes".
+   * Trim only — AE's "Trim Multiple Shapes", with AE's (and lottie-web's)
+   * meaning of the two words.
    *
-   * `individually`: every run is trimmed by the SAME percentages, so three
-   * bars grow together like one body. `simultaneously`: the runs are one
-   * concatenated path, so the window walks the first shape, then the second,
-   * then the third — which is what a staggered reveal of several outlines
-   * looks like, and AE's default.
+   * `simultaneously` (AE's default): every run is trimmed by the SAME
+   * percentages at once, so three bars grow together. `individually`: the runs
+   * are trimmed one after another as a single concatenated length — the window
+   * walks the first shape, then the second, then the third.
    *
-   * Discrete (not keyframeable). Absent on stored ops means `individually`,
-   * which is what this renderer did before the switch existed.
+   * Discrete (not keyframeable). Absent means `simultaneously`.
+   *
+   * RENAMED from `trimMultiple` in document 1.7.0, whose two values meant the
+   * OPPOSITE (see `v1_6_0_to_v1_7_0`). A new key rather than swapped values
+   * because `captureDocument` stamps every save '1.1.0' and re-walks the whole
+   * chain on each load: a value swap would flip back and forth per reopen,
+   * while a key rename converts once.
    */
-  trimMultiple?: 'individually' | 'simultaneously';
+  trimMultipleShapes?: 'simultaneously' | 'individually';
   /**
    * Trim: rotate the window around the path, percent (wraps).
    * Repeater: AE's Repeater Offset — shift the whole ladder by this many rungs,
@@ -372,7 +377,7 @@ export function defaultPathOp(): PathOp {
 export function defaultTrimOp(): PathOp {
   return {
     id: newPathOpId(), type: 'trim', amount: 0, detail: 0,
-    start: 0, end: 100, offset: 0, trimMultiple: 'simultaneously',
+    start: 0, end: 100, offset: 0, trimMultipleShapes: 'simultaneously',
   };
 }
 
@@ -1322,7 +1327,7 @@ function coercePathOp(raw: unknown): PathOp | null {
     start: num(o.start, 0),
     end: num(o.end, 100),
     offset: num(o.offset, 0),
-    trimMultiple: o.trimMultiple === 'simultaneously' ? 'simultaneously' : 'individually',
+    trimMultipleShapes: o.trimMultipleShapes === 'individually' ? 'individually' : 'simultaneously',
     copies: num(o.copies, 1),
     offsetX: num(o.offsetX, 0),
     offsetY: num(o.offsetY, 0),
@@ -1371,8 +1376,8 @@ function resolveOne(op: PathOp, av: Map<string, number> | undefined): PathOp {
     start: v('start', op.start ?? 0),
     end: v('end', op.end ?? 100),
     offset: v('offset', op.offset ?? 0),
-    // Discrete — never sampled. Absent means the historical individually.
-    trimMultiple: op.trimMultiple === 'simultaneously' ? 'simultaneously' : 'individually',
+    // Discrete — never sampled. Absent means AE's default, simultaneously.
+    trimMultipleShapes: op.trimMultipleShapes === 'individually' ? 'individually' : 'simultaneously',
     // The repeater's eight. Every one of them was keyframeable under `rep.*`
     // before the fold and stays keyframeable here — the migration reroutes the
     // tracks rather than dropping them.
@@ -1460,13 +1465,12 @@ function polylineLength(pts: readonly Pt[], closed: boolean): number {
 /**
  * Cut every run down to a trim's visible arcs.
  *
- * `individually` (the historical default): each run is trimmed by the same
- * percentages — AE's "Trim Multiple Shapes: Individually". Three bars then
- * grow together like one body.
+ * `simultaneously` (AE's default): each run is trimmed by the same
+ * percentages at once. Three bars then grow together.
  *
- * `simultaneously`: the runs are one concatenated path, so the window walks
- * the first shape, then the second — AE's default, and the one a staggered
- * reveal of several outlines actually wants.
+ * `individually`: the runs are trimmed one after another as one concatenated
+ * length, so the window walks the first shape, then the second — lottie-web's
+ * `m: 2`, and what a staggered reveal of several outlines wants.
  *
  * Outputs of a partial cut are always OPEN: a cut arc closed by the stroke
  * would draw a chord back to its own start. A run that lands fully inside
@@ -1479,8 +1483,8 @@ function applyTrim(runs: readonly PolyRun[], op: PathOp): PolyRun[] {
   // outline closed, or adding an untouched Trim card would visibly open the
   // shape's stroke.
   if (segs.length === 1 && segs[0]![0] === 0 && segs[0]![1] === 1) return [...runs];
-  if (op.trimMultiple === 'simultaneously' && runs.length > 1) {
-    return applyTrimSimultaneously(runs, segs);
+  if (op.trimMultipleShapes === 'individually' && runs.length > 1) {
+    return applyTrimIndividually(runs, segs);
   }
   const out: PolyRun[] = [];
   for (const run of runs) {
@@ -1497,9 +1501,9 @@ function applyTrim(runs: readonly PolyRun[], op: PathOp): PolyRun[] {
 /**
  * Trim the concatenation: each run occupies a slice of the combined
  * arc-length, so a 0→100 end on three equal bars reveals them one after
- * another instead of all three at once.
+ * another instead of all three at once — AE's "Individually".
  */
-function applyTrimSimultaneously(
+function applyTrimIndividually(
   runs: readonly PolyRun[],
   segs: ReadonlyArray<readonly [number, number]>,
 ): PolyRun[] {

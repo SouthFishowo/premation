@@ -25,7 +25,6 @@ import { TreeView, type TreeNode } from '@components/TreeView';
 import { SearchField } from '@components/SearchField';
 import { Icon, type IconName } from '@components/Icon';
 import { Dropdown, type DropdownItem } from '@components/Dropdown';
-import { customConfirm } from '@components/Modal';
 import { useSelectionStore } from '@stores/selectionStore';
 import { useSceneRevision } from '@stores/sceneStore';
 import { useAnimationRevision } from '@hooks/useAnimationRevision';
@@ -52,11 +51,7 @@ import { mergeSelectedPaths, liveMergeSelectedPaths } from '@core/scene/mergePat
 import { rigLogoForAnimation } from '@core/scene/rigLogo';
 import { reparentNode, moveNodeAdjacent, canReparent, arrangeNodes } from '@core/scene/parenting';
 import { LABEL_COLORS, readNodeLabelColor, setNodeLabelColor, nodesWithLabelColor } from '@core/scene/labelColor';
-import { deleteComposition, duplicateComposition } from '@core/composition/compositionOps';
-import { isRealComposition } from '@core/composition/compNavigation';
 import { openPrecomposeDialog } from '@layout/Composition/PrecomposeDialog';
-import { openCompositionSettings } from '@layout/Composition/CompositionSettingsDialog';
-import { openNewCompositionDialog } from '@layout/Composition/NewCompositionDialog';
 import { svgContextMenuItems } from '@layout/Inspector/svgLayerActions';
 import { getNodeEffects } from '@core/effects/effects';
 import { defaultAnimation } from '@motion/animation';
@@ -73,6 +68,7 @@ import { findLayerKind, findKindFor } from '@core/plugins/layerKindRegistry';
 import { ownerOf, readCustomLayer } from '@core/plugins/customLayers';
 import type { SceneNode } from '@core/types';
 import styles from '@layout/EditorLayout/panels.module.css';
+import { CompositionList } from './CompositionList';
 
 /** What the TreeView carries per row beyond its label — used for the glyph. */
 interface SceneNodeData {
@@ -182,7 +178,13 @@ function toTreeNode(node: SceneNode): TreeNode<SceneNodeData> {
   const custom = readCustomLayer(node);
   const inert = custom ? !findKindFor(custom.pluginId, custom.kindId) : false;
 
-  let label: React.ReactNode = node.name ?? node.id;
+  // A composition root is labelled from the PROJECT record, the source of truth
+  // the comp tabs and the timeline read. The root node carries a name of its
+  // own, seeded as "Composition 1" and only kept in step by `renameComposition`
+  // — so a fresh project's tree said "Composition 1" under a tab titled
+  // "Main Comp".
+  const compName = node.parent ? undefined : useProjectStore.getState().comps[node.id]?.name;
+  let label: React.ReactNode = compName ?? node.name ?? node.id;
   if (owner) {
     label = (
       <span className={styles.pluginManagedRow} title={`Managed by ${owner}. Editing it takes it over.`}>
@@ -333,67 +335,13 @@ export function ScenePanel(): JSX.Element {
     setQuery('');
   };
 
+  // The comp records are an input to the tree: a composition root is labelled
+  // with its project name (see `toTreeNode`), so a rename must rebuild it.
   const comps = useProjectStore((s) => s.comps);
-  const projectTabs = useProjectStore((s) => s.tabs);
   const activeTabId = useProjectStore((s) => s.activeTabId);
-  const openTab = useProjectStore((s) => s.actions.openTab);
-  const setActiveTab = useProjectStore((s) => s.actions.setActiveTab);
-  const listedComps = useMemo(
-    // Scene roots only — a group opened in its own tab carries a settings
-    // record too, and would otherwise be listed here as a composition.
-    () => Object.values(comps).filter((c) => !c.pristine && isRealComposition(c.id)),
-    [comps],
-  );
-  const activeCompId = activeTabId ? projectTabs[activeTabId]?.compositionId : undefined;
 
-  const openComposition = (compId: string): void => {
-    const existing = Object.values(projectTabs).find((t) => t.compositionId === compId);
-    if (existing) {
-      setActiveTab(existing.id);
-      return;
-    }
-    const name = comps[compId]?.name ?? compId;
-    openTab(compId, [compId], name);
-  };
-
-  const confirmDeleteComp = async (compId: string): Promise<void> => {
-    const comp = comps[compId];
-    if (!comp || comp.pristine) return;
-    const layers = Math.max(0, flattenComposition(defaultSceneGraph, compId).length - 1);
-    const warn = layers > 0
-      ? `Delete “${comp.name}” and its ${layers} layer${layers === 1 ? '' : 's'}?`
-      : `Delete “${comp.name}”?`;
-    if (await customConfirm('Delete Composition', warn, { isDanger: true, confirmLabel: 'Delete' })) {
-      deleteComposition(compId);
-    }
-  };
-
-  const openCompMenu = (compId: string, e: React.MouseEvent): void => {
-    e.preventDefault();
-    e.stopPropagation();
-    const name = comps[compId]?.name ?? compId;
-    openContextMenu(e.clientX, e.clientY, [
-      { id: 'open', label: 'Open Composition', onSelect: () => openComposition(compId) },
-      {
-        id: 'settings',
-        label: 'Composition Settings…',
-        onSelect: () => {
-          openComposition(compId);
-          openCompositionSettings();
-        },
-      },
-      { id: 'duplicate', label: 'Duplicate', onSelect: () => duplicateComposition(compId) },
-      { id: 'sep', separator: true },
-      {
-        id: 'delete',
-        label: `Delete “${name}”`,
-        danger: true,
-        onSelect: () => { void confirmDeleteComp(compId); },
-      },
-    ]);
-  };
-
-  const tree = useMemo(() => sceneGraphToTree(), [rev]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const tree = useMemo(() => sceneGraphToTree(), [rev, comps]);
   const q = query.trim().toLowerCase();
   /*
     Search is one of FIVE questions this panel answers, not the only one. A
@@ -623,60 +571,10 @@ export function ScenePanel(): JSX.Element {
       onClose={() => getEventBus().emit('PanelClosed', { panelId: 'scene' })}
     >
       <div className={styles.sceneShell} data-tour="scene-panel">
-      {/* Compositions live here — not in Assets. Assets = media library. */}
-      <div className={styles.compSection}>
-        <div className={styles.compSectionHead}>
-          <span className={styles.compSectionLabel}>Compositions</span>
-          <button
-            type="button"
-            className={styles.compAddBtn}
-            title="New Composition…"
-            aria-label="New Composition"
-            onClick={() => openNewCompositionDialog()}
-          >
-            <Icon name="plus" size="sm" />
-          </button>
+        <CompositionList collapsible />
+        <div className={styles.layerSectionHead}>
+          <span className={styles.compSectionLabel}>Layers</span>
         </div>
-        {listedComps.length === 0 ? (
-          <div className={styles.compEmpty}>None yet — create one to start</div>
-        ) : (
-          <div className={styles.compList} role="list">
-            {listedComps.map((c) => {
-              const active = c.id === activeCompId;
-              return (
-                <div
-                  key={c.id}
-                  role="listitem"
-                  className={`${styles.compRow}${active ? ` ${styles.compRowActive}` : ''}`}
-                  title={`${c.name} · ${c.width}×${c.height} · ${c.fps} fps`}
-                  onClick={() => openComposition(c.id)}
-                  onContextMenu={(e) => openCompMenu(c.id, e)}
-                >
-                  <Icon name="component" size="sm" className={styles.compGlyph} />
-                  <span className={styles.compName}>{c.name}</span>
-                  <span className={styles.compMeta}>{c.width}×{c.height}</span>
-                  <button
-                    type="button"
-                    className={styles.compDeleteBtn}
-                    title={`Delete “${c.name}”`}
-                    aria-label={`Delete ${c.name}`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void confirmDeleteComp(c.id);
-                    }}
-                  >
-                    <Icon name="trash" size="sm" />
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      <div className={styles.layerSectionHead}>
-        <span className={styles.compSectionLabel}>Layers</span>
-      </div>
       <div className={styles.searchRow}>
         <SearchField
           placeholder="Search layers…"

@@ -10,7 +10,7 @@
  */
 
 import { defineScene, node, type Scene } from '../sceneKit';
-import { ellipseMask } from '@core/effects/mask';
+import { ellipseMask, rectangleMask } from '@core/effects/mask';
 
 const COMP = { width: 320, height: 220, background: '#0c0c12' };
 const SIZE = { w: 320, h: 220 };
@@ -878,8 +878,113 @@ const beamPathMaskScene: Scene = defineScene({
   },
 });
 
+/**
+ * AE Stroke (`path-stroke`) along an ELLIPSE mask, Start 10 → End 85, On
+ * Transparent, soft 60 % brush. What a wrong hand-off looks like is legible:
+ * a stroke on the layer box (wrong geometry), a closed ring (Start/End ignored),
+ * or nothing (masks never resolved). Not run by this change's author — bless
+ * with `npm run render-tests:update -- effect-path-stroke-mask`.
+ */
+const pathStrokeMaskScene: Scene = defineScene({
+  id: 'effect-path-stroke-mask',
+  description: 'AE Stroke along an ellipse mask, Start 10 → End 85, soft brush, On Transparent.',
+  size: SIZE,
+  comp: COMP,
+  fps: 30,
+  frames: [0],
+  gpuParity: 'expect-pass',
+  build(graph) {
+    graph.addNode(node('subj', {
+      kind: 'shape',
+      position: { x: 160, y: 110 },
+      transform: { width: 220, height: 170, shapeType: 'rect' },
+      style: { fill: '#1d2740' },
+    }));
+    graph.setMask('subj', { paths: [{ ...ellipseMask(170, 120), id: 'ring', mode: 'none' }] });
+    graph.setEffects('subj', [
+      { id: 'st', type: 'path-stroke', params: { pathMaskId: 'ring', color: '#ffd166', brushSize: 9, brushHardness: 60, opacity: 100, start: 10, end: 85, spacing: 15, paintStyle: 1 } },
+    ]);
+  },
+});
+
+/**
+ * Scribble, Single Mask ▸ Inside an ellipse, Static wiggle (so the golden does
+ * not depend on the frame's clock), over the original image. Seeded, so the
+ * zig-zag is reproducible. Bless with `-- effect-scribble-inside`.
+ */
+const scribbleInsideScene: Scene = defineScene({
+  id: 'effect-scribble-inside',
+  description: 'Scribble filling an ellipse mask: angle 45, spacing 7, curviness 40 %, static wiggle, On Original Image.',
+  size: SIZE,
+  comp: COMP,
+  fps: 30,
+  frames: [0],
+  gpuParity: 'expect-pass',
+  build(graph) {
+    graph.addNode(node('subj', {
+      kind: 'shape',
+      position: { x: 160, y: 110 },
+      transform: { width: 240, height: 180, shapeType: 'rect' },
+      style: { fill: '#1d2740' },
+    }));
+    graph.setMask('subj', { paths: [{ ...ellipseMask(180, 130), id: 'blob', mode: 'none' }] });
+    graph.setEffects('subj', [
+      {
+        id: 'sc', type: 'scribble',
+        params: {
+          scribbleMode: 0, pathMaskId: 'blob', fillType: 0, color: '#ff7a1a', opacity: 100, angle: 45, strokeWidth: 3,
+          curviness: 40, curvinessVariation: 10, spacing: 7, spacingVariation: 1, pathOverlap: 10, pathOverlapVariation: 20,
+          start: 0, end: 100, fillPathsSequentially: true, wiggleType: 0, wigglesPerSecond: 0, randomSeed: 7, composite: 0,
+        },
+      },
+    ]);
+  },
+});
+
+/**
+ * Vegas ▸ All Masks + Stroke Sequentially over two rectangles, Bunched, with a
+ * Start → End opacity fade along each light. Bless with `-- effect-vegas-all-masks`.
+ */
+const vegasAllMasksScene: Scene = defineScene({
+  id: 'effect-vegas-all-masks',
+  description: 'Vegas on two rectangle masks, sequential, bunched, fading lights, blend Transparent.',
+  size: SIZE,
+  comp: COMP,
+  fps: 30,
+  frames: [0],
+  gpuParity: 'expect-pass',
+  build(graph) {
+    graph.addNode(node('subj', {
+      kind: 'shape',
+      position: { x: 160, y: 110 },
+      transform: { width: 260, height: 180, shapeType: 'rect' },
+      style: { fill: '#1d2740' },
+    }));
+    const left = { ...rectangleMask(90, 110), id: 'l', mode: 'none' as const };
+    const right = { ...rectangleMask(90, 110), id: 'r', mode: 'none' as const };
+    graph.setMask('subj', {
+      paths: [
+        { ...left, points: left.points.map((pt) => ({ ...pt, x: pt.x - 60, inX: pt.inX - 60, outX: pt.outX - 60 })) },
+        { ...right, points: right.points.map((pt) => ({ ...pt, x: pt.x + 60, inX: pt.inX + 60, outX: pt.outX + 60 })) },
+      ],
+    });
+    graph.setEffects('subj', [
+      {
+        id: 'veg', type: 'vegas',
+        params: {
+          allMasks: true, strokeSequentially: true, segments: 6, length: 60, segmentDistribution: 0, rotation: 20,
+          blendMode: 0, color: '#7dd3fc', width: 6, hardness: 100, startOpacity: 100, midOpacity: 60, midPosition: 50, endOpacity: 10, opacity: 100,
+        },
+      },
+    ]);
+  },
+});
+
 export const effectScenes: Scene[] = [
   ...EFFECTS.map(effectScene),
+  pathStrokeMaskScene,
+  scribbleInsideScene,
+  vegasAllMasksScene,
   displacementMapLayerScene,
   applyColorLutScene,
   compoundBlurScene,

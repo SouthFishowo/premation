@@ -1,0 +1,14 @@
+.root {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* One quiet line — the header "+" is the action, this only says why the
+   section is empty. */
+.hint {
+  margin: 0;
+  padding: var(--space-1) 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+}

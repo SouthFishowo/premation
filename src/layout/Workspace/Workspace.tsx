@@ -32,7 +32,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type ReactNode, type KeyboardEvent } from 'react';
 import { cn } from '@utils/cn';
 import { useProjectStore } from '@stores/projectStore';
-import { useCurrentTime, getTime as getPlayheadTime } from '@stores/playbackClockStore';
+import { getTime as getPlayheadTime } from '@stores/playbackClockStore';
 import { useSceneRevisionFrame } from '@hooks/useSceneRevisionFrame';
 import { useCompositionStore } from '@stores/compositionStore';
 import { useWorkspaceViewStore } from '@stores/workspaceViewStore';
@@ -84,6 +84,7 @@ import { useGizmo3d } from './useGizmo3d';
 import { useDeviceHandles } from './useDeviceHandles';
 import { useFocusContext } from '@layout/focus/useFocusContext';
 import { useWorkspace } from './useWorkspace';
+import { pluginKeyDown } from './pluginDrawOverlay';
 import { TransportBar } from './TransportBar';
 import { ViewportHud } from './ViewportHud';
 import { CompareOverlay } from './CompareOverlay';
@@ -121,6 +122,9 @@ export interface WorkspaceViewportProps {
 const VIEWPORT_KEYS = new Set([
   'Space', 'Delete', 'Backspace', 'Escape', 'Enter', 'NumpadEnter',
   'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown',
+  // Ctrl/Cmd+T opens Free Transform Points while path vertices are selected —
+  // offered to the tool, which claims it only then (see `toolClaimedKeys`).
+  'KeyT',
 ]);
 
 /**
@@ -162,13 +166,57 @@ function TransparencyGrid(): JSX.Element {
   return <div ref={ref} className={styles.transparencyGrid} data-transparency-grid="" />;
 }
 
+/**
+ * The 3D gizmo and the camera / light handles, as their own leaf.
+ *
+ * Both hooks follow the playhead (an animated camera moves the gizmo's
+ * projection, a keyframed light moves its dot), so whatever calls them
+ * re-renders on every tick of playback. They used to be called from
+ * `WorkspaceViewport` itself, which dragged the whole viewport shell — and
+ * every overlay under it — through a React render per frame. Here only this
+ * subtree does.
+ *
+ * Their capture-phase `pointerdown` listeners are on the stage, so moving them
+ * into a child changes nothing about who sees a press first: capture on an
+ * ancestor always runs before the overlay canvas' own listeners, and the two
+ * keep their relative order because they are still called in the same order
+ * from the same component.
+ */
+function Gizmo3dLayer({ stageRef }: { stageRef: React.RefObject<HTMLDivElement | null> }): JSX.Element | null {
+  // No view options — the main viewport IS the default view (camera3dMode +
+  // the workspace controller's transform). The secondary panes pass their own.
+  const gizmo3dProps = useGizmo3d(stageRef);
+  // Camera / light handles. Called AFTER the layer gizmo so its capture-phase
+  // listener runs second: where a device handle overlaps a transform handle the
+  // layer gizmo claims the press first, which is the more specific intent.
+  const { deviceHandles, hoveredHandle } = useDeviceHandles(stageRef);
+  // Mounts for the whole 3D SCENE, not for the selection: the ground plane and
+  // comp frame are how you orient yourself in a side view, so gating them on
+  // "a 3D layer is selected" hid them in exactly the case they exist for. The
+  // gizmo inside still needs a target.
+  if (!(gizmo3dProps.scene3d || (gizmo3dProps.is3D && gizmo3dProps.singleId))) return null;
+  return (
+    <Gizmo3dOverlay
+      {...gizmo3dProps}
+      deviceHandles={deviceHandles}
+      hoveredDeviceHandle={hoveredHandle}
+      nodeId={gizmo3dProps.singleId ?? null}
+      showGizmo={gizmo3dProps.is3D && !!gizmo3dProps.singleId}
+    />
+  );
+}
+
 export function WorkspaceViewport({
   topLeft,
   bottomLeft,
   bottomRight,
   className,
 }: WorkspaceViewportProps): JSX.Element {
-  const time     = useCurrentTime();
+  // NO playhead subscription here. This component is the whole viewport shell
+  // and it used to re-render on every tick of playback to hand `time` to
+  // useWorkspace — which now reads the clock itself. Anything below that has
+  // to follow the playhead subscribes on its own (see Gizmo3dLayer).
+  //
   // Frame-coalesced, NOT the raw rev: this component is the whole viewport
   // shell — every SVG overlay under it reconciles when it does — and the raw
   // subscription re-rendered it once per pointermove during a drag.
@@ -281,18 +329,29 @@ export function WorkspaceViewport({
     overlayCanvasRef: overlayRef,
     stageRef,
     sceneRev,
-    time,
     focus,
     focusKey,
   });
 
-  // No view options — the main viewport IS the default view (camera3dMode +
-  // the workspace controller's transform). The secondary panes pass their own.
-  const gizmo3dProps = useGizmo3d(stageRef);
-  // Camera / light handles. Mounted AFTER the layer gizmo so its capture-phase
-  // listener runs second: where a device handle overlaps a transform handle the
-  // layer gizmo claims the press first, which is the more specific intent.
-  const { deviceHandles, hoveredHandle } = useDeviceHandles(stageRef);
+  // The active tool's key claims, mirrored onto the focusable viewport so the
+  // capture-phase ShortcutManager lets them through: with path vertices
+  // selected, Delete deletes VERTICES and the arrows nudge them, where the
+  // global bindings would delete / nudge the layer. Refreshed on every engine
+  // redraw, which every change of tool state already requests.
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const controller = getWorkspaceController();
+    let last = '';
+    const sync = (): void => {
+      const claims = controller.ws.toolClaimedKeys().join(' ');
+      if (claims === last || !rootRef.current) return;
+      last = claims;
+      if (claims) rootRef.current.setAttribute('data-shortcut-claim', claims);
+      else rootRef.current.removeAttribute('data-shortcut-claim');
+    };
+    sync();
+    return controller.onRender(sync);
+  }, []);
 
   const onKeyDown = useCallback((e: KeyboardEvent<HTMLDivElement>): void => {
     const target = e.target as HTMLElement | null;
@@ -304,6 +363,22 @@ export function WorkspaceViewport({
       return;
     }
     if (!VIEWPORT_KEYS.has(e.code)) return;
+    /*
+      A plugin's TOOL gets first refusal, ahead of the engine's own.
+
+      Only a tool: a plugin that has merely drawn a gizmo has no claim on the
+      keyboard, and swallowing keys it never asked for would break every
+      shortcut the user expects to work while looking at the composition. The
+      plugin is asynchronous, so the key is consumed rather than answered — the
+      same contract its pointer events have.
+    */
+    if (pluginKeyDown(e.key, {
+      alt: e.altKey, ctrl: e.ctrlKey, meta: e.metaKey, shift: e.shiftKey,
+    })) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     const controller = getWorkspaceController();
     /*
       The ACTIVE TOOL gets first refusal.
@@ -528,6 +603,7 @@ export function WorkspaceViewport({
 
       {/* Canvas viewport */}
       <div
+        ref={rootRef}
         className={styles.root}
         data-workspace-viewport=""
         data-drag-over={dragOver || undefined}
@@ -605,15 +681,7 @@ export function WorkspaceViewport({
               plane and comp frame are how you orient yourself in a side view,
               so gating them on "a 3D layer is selected" hid them in exactly
               the case they exist for. The gizmo inside still needs a target. */}
-          {(gizmo3dProps.scene3d || (gizmo3dProps.is3D && gizmo3dProps.singleId)) && (
-            <Gizmo3dOverlay
-              {...gizmo3dProps}
-              deviceHandles={deviceHandles}
-              hoveredDeviceHandle={hoveredHandle}
-              nodeId={gizmo3dProps.singleId ?? null}
-              showGizmo={gizmo3dProps.is3D && !!gizmo3dProps.singleId}
-            />
-          )}
+          <Gizmo3dLayer stageRef={stageRef} />
           {/* The camera's focus plane and its focus-pull handle. Mounted AFTER
               the 3D gizmo so it paints above the wireframes it belongs to; it
               is pointer-transparent apart from that one handle, and renders

@@ -43,3 +43,15 @@ export function useInspectorSelection(nodeId: string): ReadonlyArray<string> {
     return ctx.nodeIds;
   }, [ctx, nodeId]);
 }
+
+/**
+ * True when the caller is rendered inside the Properties panel's provider.
+ *
+ * The inspector rows use it to pick the compact inspector row layout without
+ * the panel having to announce a layout of its own: the provider already marks
+ * exactly "this is the Properties body". Rows mounted anywhere else (the
+ * Rigging panel, a test) answer false and keep the default grid.
+ */
+export function useInspectorHosted(): boolean {
+  return useContext(InspectorSelectionContext) !== null;
+}

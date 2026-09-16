@@ -49,6 +49,7 @@ import { compSourceOf } from '@core/composition/compSizes';
 import type { SceneNode } from '@core/types';
 import { defaultAnimation } from '@motion/animation';
 import { runAnimEdit } from '@core/animation/animationCommands';
+import { hasRetime, pickRetimeBar, retimeClipOf, retimedChainTime } from '@core/animation/retime';
 
 
 import { getEventBus } from '@core/events/EventBus';
@@ -2062,20 +2063,21 @@ function precompChainOf(nodeId: string): SceneNode[] {
 }
 
 function isChainRemapAnimated(pc: SceneNode): boolean {
-  const src = srcIdOf(pc.id);
-  return defaultAnimation.isAnimated(src, 'timeRemap') || defaultAnimation.isAnimated(src, 'precompTime');
+  return hasRetime(defaultAnimation, srcIdOf(pc.id));
 }
 
 /** Fold every ancestor precomp's animated time remap over `compTime`,
- *  outermost → innermost — buildSnapshot's ancestor-chain composition. */
+ *  outermost → innermost — buildSnapshot's ancestor-chain composition.
+ *  Speed % and Frame Number both resolve through `retimedChainTime`. */
 function foldPrecompChain(nodeId: string, compTime: number): number {
   let time = compTime;
+  const controller = getTimelineController();
   for (const pc of precompChainOf(nodeId)) {
     if (isChainRemapAnimated(pc)) {
       const src = srcIdOf(pc.id);
-      time = defaultAnimation.sample(src, 'timeRemap', time)
-        ?? defaultAnimation.sample(src, 'precompTime', time)
-        ?? time;
+      const fps = controller.fpsForNode(src);
+      const clip = retimeClipOf(pickRetimeBar(controller.getLayersForNode(src), Math.round(time * fps)), fps);
+      time = retimedChainTime(defaultAnimation, src, time, clip) ?? time;
     }
   }
   return time;

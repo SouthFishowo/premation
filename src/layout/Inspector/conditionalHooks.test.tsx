@@ -149,6 +149,11 @@ describe("the discovery found real subjects", () => {
  */
 const EXTRA_PROPS: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   "MultiPropertyRow.MultiPropertyRow": { prop: "opacity" },
+  // Same argument, several props: the two-field row needs its members.
+  "MultiPropertyPairRow.MultiPropertyPairRow": {
+    label: "Position",
+    props: [{ prop: "x", prefix: "X" }, { prop: "y", prefix: "Y" }],
+  },
   // The stopwatch + navigator control every non-PropertyRow row shares. Same
   // argument as MultiPropertyRow: it governs named tracks, so it needs them.
   "AnimToggle.AnimToggle": { tracks: ["opacity"], label: "Opacity", animated: false, onToggle: () => {} },

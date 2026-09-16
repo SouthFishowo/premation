@@ -85,9 +85,16 @@ describe('isPaintableKind', () => {
     expect(isPaintableKind(node({}, 'light'))).toBe(false);
     expect(isPaintableKind(node({}, 'audio'))).toBe(false);
   });
-  test('shape/image/text layers are paintable', () => {
+  test('shape/image/text/video/svg layers are paintable', () => {
     expect(isPaintableKind(node({}, 'shape'))).toBe(true);
     expect(isPaintableKind(node({}, 'image'))).toBe(true);
     expect(isPaintableKind(node({}, 'text'))).toBe(true);
+    expect(isPaintableKind(node({}, 'video'))).toBe(true);
+    expect(isPaintableKind(node({}, 'svg'))).toBe(true);
+  });
+  test('kinds with no paint pass refuse rather than record strokes nothing draws', () => {
+    for (const k of ['comp', 'null', 'group', 'adjustment', 'particle']) {
+      expect(isPaintableKind(node({}, k))).toBe(false);
+    }
   });
 });

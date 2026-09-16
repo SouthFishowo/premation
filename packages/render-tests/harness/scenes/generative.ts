@@ -63,4 +63,27 @@ export const generativeScenes: Scene[] = [
       });
     },
   }),
+  defineScene({
+    id: 'paint-strokes-v2',
+    description: 'Paint model v2: soft elliptical dab brush with flow, write-on End, per-stroke transform, multiply mode, Paint Only eraser.',
+    size: SIZE,
+    comp: COMP,
+    fps: 30,
+    frames: [0],
+    build(graph) {
+      graph.addNode(node('canvas', { kind: 'shape', position: { x: 180, y: 140 }, transform: { width: 300, height: 220, shapeType: 'rect' }, style: { fill: '#c8d4e6' } }));
+      graph.setPaint('canvas', {
+        strokes: [
+          // Soft, flattened, angled tip at 25 % spacing with 40 % flow.
+          { id: 'd1', points: [{ x: -120, y: 60 }, { x: -40, y: -40 }, { x: 40, y: 50 }, { x: 120, y: -50 }], color: '#d02070', size: 26, opacity: 0.9, hardness: 0.2, mode: 'paint', spacing: 0.25, flow: 0.4, roundness: 0.35, angle: 40 },
+          // Written on to 60 % of its length, rotated about its first point.
+          { id: 'd2', points: [{ x: -120, y: -70 }, { x: 120, y: -70 }], color: '#1a6cff', size: 14, opacity: 1, hardness: 1, mode: 'paint', spacing: 0.25, end: 0.6, transform: { anchorX: -120, anchorY: -70, x: -120, y: -70, scale: 100, rotation: 15 } },
+          // Multiply over the layer and the strokes beneath.
+          { id: 'd3', points: [{ x: 0, y: -100 }, { x: 0, y: 100 }], color: '#ffcc00', size: 40, opacity: 0.8, hardness: 0.7, mode: 'paint', spacing: 0.1, blend: 'multiply' },
+          // Paint Only: cuts the strokes, leaves the layer's fill.
+          { id: 'e1', points: [{ x: -130, y: 10 }, { x: 130, y: 10 }], color: '#000000', size: 18, opacity: 1, hardness: 1, mode: 'erase', eraseMode: 'paintOnly' },
+        ],
+      });
+    },
+  }),
 ];

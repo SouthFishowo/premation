@@ -11,6 +11,7 @@ import {
   mayFillFromPausedRender,
   isOnFrameGrid,
   playbackBlitWorthwhile,
+  PlaybackBlitPolicy,
   MIN_PLAYBACK_BLIT_RUN,
   type PreviewCacheState,
 } from './previewCacheGate';
@@ -142,5 +143,63 @@ describe('playbackBlitWorthwhile', () => {
     expect(playbackBlitWorthwhile(end - MIN_PLAYBACK_BLIT_RUN, end)).toBe(true);
     expect(playbackBlitWorthwhile(end - MIN_PLAYBACK_BLIT_RUN + 1, end)).toBe(false);
     expect(playbackBlitWorthwhile(end, end)).toBe(false);
+  });
+});
+
+describe('PlaybackBlitPolicy — short runs when the live render is the slow path', () => {
+  const BUDGET = 1000 / 30;
+
+  it('changes nothing until both costs have been measured', () => {
+    const p = new PlaybackBlitPolicy();
+    expect(playbackBlitWorthwhile(100, 100, p)).toBe(false);
+    for (let i = 0; i < 10; i++) p.noteLiveRender(80, BUDGET);
+    expect(playbackBlitWorthwhile(100, 100, p)).toBe(false); // blit cost unknown
+    p.noteBlit(4);
+    expect(playbackBlitWorthwhile(100, 100, p)).toBe(true);
+  });
+
+  it('serves a lone cached frame only once three live frames in a row missed the period', () => {
+    const p = new PlaybackBlitPolicy();
+    p.noteBlit(4);
+    p.noteLiveRender(80, BUDGET);
+    p.noteLiveRender(80, BUDGET);
+    expect(p.singleFrameBlits).toBe(false);
+    p.noteLiveRender(80, BUDGET);
+    expect(p.singleFrameBlits).toBe(true);
+  });
+
+  it('never for a live render that keeps up, however cheap the blit', () => {
+    const p = new PlaybackBlitPolicy();
+    p.noteBlit(1);
+    for (let i = 0; i < 40; i++) p.noteLiveRender(20, BUDGET);
+    expect(playbackBlitWorthwhile(5, 5, p)).toBe(false);
+  });
+
+  it('never when the blit is not clearly cheaper than the live render', () => {
+    const p = new PlaybackBlitPolicy();
+    p.noteBlit(30);
+    for (let i = 0; i < 5; i++) p.noteLiveRender(40, BUDGET);
+    expect(p.singleFrameBlits).toBe(false);
+  });
+
+  it('holds its decision through a few fast frames — no cached/live flicker at the threshold', () => {
+    const p = new PlaybackBlitPolicy();
+    p.noteBlit(4);
+    for (let i = 0; i < 3; i++) p.noteLiveRender(90, BUDGET);
+    expect(p.singleFrameBlits).toBe(true);
+    // Alternating around the budget must not toggle it.
+    for (let i = 0; i < 20; i++) p.noteLiveRender(i % 2 ? 90 : 20, BUDGET);
+    expect(p.singleFrameBlits).toBe(true);
+    // A sustained recovery does withdraw it.
+    for (let i = 0; i < 30; i++) p.noteLiveRender(10, BUDGET);
+    expect(p.singleFrameBlits).toBe(false);
+  });
+
+  it('a run long enough needs no policy at all, and a nonsense run never passes', () => {
+    expect(playbackBlitWorthwhile(10, 10 + MIN_PLAYBACK_BLIT_RUN, null)).toBe(true);
+    const p = new PlaybackBlitPolicy();
+    p.noteBlit(1);
+    for (let i = 0; i < 5; i++) p.noteLiveRender(200, BUDGET);
+    expect(playbackBlitWorthwhile(10, 9, p)).toBe(false);
   });
 });

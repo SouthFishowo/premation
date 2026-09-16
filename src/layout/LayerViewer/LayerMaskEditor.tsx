@@ -8,7 +8,8 @@
  *     to move the whole mask. Delete removes the picked mask.
  *   • Rectangle / Ellipse — drag out a new mask.
  *   • Pen — click for a corner, drag for a smooth point; click the first point
- *     (or press Enter) to close it; Esc throws the draft away.
+ *     (or press Enter) to close it; Backspace takes back the last point; Esc
+ *     throws the draft away.
  *
  * Everything is in the layer's own space, so the panel's fit is the only
  * mapping (`maskEditing`). A drag previews on a local draft and writes ONCE
@@ -221,6 +222,9 @@ export function LayerMaskEditor({
       else selectMask(null);
     } else if (e.key === 'Enter') {
       finishPen();
+    } else if ((e.key === 'Delete' || e.key === 'Backspace') && pen.length > 0) {
+      // Mid-draw, take back the last pen vertex — not the selected mask.
+      setPen((pts) => pts.slice(0, -1));
     } else if ((e.key === 'Delete' || e.key === 'Backspace') && selection && !locked) {
       const pathId = selection.pathId;
       runDocumentEdit('Delete Mask', () => removeMaskPath(nodeId, pathId));

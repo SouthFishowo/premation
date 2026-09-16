@@ -18,12 +18,48 @@
  * Layout notes live in PropertyRow.module.css — the short version is that the
  * columns are a real grid, so a row with an extra control (the rotation dial)
  * can no longer push its value out of the column every other row shares.
+ *
+ * TWO LAYOUTS, one component (2026-09-15). The timeline and Effect Controls
+ * keep the AE column set — stopwatch, navigator, name, value, reset — because
+ * they list hundreds of rows where a fixed control column IS the scanning aid.
+ * The Properties inspector opts into `'inspector'`: `Label [field] [field] ◀◆▶`,
+ * with the stopwatch and expression controls revealed on hover and reset moved
+ * to the right-click menu. Users read the old inspector rows as "too many
+ * buttons": five controls per property, times seven transform groups, at a
+ * 280px panel width that already truncated "X" and "Y". The opt-in is a prop
+ * or a context so no timeline row can change by accident.
  */
 
-import type { ReactNode } from 'react';
+import { createContext, useContext, type ReactNode } from 'react';
 import { cn } from '@utils/cn';
 import { Icon } from '@components/Icon';
 import styles from './PropertyRow.module.css';
+
+/** `'default'` = the timeline / Effect Controls grid; `'inspector'` = the compact Properties row. */
+export type PropertyRowLayout = 'default' | 'inspector';
+
+/**
+ * The layout every `PropertyRow` below uses unless it passes `layout` itself.
+ * A context rather than a prop threaded through every section, because the
+ * inspector's rows are built several components deep (section → pair row →
+ * row) and each hop would otherwise have to remember to forward it.
+ */
+export const PropertyRowLayoutContext = createContext<PropertyRowLayout>('default');
+
+/**
+ * Registry labels are Title Case ("Skew Axis", "Anchor Point") because the
+ * timeline and menus use them as names. The inspector shows them in sentence
+ * case like the rest of a form, WITHOUT lower-casing axis letters or acronyms:
+ * only a capitalised ordinary word after the first is folded, so "Position X"
+ * and "3D Layer" survive as "Position X" and "3D layer". Display only — the
+ * accessible name keeps the registry spelling.
+ */
+export function sentenceCaseLabel(label: string): string {
+  return label
+    .split(' ')
+    .map((word, i) => (i > 0 && /^[A-Z][a-z]+$/.test(word) ? word.toLowerCase() : word))
+    .join(' ');
+}
 
 export interface StopwatchButtonProps {
   /** True when the property has keyframes (or an expression). */
@@ -188,6 +224,13 @@ export interface PropertyRowProps {
   /** Focus entering / leaving the row — lets a shortcut act on "the focused property". */
   onFocusCapture?: (e: React.FocusEvent<HTMLDivElement>) => void;
   onBlurCapture?: (e: React.FocusEvent<HTMLDivElement>) => void;
+  /**
+   * Which grid to draw. Omitted → `PropertyRowLayoutContext` (default
+   * `'default'`). In `'inspector'` the stopwatch joins `trailing` in the name
+   * cell's hover tray, the navigator takes the right-hand cell, and `onReset`
+   * draws nothing — reset is the row menu's "Reset …" entry there.
+   */
+  layout?: PropertyRowLayout;
 }
 
 /**
@@ -219,8 +262,67 @@ export function PropertyRow({
   below,
   onFocusCapture,
   onBlurCapture,
+  layout: layoutProp,
 }: PropertyRowProps): JSX.Element {
+  const contextLayout = useContext(PropertyRowLayoutContext);
+  const layout = layoutProp ?? contextLayout;
   const a11yLabel = srLabel ?? label;
+
+  if (layout === 'inspector') {
+    /*
+     *     Label·······[tray]  [ field ][ field ]  [◀ ◆ ▶]
+     *
+     * The tray (stopwatch, `=`, whip, caller extras) lives in the LABEL cell
+     * and is revealed on hover/focus, so revealing it can only truncate the
+     * label under the cursor — never move a field. Children marked
+     * `data-persist` stay visible at rest: that is how an attached expression
+     * keeps its `=` mark. The right-hand cell is reserved even when empty for
+     * the reason the default grid reserves its navigator column.
+     */
+    return (
+      <div
+        className={cn(
+          styles.row,
+          styles.inspector,
+          compact && styles.compact,
+          below !== undefined && styles.withBelow,
+          className,
+        )}
+        onContextMenu={onContextMenu}
+        onFocusCapture={onFocusCapture}
+        onBlurCapture={onBlurCapture}
+        style={depth > 0 ? { paddingLeft: depth * 16 } : undefined}
+        data-property-row
+        data-layout="inspector"
+        data-mixed={mixed || undefined}
+      >
+        <span className={cn(styles.name, animated && styles.nameAnimated)} title={error ?? a11yLabel}>
+          {pinned && <Icon name="push-pin" size="sm" className={styles.pin} title="Pinned" />}
+          <span className={cn(styles.nameText, error && styles.nameError)} data-error={error ? '' : undefined}>
+            {sentenceCaseLabel(label)}
+          </span>
+          {mixed && (
+            <span className={styles.mixedMark} title="Mixed — the selected layers disagree" aria-label="Mixed values">
+              mixed
+            </span>
+          )}
+          {hint && <span className={styles.hint}>{hint}</span>}
+          {(onStopwatch || trailing) && (
+            <span className={styles.trailing}>
+              {onStopwatch && <StopwatchButton animated={animated} label={a11yLabel} onToggle={onStopwatch} />}
+              {trailing}
+            </span>
+          )}
+        </span>
+        <div className={styles.values}>{children}</div>
+        <span className={styles.anim}>
+          {animated && navigator ? <KeyframeNavigator label={a11yLabel} {...navigator} /> : null}
+        </span>
+        {below !== undefined && <div className={styles.below}>{below}</div>}
+      </div>
+    );
+  }
+
   return (
     <div
       className={cn(styles.row, compact && styles.compact, below !== undefined && styles.withBelow, className)}

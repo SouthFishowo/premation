@@ -26,7 +26,7 @@
 import { isPluginFormat, pluginExporterFor } from './pluginExporters';
 import { openPluginExport } from './openPluginExport';
 import { createHdrMasteringAccumulator } from './hdrTransfer';
-import { FramePipeline, CanvasPool, defaultConcurrency } from './framePipeline';
+import { FramePipeline, CanvasPool, SequentialWriter, defaultConcurrency } from './framePipeline';
 import { formatFfmetadata, formatCarriesChapters, type ExportChapter } from './chapters';
 
 /**
@@ -81,6 +81,15 @@ export interface VideoSinkParams {
   chapters?: ReadonlyArray<ExportChapter>;
   /** Mixed comp audio as WAV bytes, or undefined for a silent export. */
   audioWav?: Uint8Array;
+  /**
+   * How the desktop sink hands frames to ffmpeg.
+   *
+   * 'auto' (the default) STREAMS raw RGBA into one ffmpeg child whenever the
+   * format allows it, and falls back to staging image files when the stream
+   * cannot be opened. 'staged' forces the old path. HDR and anything carrying
+   * `resume` always stage — see `streamEligible`.
+   */
+  pipeline?: 'auto' | 'staged';
   /** Cooperative cancellation reaching INTO the encode phase — without it the
    *  Cancel button was inert for the entire ffmpeg run, which on a long comp
    *  is most of the export's wall clock. */
@@ -537,38 +546,10 @@ class FfmpegSink implements VideoSink {
       signal?.removeEventListener('abort', onAbort);
     }
     const { frames, videoCodec } = encoded;
-    // The staging dir (and the encoded file in it) outlives finish — the caller
-    // still has to place the output. Whoever consumes the result is responsible
-    // for save/saveTo/discard, each of which cleans the job up.
-    const cleanup = async (): Promise<void> => {
-      this.jobId = null;
-      await r.cleanJob?.(jobId).catch(() => undefined);
-    };
-
-    const ext = encodeFormat;
-    return {
-      kind: 'file',
-      ext,
-      frames,
+    return encodedFileResult(r, jobId, encodeFormat, frames, () => { this.jobId = null; }, {
       ...(videoCodec ? { videoCodec } : {}),
       ...(mastering ? { hdrMastering: mastering } : {}),
-      save: async (defaultName: string) => {
-        const saved = await r.save?.(jobId, defaultName);
-        // A cancelled save dialog must NOT clean up: cleanup deletes the
-        // staging dir INCLUDING the finished encode, so dismissing the dialog
-        // by reflex destroyed a completed multi-minute render with no way to
-        // retry. Keep it; discard()/dispose() still reclaims it later.
-        if (saved) await cleanup();
-        return saved?.path ?? null;
-      },
-      saveTo: async (dir: string, filename: string, overwrite?: boolean) => {
-        const saved = await r.saveTo?.(jobId, dir, filename, overwrite);
-        await cleanup();
-        if (!saved) throw new Error('This build cannot save into a folder directly.');
-        return saved.path;
-      },
-      discard: cleanup,
-    };
+    });
   }
 
   async dispose(): Promise<void> {
@@ -581,6 +562,275 @@ class FfmpegSink implements VideoSink {
     await r?.cancel?.(jobId).catch(() => undefined);
     await r?.cleanJob?.(jobId).catch(() => undefined);
   }
+}
+
+type RenderBridge = NonNullable<NonNullable<Window['motionEditor']>['render']>;
+
+/**
+ * The deliverable for an encode that main has written to `out.<ext>` in a job
+ * dir — shared by the staged and the streaming sink, which differ in how the
+ * frames reached ffmpeg and in nothing after that.
+ *
+ * The staging dir (and the encoded file in it) outlives `finish` — the caller
+ * still has to place the output. Whoever consumes the result is responsible for
+ * save/saveTo/discard, each of which cleans the job up.
+ */
+function encodedFileResult(
+  r: RenderBridge,
+  jobId: string,
+  ext: string,
+  frames: number,
+  forget: () => void,
+  extra: Pick<Extract<VideoSinkResult, { kind: 'file' }>, 'videoCodec' | 'hdrMastering'>,
+): VideoSinkResult {
+  const cleanup = async (): Promise<void> => {
+    forget();
+    await r.cleanJob?.(jobId).catch(() => undefined);
+  };
+  return {
+    kind: 'file',
+    ext,
+    frames,
+    ...extra,
+    save: async (defaultName: string) => {
+      const saved = await r.save?.(jobId, defaultName);
+      // A cancelled save dialog must NOT clean up: cleanup deletes the
+      // staging dir INCLUDING the finished encode, so dismissing the dialog
+      // by reflex destroyed a completed multi-minute render with no way to
+      // retry. Keep it; discard()/dispose() still reclaims it later.
+      if (saved) await cleanup();
+      return saved?.path ?? null;
+    },
+    saveTo: async (dir: string, filename: string, overwrite?: boolean) => {
+      const saved = await r.saveTo?.(jobId, dir, filename, overwrite);
+      await cleanup();
+      if (!saved) throw new Error('This build cannot save into a folder directly.');
+      return saved.path;
+    },
+    discard: cleanup,
+  };
+}
+
+// ── Desktop, fast path: stream raw RGBA into one ffmpeg child ─────────
+
+/**
+ * May this export stream at all?
+ *
+ * Everything the staged sink can encode except:
+ *  - HDR10/HLG — the mastering metadata (MaxCLL/MaxFALL) is measured over EVERY
+ *    frame and goes on the encoder's command line, which a stream has to have
+ *    before its first frame; and the libx265 → libx264 retry re-reads the input.
+ *    Both need the staged files, so HDR keeps the old path.
+ *  - a render that asked to be resumable across a restart (`resume`) — only
+ *    files on disk survive the process.
+ *  - an explicit `pipeline: 'staged'`.
+ */
+export function streamEligible(params: VideoSinkParams): boolean {
+  if (isPluginFormat(params.format)) return false;
+  if (params.format === 'hdr10' || params.format === 'hlg') return false;
+  if (params.resume) return false;
+  return params.pipeline !== 'staged';
+}
+
+/**
+ * Frames outstanding between the render loop and ffmpeg: the one crossing IPC
+ * and one queued behind it. The render of the next frame therefore always
+ * overlaps a write, while a slow encoder can hold at most two frames (16 MB at
+ * 1080p, 66 MB at 4K) before it slows the render down.
+ */
+const STREAM_MAX_QUEUED = 2;
+
+/** An error the staged path would hit identically — falling back cannot help. */
+function isFfmpegMissing(err: unknown): boolean {
+  return /ffmpeg was not found/i.test(String((err as Error)?.message ?? err));
+}
+
+/**
+ * The desktop fast path: every frame read back as raw RGBA and piped into ONE
+ * ffmpeg child that is encoding while the comp renders.
+ *
+ * What it removes, per frame, from the staged path: the JPEG/PNG encode in the
+ * renderer (17 / 23 ms at 1080p, measured in Electron 32), the file write, and
+ * ffmpeg's decode of that file — and the encode no longer waits for the whole
+ * render to finish before it starts. What it costs: a synchronous 8-bit
+ * readback (the same unpremultiplied bytes a staged PNG holds, so formats that
+ * staged PNG see identical encoder input) and a larger IPC payload.
+ *
+ * ── Falling back ─────────────────────────────────────────────────────────
+ *
+ * The FIRST frame is opened and written synchronously, with its canvas still in
+ * hand. Anything that fails there (a main process without the stream channels,
+ * a preference of 'staged', a spawn or argument failure) hands this frame and
+ * every later one to an ordinary `FfmpegSink` — the old path, unchanged — so a
+ * stream that cannot start costs nothing but a log line. A missing ffmpeg is
+ * rethrown instead: the staged path would fail the same way, after rendering
+ * the whole comp. Failures AFTER the first frame are real errors: those frames
+ * are inside an encoder that has died, and there is nothing left to fall back
+ * WITH.
+ */
+export class FfmpegStreamSink implements VideoSink {
+  private jobId: string | null = null;
+  private frames = 0;
+  private size: { width: number; height: number } | null = null;
+  private readonly writer = new SequentialWriter({ maxQueued: STREAM_MAX_QUEUED });
+  /** Set when the stream could not start: every frame then goes to the staged sink. */
+  private fallback: VideoSink | null = null;
+  private readonly readPixels: (canvas: HTMLCanvasElement) => Uint8Array;
+  private readonly makeStaged: () => VideoSink;
+
+  constructor(
+    private readonly params: VideoSinkParams,
+    deps: { readPixels?: (canvas: HTMLCanvasElement) => Uint8Array; staged?: () => VideoSink } = {},
+  ) {
+    this.readPixels = deps.readPixels ?? streamPixels;
+    this.makeStaged = deps.staged ?? (() => new FfmpegSink(params));
+  }
+
+  private bridge(): RenderBridge {
+    const r = window.motionEditor?.render;
+    if (!r) throw new Error('Local encoding is not available in this build.');
+    return r;
+  }
+
+  /** Streams hold no staging a later run could adopt; a fallback's dir can be. */
+  stagingJobId(): string | null {
+    return this.fallback?.stagingJobId?.() ?? null;
+  }
+
+  /** Which path this sink ended up on — for the export log and tests. */
+  get pipeline(): 'stream' | 'staged' | 'pending' {
+    return this.fallback ? 'staged' : this.frames > 0 ? 'stream' : 'pending';
+  }
+
+  private async openStream(r: RenderBridge, width: number, height: number): Promise<string> {
+    if (!r.openStream || !r.streamFrame || !r.finishStream || !r.beginJob) {
+      throw new Error('This build has no streaming encode.');
+    }
+    const preference = await r.streamPreference?.().catch(() => 'stream' as const);
+    if (preference === 'staged') throw new Error('Streaming disabled by MOTION_EXPORT_PIPELINE=staged.');
+    const jobId = await r.beginJob();
+    this.jobId = jobId;
+    if (this.params.audioWav && r.stageAudio) await r.stageAudio(jobId, this.params.audioWav);
+    const format = this.params.format as 'mp4' | 'webm' | 'gif' | 'mov';
+    // Same FFMETADATA1 text the staged encode sends — see FfmpegSink.finish.
+    const chapterMetadata = formatCarriesChapters(format) ? formatFfmetadata(this.params.chapters ?? []) : '';
+    await r.openStream(jobId, {
+      format,
+      fps: this.params.fps,
+      width,
+      height,
+      hasAudio: !!this.params.audioWav,
+      quality: this.params.quality ?? 'high',
+      ...(format === 'mov' && this.params.proresProfile ? { proresProfile: this.params.proresProfile } : {}),
+      alpha: !!this.params.transparent,
+      ...(chapterMetadata ? { chaptersFfmetadata: chapterMetadata } : {}),
+    });
+    return jobId;
+  }
+
+  /** Tear down a stream that never got going, before handing over to staging. */
+  private async abandonStream(r: RenderBridge): Promise<void> {
+    const jobId = this.jobId;
+    this.jobId = null;
+    if (!jobId) return;
+    await r.cancel?.(jobId).catch(() => undefined);
+    await r.cleanJob?.(jobId).catch(() => undefined);
+  }
+
+  async addFrame(canvas: HTMLCanvasElement, index: number, source?: LinearFrameSource): Promise<void> {
+    if (this.fallback) return this.fallback.addFrame(canvas, index, source);
+    const r = this.bridge();
+
+    if (this.frames === 0) {
+      try {
+        const jobId = await this.openStream(r, canvas.width, canvas.height);
+        await r.streamFrame!(jobId, index, this.readPixels(canvas));
+      } catch (err) {
+        if (isFfmpegMissing(err)) {
+          await this.abandonStream(r);
+          throw err;
+        }
+        if (!/MOTION_EXPORT_PIPELINE/.test(String(err))) {
+          console.warn('[export] streaming encode unavailable — staging frames instead:', err);
+        }
+        await this.abandonStream(r);
+        this.fallback = this.makeStaged();
+        return this.fallback.addFrame(canvas, index, source);
+      }
+      this.size = { width: canvas.width, height: canvas.height };
+      this.frames = 1;
+      return;
+    }
+
+    if (canvas.width !== this.size!.width || canvas.height !== this.size!.height) {
+      throw new Error(
+        `Frame ${index} is ${canvas.width}×${canvas.height}; the encode was opened at `
+        + `${this.size!.width}×${this.size!.height}.`,
+      );
+    }
+    // Read back NOW: the renderer reuses its canvas for the next frame the
+    // moment this returns. The bytes then cross IPC while that frame renders.
+    const bytes = this.readPixels(canvas);
+    const jobId = this.jobId!;
+    await this.writer.push(() => r.streamFrame!(jobId, index, bytes));
+    this.frames += 1;
+  }
+
+  async finish(): Promise<VideoSinkResult> {
+    if (this.fallback) return this.fallback.finish();
+    if (this.frames === 0 || !this.jobId) {
+      throw new Error('No frames were rendered — nothing to encode.');
+    }
+    const r = this.bridge();
+    const jobId = this.jobId;
+    // Every frame must be in the encoder before its input is closed — and a
+    // frame that failed to arrive fails the export here.
+    await this.writer.drain();
+    // Encode-phase cancellation, as in FfmpegSink.finish: `cancel` kills the
+    // child, which rejects `finishStream`.
+    const signal = this.params.signal;
+    if (signal?.aborted) {
+      await this.dispose();
+      throw new DOMException('Export cancelled', 'AbortError');
+    }
+    const onAbort = (): void => {
+      void r.cancel?.(jobId).catch(() => undefined);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    let encoded: { frames: number };
+    try {
+      encoded = await r.finishStream!(jobId);
+    } catch (err) {
+      if (signal?.aborted) {
+        await r.cleanJob?.(jobId).catch(() => undefined);
+        this.jobId = null;
+        throw new DOMException('Export cancelled', 'AbortError');
+      }
+      throw err;
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+    }
+    return encodedFileResult(r, jobId, this.params.format, encoded.frames, () => { this.jobId = null; }, {});
+  }
+
+  async dispose(): Promise<void> {
+    if (this.fallback) return this.fallback.dispose();
+    const jobId = this.jobId;
+    this.jobId = null;
+    const r = window.motionEditor?.render;
+    // Kill FIRST: a write parked on a drain that will never come (a wedged
+    // encoder) must be released before the queue can be closed.
+    if (jobId) await r?.cancel?.(jobId).catch(() => undefined);
+    await this.writer.close();
+    if (jobId) await r?.cleanJob?.(jobId).catch(() => undefined);
+  }
+}
+
+/** A frame's RGBA bytes for the stream, through the shared 2D scratch. */
+function streamPixels(canvas: HTMLCanvasElement): Uint8Array {
+  const data = readCanvasPixels(canvas);
+  if (!data) throw new Error('The export frame could not be read (no 2D context available).');
+  return new Uint8Array(data.data.buffer, data.data.byteOffset, data.data.byteLength);
 }
 
 // ── Browser: WebCodecs → WebM ────────────────────────────────────────
@@ -853,7 +1103,11 @@ export function createVideoSink(params: VideoSinkParams): VideoSink | null {
   // ffmpeg sink could fall back to encoding, so reaching that branch would
   // silently produce an MP4 under the plugin's extension.
   if (isPluginFormat(params.format)) return new PluginSink(params);
-  if (canEncodeLocally()) return new FfmpegSink(params);
+  if (canEncodeLocally()) {
+    // Streaming is the default; the sink itself falls back to staging files
+    // when the stream cannot start. See FfmpegStreamSink.
+    return streamEligible(params) ? new FfmpegStreamSink(params) : new FfmpegSink(params);
+  }
   // Only WebM is reachable in a browser: MP4/MOV need codecs and containers no
   // browser will mux, and GIF has its own dedicated encoder (gifEncoder.ts).
   if (params.format === 'webm' && canEncodeWithWebCodecs()) return new WebCodecsSink(params);

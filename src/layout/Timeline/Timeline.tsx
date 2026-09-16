@@ -69,6 +69,9 @@ import { type LayerBlendMode } from '@core/effects/blendMode';
 import { OPEN_WINDOW, cullTicks, pagedTimeWindow, sameWindow, timeInWindow, type TimeWindow } from './visibleWindow';
 import { kfPreviewForRow, previewsForRow } from './dragOverlay';
 import { createEdgeAutoScroller, followScrollLeft } from './playheadFollow';
+import { useLivePlayhead } from './useLivePlayhead';
+import { getTime as getLiveTime } from '@stores/playbackClockStore';
+import { flushRenderNow } from '@core/perf/framePump';
 import { installTimelineExpandCommands, recursiveTogglePlan, expandAllPlan, collapseAllPlan, registerTimelineExpansion } from './expandCollapse';
 import { registerTimelineFitSource } from './fitSelection';
 import { installTimelineSnapCommands, toggleTimelineSnap } from './snapCommands';
@@ -102,7 +105,7 @@ import {
 import { WaveformLane } from './WaveformLane';
 import { AUDIO_WAVEFORM_ROW } from '@core/timeline/propertyTree';
 import { DragHud, type DragHudState } from './DragHudOverlay';
-import { Minimap, Ruler, generateRulerTicks } from './RulerStack';
+import { Minimap, Ruler, generateRulerTicks, rulerProgressWidth } from './RulerStack';
 import { TrackHeader, PropertyHeader, TrackCategoryHeader } from './TrackHeaderColumn';
 import { canResetProperties, resetProperties, resetTransforms } from '@core/scene/layerTransformOps';
 import { expressionMenuItems } from '@core/animation/expressionCommands';
@@ -225,6 +228,18 @@ export interface TimelineProps {
    * non-realtime consumers (GraphEditor, BottomTimeline timecode).
    */
   playheadTime?: number;
+  /**
+   * The host passes a THROTTLED `playheadTime` (exact while paused, ≤10 Hz
+   * while playing — `useThrottledTime`) and the timeline follows the LIVE
+   * clock itself for everything that has to move every frame: the playhead
+   * line and grabber, the ruler's progress fill, the slider's aria value and
+   * the auto-follow scroll. Those are written through refs from a clock
+   * subscription, so playback does not re-render the timeline at all.
+   *
+   * Off (the default) for embeds without a tab, which keep driving the
+   * playhead purely from `playheadTime`.
+   */
+  livePlayhead?: boolean;
 }
 
 function Timeline({
@@ -274,6 +289,7 @@ function Timeline({
   columns = 'both',
   onDurationChange,
   playheadTime,
+  livePlayhead = false,
 }: TimelineProps): JSX.Element {
   const showSwitches = columns !== 'modes';
   const showModes = columns !== 'switches';
@@ -924,19 +940,31 @@ function Timeline({
   useEffect(() => () => edgeScrollerRef.current?.stop(), []);
 
   const followMode = usePreferenceStore((s) => s.timelineFollowMode);
-  useEffect(() => {
+  // Read through refs so the live clock subscription (below) can follow on
+  // every tick without re-subscribing when the zoom or the mode changes.
+  const followGeomRef = useRef({ followMode, pps });
+  followGeomRef.current = { followMode, pps };
+  const followTo = useCallback((t: number): void => {
     const el = lanesRef.current;
-    if (!el || followMode === 'off' || dragScrollBusyRef.current) return;
+    const { followMode: mode, pps: p } = followGeomRef.current;
+    if (!el || mode === 'off' || dragScrollBusyRef.current) return;
     const next = followScrollLeft({
-      mode: followMode,
-      playheadX: TIMELINE_LEFT_OFFSET + currentTime * pps,
+      mode,
+      playheadX: TIMELINE_LEFT_OFFSET + t * p,
       scrollLeft: el.scrollLeft,
       viewportWidth: el.clientWidth,
       contentWidth: el.scrollWidth,
       leftOffset: TIMELINE_LEFT_OFFSET,
     });
     if (next !== null) el.scrollLeft = next;
-  }, [followMode, currentTime, pps]);
+    // lanesRef is a stable ref object.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    // Live: the LIVE time, never the throttled prop — following a value up to
+    // 100ms old at a page boundary would page back, then forward again.
+    followTo(livePlayhead ? getLiveTime() : currentTime);
+  }, [followMode, currentTime, pps, livePlayhead, followTo]);
 
   // ── Wheel zoom (Ctrl + Wheel) ──────────────────────────────────
   const onWheel = useCallback(
@@ -973,15 +1001,42 @@ function Timeline({
     document.body.style.userSelect = 'none';
   }, [lanesRef, pps, totalSeconds, onScrub]);
   useEffect(() => {
+    // Scrubs COALESCE to one seek per animation frame. A pointer emits moves
+    // far faster than the display refreshes (120–1000 Hz), and each seek is a
+    // clock write that re-renders every time reader and asks the viewport for
+    // a frame — only the last one per frame is ever seen. The seek then runs
+    // inside the rAF and flushes the viewport in the same frame.
+    let raf: number | null = null;
+    let pending: number | null = null;
+    const flushScrub = (): void => {
+      if (raf !== null) {
+        cancelAnimationFrame(raf);
+        raf = null;
+      }
+      if (pending === null) return;
+      const t = pending;
+      pending = null;
+      onScrub?.(t);
+    };
     const onMove = (e: PointerEvent): void => {
       if (!draggingRef.current || !lanesRef.current) return;
       const rect = lanesRef.current.getBoundingClientRect();
       const x = e.clientX - rect.left + scrollLeft - TIMELINE_LEFT_OFFSET;
-      const time = clamp(x / pps, 0, totalSeconds);
-      onScrub?.(time);
+      pending = clamp(x / pps, 0, totalSeconds);
+      if (raf !== null) return;
+      raf = requestAnimationFrame((frameTs) => {
+        raf = null;
+        if (pending === null) return;
+        const t = pending;
+        pending = null;
+        onScrub?.(t);
+        flushRenderNow(frameTs);
+      });
     };
     const onUp = (): void => {
       if (!draggingRef.current) return;
+      // The release lands exactly where the pointer let go.
+      flushScrub();
       draggingRef.current = false;
       useUIStore.getState().setDragging(false);
       document.body.style.cursor = '';
@@ -992,6 +1047,8 @@ function Timeline({
     return () => {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      // A re-bind mid-drag (the lanes scrolled) must not drop the last move.
+      flushScrub();
       if (draggingRef.current) {
         draggingRef.current = false;
         useUIStore.getState().setDragging(false);
@@ -1522,13 +1579,15 @@ function Timeline({
   const onPlayheadKey = useCallback(
     (e: React.KeyboardEvent<HTMLDivElement>) => {
       const frame = 1 / (model.frameRate || 30);
+      // Nudge from where the playhead IS, not from the throttled display value.
+      const at = livePlayhead ? getLiveTime() : currentTime;
       let next: number | null = null;
       switch (e.key) {
         case 'ArrowLeft':
-          next = currentTime - (e.shiftKey ? 1 : frame);
+          next = at - (e.shiftKey ? 1 : frame);
           break;
         case 'ArrowRight':
-          next = currentTime + (e.shiftKey ? 1 : frame);
+          next = at + (e.shiftKey ? 1 : frame);
           break;
         case 'Home':
           next = 0;
@@ -1542,7 +1601,7 @@ function Timeline({
       e.preventDefault();
       onScrub?.(clamp(next, 0, totalSeconds));
     },
-    [model.frameRate, currentTime, totalSeconds, onScrub],
+    [model.frameRate, currentTime, totalSeconds, onScrub, livePlayhead],
   );
 
   // ── Track row reorder ──────────────────────────────────────────────────────
@@ -1685,6 +1744,29 @@ function Timeline({
   }, [rows, scrollTop, trackHeight]);
 
   const playheadX = TIMELINE_LEFT_OFFSET + currentTime * pps;
+
+  // ── Live playhead (see `livePlayhead`) ─────────────────────────
+  // The three things that move every frame, written straight to the DOM from
+  // the clock. In live mode React never manages their position (the JSX below
+  // omits it), so a re-render with the throttled time cannot fight them.
+  const playheadRef = useRef<HTMLDivElement | null>(null);
+  const stickyPlayheadRef = useRef<HTMLDivElement | null>(null);
+  const rulerFillRef = useRef<HTMLDivElement | null>(null);
+  const liveGeomRef = useRef({ pps, totalSeconds });
+  liveGeomRef.current = { pps, totalSeconds };
+  useLivePlayhead((t) => {
+    const { pps: p, totalSeconds: dur } = liveGeomRef.current;
+    const transform = `translateX(${TIMELINE_LEFT_OFFSET + t * p}px)`;
+    const line = playheadRef.current;
+    if (line) {
+      line.style.transform = transform;
+      line.setAttribute('aria-valuenow', String(t));
+      line.setAttribute('aria-valuetext', `${t.toFixed(2)} seconds`);
+    }
+    if (stickyPlayheadRef.current) stickyPlayheadRef.current.style.transform = transform;
+    if (rulerFillRef.current) rulerFillRef.current.style.width = `${rulerProgressWidth(t, dur, p)}px`;
+    followTo(t);
+  }, livePlayhead);
 
   const fps = model.frameRate || 30;
 
@@ -2169,6 +2251,7 @@ function Timeline({
               duration={totalSeconds}
               pixelsPerSecond={pps}
               leftOffset={TIMELINE_LEFT_OFFSET}
+              fillRef={livePlayhead ? rulerFillRef : undefined}
             />
 
             {/* Preview-coverage lanes (green = RAM, blue = disk). They
@@ -2218,8 +2301,9 @@ function Timeline({
                 lives in `lanesInner` and scrolls; this is the part you drag, so
                 it has to stay reachable at any scroll offset. */}
             <div
+              ref={stickyPlayheadRef}
               className={styles.stickyPlayhead}
-              style={{ transform: `translateX(${playheadX}px)`, height: rulerHeight }}
+              style={livePlayhead ? { height: rulerHeight } : { transform: `translateX(${playheadX}px)`, height: rulerHeight }}
               onPointerDown={onPlayheadDown}
               aria-hidden
             >
@@ -2597,8 +2681,9 @@ function Timeline({
 
             {/* Playhead */}
             <div
+              ref={playheadRef}
               className={styles.playhead}
-              style={{ transform: `translateX(${playheadX}px)`, height: effectiveLanesHeight }}
+              style={livePlayhead ? { height: effectiveLanesHeight } : { transform: `translateX(${playheadX}px)`, height: effectiveLanesHeight }}
               onPointerDown={onPlayheadDown}
               onKeyDown={onPlayheadKey}
               tabIndex={0}
@@ -2607,8 +2692,8 @@ function Timeline({
               aria-orientation="horizontal"
               aria-valuemin={0}
               aria-valuemax={model.duration}
-              aria-valuenow={currentTime}
-              aria-valuetext={`${currentTime.toFixed(2)} seconds`}
+              aria-valuenow={livePlayhead ? undefined : currentTime}
+              aria-valuetext={livePlayhead ? undefined : `${currentTime.toFixed(2)} seconds`}
             >
               <div className={styles.playheadHead} />
             </div>

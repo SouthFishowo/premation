@@ -45,6 +45,16 @@ import { useHistoryStore } from '@stores/historyStore';
 import { getCommandSystem } from '@core/commands/CommandSystem';
 import type { HistoryService } from '@core/commands/HistoryService';
 import { bumpScene } from '@stores/sceneStore';
+import { internDocumentParts, noteRestoredState } from '@core/commands/snapshotSharing';
+
+/**
+ * `captureDocument`, with its scene and animation re-expressed in the shared
+ * form history snapshots use — unchanged nodes and tracks are the objects the
+ * neighbouring entries already hold. Same content; see `snapshotSharing.ts`.
+ */
+function captureShared(): EditorDocument {
+  return internDocumentParts(captureDocument());
+}
 
 /** The app history service, or null in a headless context that has no CommandSystem. */
 function historyService(): HistoryService | null {
@@ -60,6 +70,8 @@ function restore(doc: EditorDocument): void {
   // which then own and mutate them. Handing over the same instance twice would
   // make the second undo restore a document the first one had since edited.
   restoreDocument(structuredClone(doc));
+  // The live scene now matches `doc`, so the next capture can share with it.
+  noteRestoredState(doc.scene, doc.animation);
   bumpScene();
 }
 
@@ -79,7 +91,7 @@ export async function runAsOneHistoryEntry<T>(
   // being swallowed by the baseline this operation is about to take.
   store.flush();
 
-  const before = captureDocument();
+  const before = captureShared();
   const history = historyService();
 
   history?.suspend();
@@ -95,7 +107,7 @@ export async function runAsOneHistoryEntry<T>(
     history?.resume();
   }
 
-  const after = captureDocument();
+  const after = captureShared();
   history?.push({
     label,
     // Undo/redo arrive through `performUndo`/`performRedo`, which already wrap
@@ -135,7 +147,7 @@ export async function runAsOneHistoryEntry<T>(
  */
 export function runAsOneHistoryEntrySync<T>(label: string, fn: () => T): T {
   useHistoryStore.getState().flush();
-  const before = captureDocument();
+  const before = captureShared();
   const history = historyService();
 
   history?.suspend();
@@ -149,7 +161,7 @@ export function runAsOneHistoryEntrySync<T>(label: string, fn: () => T): T {
     history?.resume();
   }
 
-  const after = captureDocument();
+  const after = captureShared();
   const swapTo = (doc: EditorDocument): void => {
     history?.suspend();
     try {

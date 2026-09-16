@@ -188,6 +188,18 @@ describe('rendered from the schema', () => {
     expect((screen.getByLabelText('Invert') as HTMLInputElement).checked).toBe(true);
   });
 
+  it('★ writes a boolean from the checkbox, not the change event', () => {
+    // The shared Checkbox is a plain <input type="checkbox">, so its onChange
+    // hands back an event. Passing that straight through stored a React
+    // SyntheticEvent as the property value: the box then read back unchecked,
+    // and the document carried an unserialisable object.
+    render(<CustomLayerSection nodeId="n1" />);
+    fireEvent.click(screen.getByLabelText('Invert'));
+
+    const comp = customLayerComponent(defaultSceneGraph.getNode('n1')!);
+    expect((comp!.props as Record<string, unknown>).invert).toBe(false);
+  });
+
   it('renders an animatable number through the shared keyframe row', () => {
     // Same component a native property uses. Nothing here reimplements
     // keyframing, easing or auto-keyframe — if it did, they would drift.

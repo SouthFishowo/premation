@@ -13,14 +13,28 @@
  */
 
 import { useLayoutStore } from '@stores/layoutStore';
+import { usePreferenceStore } from '@stores/preferenceStore';
 import { addEffect, type EffectType } from '@core/effects/effects';
 
 export function revealEffectControls(): void {
   useLayoutStore.getState().openPanel('effectControls');
 }
 
-/** Add an effect to a layer and switch the left sidebar to its controls. */
+/**
+ * Show the selected layer's effect stack where it now lives by default: the
+ * Effects section of the Properties panel (2026-09-15). Effect Controls became
+ * an on-demand panel, so opening it after every add would dock a panel the
+ * user closed. The section's open state is the persisted `inspectorSections`
+ * preference, so forcing it open survives the panel remounting.
+ */
+export function revealEffectsInProperties(): void {
+  const prefs = usePreferenceStore.getState();
+  prefs.set('inspectorSections', { ...prefs.inspectorSections, effects: true });
+  useLayoutStore.getState().openPanel('properties');
+}
+
+/** Add an effect to a layer and bring its parameters on screen in Properties. */
 export function addEffectAndReveal(nodeId: string, type: EffectType): void {
   addEffect(nodeId, type);
-  revealEffectControls();
+  revealEffectsInProperties();
 }

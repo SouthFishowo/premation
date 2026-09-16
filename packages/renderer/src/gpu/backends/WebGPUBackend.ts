@@ -123,6 +123,9 @@ export class WebGPUBackend implements RenderBackend {
   private context!: GPUCanvasContext;
   private surfaceFormat = 'bgra8unorm';
   private encoder: GPUCommandEncoder | null = null;
+  /** The pass encoder most recently begun — closed by `abortOpenPass` when the
+   *  code drawing into it threw before calling `end`. */
+  private openPass: WebGPUPassEncoder | null = null;
   private deviceLostHandler: ((reason: string) => void) | null = null;
 
   /** See `RenderBackend.onDeviceLost`. Attach before `initialize`. */
@@ -254,7 +257,10 @@ export class WebGPUBackend implements RenderBackend {
         { width: source.width, height: source.height },
       );
     } else {
-      const src = source.type === 'bitmap' ? source.bitmap : source.type === 'video' ? source.video : source.canvas;
+      const src = source.type === 'bitmap' ? source.bitmap
+        : source.type === 'video' ? source.video
+        : source.type === 'videoFrame' ? source.frame
+        : source.canvas;
       let width = 0;
       let height = 0;
       if (source.type === 'bitmap') {
@@ -263,6 +269,12 @@ export class WebGPUBackend implements RenderBackend {
       } else if (source.type === 'video') {
         width = source.video.videoWidth;
         height = source.video.videoHeight;
+      } else if (source.type === 'videoFrame') {
+        // Display size, as the texture was allocated. The destination's
+        // default `colorSpace: 'srgb'` converts the frame's YUV exactly as a
+        // 2D canvas draw would, so this matches the canvas route it replaces.
+        width = source.frame.displayWidth;
+        height = source.frame.displayHeight;
       } else if (source.type === 'canvas') {
         width = source.canvas.width;
         height = source.canvas.height;
@@ -551,9 +563,20 @@ export class WebGPUBackend implements RenderBackend {
       const h = Math.max(0, Math.min(this.surfaceH - y, Math.round(clip.height)));
       pass.setScissorRect(x, y, w, h);
     }
-    return new WebGPUPassEncoder(pass, sampleCount, format);
+    const encoder = new WebGPUPassEncoder(pass, sampleCount, format);
+    this.openPass = encoder;
+    return encoder;
+  }
+  /** See `RenderBackend.abortOpenPass`. */
+  abortOpenPass(): void {
+    const open = this.openPass;
+    this.openPass = null;
+    if (open && !open.ended) {
+      try { open.end(); } catch { /* the encoder is already invalid — nothing to close */ }
+    }
   }
   endFrame(): void {
+    this.openPass = null;
     if (!this.encoder) return;
     this.device.queue.submit([this.encoder.finish()]);
     this.encoder = null;
@@ -658,6 +681,7 @@ export class WebGPUBackend implements RenderBackend {
     // teardown is unnecessary; unconfigure frees the canvas' swap chain so a
     // fresh backend can reconfigure the same canvas on re-entry.
     this.encoder = null;
+    this.openPass = null;
     try {
       (this.context as unknown as { unconfigure?: () => void } | undefined)?.unconfigure?.();
     } catch {
@@ -671,6 +695,8 @@ export class WebGPUBackend implements RenderBackend {
 
 class WebGPUPassEncoder implements RenderPassEncoder {
   private pipeline: GPURenderPipeline | null = null;
+  /** Set by `end` — ending a pass twice is a validation error, not a no-op. */
+  ended = false;
   constructor(
     private readonly pass: GPURenderPassEncoder,
     readonly samples: number = 1,
@@ -702,6 +728,7 @@ class WebGPUPassEncoder implements RenderPassEncoder {
     this.pass.drawIndexed(indexCount, instanceCount, firstIndex);
   }
   end(): void {
+    this.ended = true;
     this.pass.end();
   }
 }

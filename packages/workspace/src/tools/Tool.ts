@@ -15,6 +15,7 @@ import type { CoordinateSystem } from '../coordinates/CoordinateSystem';
 import type { SelectionController } from '../selection/SelectionController';
 import type { HitTester } from '../hit/HitTester';
 import type { OverlayHandle } from '../ports';
+import type { Corners } from '../math/OrientedBox';
 import type { CursorManager, CursorType } from '../cursor/CursorManager';
 import type { SnapEngine, SnapTarget, SnapResult, SnapLine } from '../snap/SnapEngine';
 import type { SizeCandidate } from '../snap/smartGuides';
@@ -159,6 +160,29 @@ export interface Tool {
 
   /** Optional: id of the overlay handle under the cursor, for hover styling. */
   hoveredHandleId?(): string | null;
+
+  /**
+   * Optional: the chords this tool wants the host's GLOBAL shortcut layer to
+   * leave alone right now (`chordKey` form: `delete`, `shift+arrowleft`,
+   * `ctrl+t`). Delete is the case that forced it: with vertices selected it
+   * deletes vertices, and the global "delete the selected layers" must not
+   * fire first. Empty whenever the tool has nothing to act on, so the chords
+   * keep their global meaning everywhere else.
+   */
+  claimedKeys?(): readonly string[];
+
+  /**
+   * Optional: a WORLD-space transform box to draw (Free Transform Points).
+   * The workspace projects it into `WorkspaceOverlay.pathTransformBox`.
+   */
+  getTransformBox?(ctx: ToolContext): { corners: Corners; anchor: Vec2 } | null;
+
+  /**
+   * Optional: a WORLD-space marquee the tool is rubber-banding itself (Direct
+   * Selection marquee-selects VERTICES, not layers). Takes precedence over the
+   * selection controller's layer marquee while non-null.
+   */
+  getMarquee?(): Rect | null;
 
   onPointerDown?(e: ToolPointerEvent, ctx: ToolContext): void;
   onPointerMove?(e: ToolPointerEvent, ctx: ToolContext): void;

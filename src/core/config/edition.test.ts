@@ -23,6 +23,7 @@ import {
   isServerEdition,
   parseEdition,
   pluginRegistryEnabled,
+  pluginsEnabled,
   setEdition,
 } from './edition';
 
@@ -73,6 +74,17 @@ describe('edition', () => {
     expect(aiEnabled()).toBe(true);
     setEdition('local');
     expect(aiEnabled()).toBe(true);
+  });
+
+  it('ships plugins in both editions — only the registry needs the backend', () => {
+    // Local builds install plugins from local files; browsing, update checks,
+    // revocations and account sync are `pluginRegistryEnabled`, which
+    // CLOUD_CAPABILITIES above already pins off locally.
+    setEdition('server');
+    expect(pluginsEnabled()).toBe(true);
+    setEdition('local');
+    expect(pluginsEnabled()).toBe(true);
+    expect(pluginRegistryEnabled()).toBe(false);
   });
 
   it('routes the assistant through the backend only in the server edition', () => {

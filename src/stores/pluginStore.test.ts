@@ -125,6 +125,12 @@ describe('manifest normalisation on load', () => {
       exporters: [],
       importers: [],
       presets: [],
+      // The UI contributions normalise the same way, so a record stored before
+      // they existed reads back with them rather than with undefined.
+      inspector: [],
+      tools: [],
+      shortcuts: [],
+      expressions: [],
       // `net` is present as `null`, which is the same discipline stated
       // differently: no network at all is a real state and gets a real value.
       // The empty list is NOT its zero — "reach nowhere" is refused at parse

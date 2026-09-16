@@ -9,9 +9,26 @@
  * quality, comp, guides chrome …) — any change clears it wholesale, which is
  * the honest contract the old fake "cache bar" never had.
  *
- * Canvas copies (not ImageBitmap) keep everything synchronous; the byte budget
- * caps memory (a 1080p frame at dpr 1 is ~8 MB, so the default 512 MB budget
- * holds ~60 full-res frames — far more at preview resolutions).
+ * Frames are stored as 2D canvas copies, so `get` stays synchronous; the byte
+ * budget caps memory (a 1080p frame at dpr 1 is ~8 MB, so the default 512 MB
+ * budget holds ~60 full-res frames — far more at preview resolutions).
+ *
+ * ## The copy leaves the render tick
+ *
+ * `put` used to `drawImage` the live WebGL/WebGPU canvas into its 2D copy right
+ * there, inside the frame that had just rendered — and a GPU canvas drawn into
+ * a 2D canvas is a flush plus a copy: 7.9 ms at 1080p, measured in Electron 32
+ * with the flush forced, on EVERY uncached frame of playback. Now `put` takes
+ * an `ImageBitmap` snapshot instead (0.1 ms — the snapshot is taken at call
+ * time, while the drawing buffer still holds this frame, which is the same
+ * constraint the synchronous copy had) and draws it into the cache in a LATER
+ * task. Correctness is carried by a per-put sequence number: a copy lands only
+ * if no newer put for that frame, key change or purge happened in between; any
+ * of those silently drops it and the frame is simply rendered again when next
+ * needed. Pending frames answer `has`, so the idle pump does not re-render one
+ * whose copy is on its way. Where `createImageBitmap` is missing (jsdom), the
+ * snapshot throws or rejects, or too many copies are already outstanding, the
+ * old synchronous copy runs instead.
  *
  * An optional DISK TIER sits underneath (`frameDiskCache.ts`) and holds the
  * frames this budget cannot. It is deliberately not consulted on a miss — `get`
@@ -63,6 +80,7 @@
  */
 
 import { LOOK_AHEAD, type FrameDiskCache } from './frameDiskCache';
+import { playbackBlitPolicy } from './previewCacheGate';
 
 /**
  * How far ahead the disk tier may promote, given how many frames RAM holds.
@@ -116,6 +134,29 @@ interface CachedFrame {
   bytes: number;
 }
 
+/**
+ * Snapshots allowed to wait for their copy at once. Each holds a full frame
+ * (GPU-side in Chrome), so a main thread too busy to run the copies must not
+ * let them pile up: past this, `put` copies synchronously as it always did.
+ */
+const MAX_PENDING_COPIES = 6;
+
+/** Run the deferred copy in idle time when there is some, and within 100 ms
+ *  regardless — playback at full load has no idle periods at all. */
+function scheduleCopy(fn: () => void): void {
+  const ric = (globalThis as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number })
+    .requestIdleCallback;
+  if (typeof ric === 'function') ric(fn, { timeout: 100 });
+  else setTimeout(fn, 0);
+}
+
+export interface FrameCacheOptions {
+  /** Snapshot in the tick and copy later (default true). False: always copy synchronously. */
+  asyncCopies?: boolean;
+  /** Measured ms of drawing one frame into the cache — the same 2D drawImage a cache blit performs. */
+  onCopyCost?: (ms: number) => void;
+}
+
 export class FrameCache {
   /** Insertion order IS the LRU order: least-recently-used first. */
   private frames = new Map<number, CachedFrame>();
@@ -139,8 +180,23 @@ export class FrameCache {
    *  timer, so recomputing an unchanged answer is pure waste. */
   private rangesMemo: { version: number; fps: number; out: Array<{ start: number; end: number }> } | null = null;
 
-  constructor(maxBytes = 512 * 1024 * 1024) {
+  /** Frames with a snapshot taken and a copy not yet landed → that put's sequence number. */
+  private readonly pending = new Map<number, number>();
+  private putSeq = 0;
+  /** Cleared on the first snapshot that rejects: that surface cannot be snapshotted
+   *  asynchronously, and every later put would otherwise be silently dropped. */
+  private asyncCopies: boolean;
+  private readonly onCopyCost: ((ms: number) => void) | undefined;
+
+  constructor(maxBytes = 512 * 1024 * 1024, opts: FrameCacheOptions = {}) {
     this.maxBytes = maxBytes;
+    this.asyncCopies = opts.asyncCopies ?? true;
+    this.onCopyCost = opts.onCopyCost;
+  }
+
+  /** Copies still on their way into the cache. Diagnostics and tests. */
+  get pendingCopies(): number {
+    return this.pending.size;
   }
 
   /** Attach the disk tier. Optional: without one this is exactly the RAM LRU it
@@ -194,6 +250,9 @@ export class FrameCache {
    */
   setKey(key: string, _width: number, _height: number): void {
     if (key === this.key) return;
+    // A copy still in flight was rendered under the OLD key; letting it land in
+    // the new generation would file pre-edit pixels under post-edit truth.
+    this.pending.clear();
     this.parkLive();
     this.key = key;
     this.adoptParked(key);
@@ -299,7 +358,9 @@ export class FrameCache {
    * and fired a prefetch per probe.
    */
   has(frame: number): boolean {
-    return this.frames.has(frame);
+    // A frame whose copy is on its way counts: the pump that probes with this
+    // would otherwise render it a second time while the first copy lands.
+    return this.frames.has(frame) || this.pending.has(frame);
   }
 
   /**
@@ -376,6 +437,59 @@ export class FrameCache {
    *  write it through to the disk tier so it outlives RAM eviction. */
   put(frame: number, source: HTMLCanvasElement): void {
     if (source.width < 1 || source.height < 1) return;
+    if (
+      this.asyncCopies
+      && typeof createImageBitmap === 'function'
+      && this.pending.size < MAX_PENDING_COPIES
+      && this.putDeferred(frame, source)
+    ) {
+      return;
+    }
+    // A synchronous put supersedes any copy still pending for this frame.
+    this.pending.delete(frame);
+    this.putNow(frame, source);
+  }
+
+  /**
+   * Snapshot now, copy later. False when the snapshot could not even start —
+   * the caller then copies synchronously while `source` still holds the frame.
+   */
+  private putDeferred(frame: number, source: HTMLCanvasElement): boolean {
+    let snapshot: Promise<ImageBitmap>;
+    try {
+      snapshot = createImageBitmap(source);
+    } catch {
+      return false;
+    }
+    const seq = ++this.putSeq;
+    const { width, height } = source;
+    this.pending.set(frame, seq);
+    snapshot.then(
+      (bitmap) => {
+        scheduleCopy(() => {
+          // Superseded by a newer put, a key change or a purge: drop it.
+          if (this.pending.get(frame) !== seq) {
+            bitmap.close();
+            return;
+          }
+          this.pending.delete(frame);
+          this.insert(frame, bitmap, width, height);
+          bitmap.close();
+          const stored = this.frames.get(frame);
+          if (stored) this.disk?.write(frame, stored.canvas);
+        });
+      },
+      () => {
+        // The pixels are gone by now, so this frame stays uncached — and so
+        // would every later one, so stop trying.
+        if (this.pending.get(frame) === seq) this.pending.delete(frame);
+        this.asyncCopies = false;
+      },
+    );
+    return true;
+  }
+
+  private putNow(frame: number, source: HTMLCanvasElement): void {
     this.insert(frame, source, source.width, source.height);
     // Hand the disk tier OUR copy, not the caller's canvas.
     //
@@ -421,8 +535,10 @@ export class FrameCache {
     // cache bar stay correct.
     const ctx = c.getContext('2d');
     if (ctx) {
+      const copyStart = performance.now();
       ctx.clearRect(0, 0, c.width, c.height);
       ctx.drawImage(source, 0, 0);
+      this.onCopyCost?.(performance.now() - copyStart);
     }
     // Parked generations are SPECULATIVE and yield first, wholesale — that is
     // what makes parking free: it can only ever occupy headroom the live
@@ -472,6 +588,9 @@ export class FrameCache {
   }
 
   private clearFrames(): void {
+    // Before the early return: a purge right after the first put of a session
+    // has no stored frames yet, only copies on their way.
+    this.pending.clear();
     if (this.frames.size === 0 && this.parked.size === 0) return;
     this.frames.clear();
     this.totalBytes = 0;
@@ -485,5 +604,8 @@ export class FrameCache {
   }
 }
 
-/** The viewport's shared cache instance. */
-export const viewportFrameCache = new FrameCache();
+/** The viewport's shared cache instance. Its copy cost is the blit cost the
+ *  playback gate weighs a live render against (see `PlaybackBlitPolicy`). */
+export const viewportFrameCache = new FrameCache(undefined, {
+  onCopyCost: (ms) => playbackBlitPolicy.noteBlit(ms),
+});

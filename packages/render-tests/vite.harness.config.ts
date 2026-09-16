@@ -46,4 +46,14 @@ export default defineConfig({
       input: path.resolve(__dirname, 'harness/index.html'),
     },
   },
+  // Same reason as the app's vite.config.ts: every worker is spawned as
+  // `new Worker(new URL(...), { type: 'module' })`, and Vite's default worker
+  // format is 'iife', which cannot be code-split. The bake and kernel workers
+  // both reach modules with dynamic imports, so an iife worker build fails the
+  // whole harness build outright — which is how the golden gate stopped being
+  // buildable the moment the bake pool landed. Kept in step with the app on
+  // purpose: the harness must bundle what the app bundles.
+  worker: {
+    format: 'es',
+  },
 });

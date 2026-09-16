@@ -94,6 +94,39 @@ describe('Bevel style', () => {
   });
 });
 
+describe('Geometry Options — Hole Bevel Depth', () => {
+  const mountText = (bevelDepth: number): void => {
+    defaultSceneGraph.clear();
+    defaultSceneGraph.addNode(layer('txt', {
+      [SCENE_KIND_PROP]: 'text', z: 0, rotationX: 0, rotationY: 0, extrusionDepth: 40, bevelDepth,
+    }, [{ id: 'txt_text', type: 'Text', props: { content: 'O', fontSize: 80 } }] as unknown as SceneNode['components']));
+    render(<ThreeDControl nodeId="txt" />);
+  };
+
+  it('a bevelled text layer offers it, defaulting to 100 % (holes bevel like the rim)', () => {
+    mountText(6);
+    expect(field('Hole bevel depth')).toBeTruthy();
+    expect(readNode3D(defaultSceneGraph.getNode('txt')!).holeBevelDepth).toBe(100);
+  });
+
+  it('is absent without a bevel, and on a rect that has no counters', () => {
+    mountText(0);
+    expect(screen.queryByRole('spinbutton', { name: 'Hole bevel depth' })).toBeNull();
+    cleanup();
+    defaultSceneGraph.clear();
+    defaultSceneGraph.addNode(layer('box', { z: 0, rotationX: 0, rotationY: 0, extrusionDepth: 60, bevelDepth: 8, shapeType: 'rect' }));
+    render(<ThreeDControl nodeId="box" />);
+    expect(screen.queryByRole('spinbutton', { name: 'Hole bevel depth' })).toBeNull();
+  });
+
+  it('every depth row carries a stopwatch', () => {
+    mountText(6);
+    for (const name of ['Extrusion Depth', 'Bevel Depth', 'Hole Bevel Depth']) {
+      expect(screen.getAllByRole('button', { name: new RegExp(name, 'i') }).length).toBeGreaterThan(0);
+    }
+  });
+});
+
 describe('Morph Targets section', () => {
   const modelComp = (props: Record<string, unknown>): SceneNode['components'] =>
     [{ id: 'm_model', type: MODEL_COMPONENT, props }] as unknown as SceneNode['components'];

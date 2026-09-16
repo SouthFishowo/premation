@@ -20,7 +20,7 @@ import { resolvePropertyMeta } from '@core/inspector/propertyMeta';
 import { pinnedEntriesFor, setPinnedProp, type PinnedEntry } from '@core/inspector/pinnedProps';
 import { useNodeRevision } from '@core/inspector/nodeRevision';
 import { readPropertyValue } from '@core/inspector/multiSelection';
-import { useCurrentTime } from '@stores/playbackClockStore';
+import { useThrottledTime } from '@stores/playbackClockStore';
 import { MultiPropertyRow } from './MultiPropertyRow';
 import styles from '@layout/EditorLayout/panels.module.css';
 import tStyles from './TransformSection.module.css';
@@ -63,6 +63,10 @@ function PinnedRow({ nodeId, entry, time }: { nodeId: string; entry: PinnedEntry
       hint={hint}
       pinned={entry.pinned}
       compact
+      // Same grid as the numeric rows beside it (MultiPropertyRow picks the
+      // inspector layout from its host); without this the name column of a
+      // non-numeric pin sat 20px off every other row in the section.
+      layout="inspector"
       trailing={entry.pinned ? <UnpinButton nodeId={nodeId} prop={entry.prop} /> : undefined}
     >
       <span className={styles.groupCount}>Edit in its own section</span>
@@ -72,7 +76,7 @@ function PinnedRow({ nodeId, entry, time }: { nodeId: string; entry: PinnedEntry
 
 export function PinnedSection({ nodeId }: { nodeId: string }): JSX.Element | null {
   useNodeRevision(nodeId);
-  const time = useCurrentTime();
+  const time = useThrottledTime();
   const node = defaultSceneGraph.getNode(nodeId);
   if (!node) return null;
   const entries = pinnedEntriesFor(nodeId);

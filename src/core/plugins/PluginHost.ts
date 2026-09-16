@@ -37,7 +37,18 @@ import { getCommandRegistry, type Command } from '@core/commands/Command';
 import { asCommandId, type CommandId } from '@app-types/common';
 import { useUIStore } from '@stores/uiStore';
 import { registerLayerKinds, unregisterLayerKinds } from './layerKindRegistry';
+import { resetGeneratorsForPlugin, setGeneratorRunner } from './generator/generatorScheduler';
+import { forgetPluginAssetTextures, setPluginAssetHost } from './pluginAssetTextures';
 import { registerEffects, unregisterEffects } from './pluginEffects';
+import { registerPluginTools, unregisterPluginTools } from './uiTools';
+import { setPluginExpressionScope } from '@motion/animation';
+import {
+  configurePluginExpressions, pluginExpressionScope, registerPluginExpressions,
+  unregisterPluginExpressions,
+} from './uiExpressions';
+import { clearPluginDrawList, configurePluginCanvas, type PluginCanvasEvent } from './uiCanvas';
+import { clearPluginStatus } from './uiStatus';
+import { findShortcutClash, describeClash } from './uiShortcuts';
 import { clearLayerChangeListeners, notifyAuthoredChange } from './layerChangeNotifier';
 import { revocationFor, refreshRevocations } from './revocation';
 import { fetchRevocationList } from './registry';
@@ -59,6 +70,15 @@ import {
   type RenderFinishedInfo,
 } from './protocol';
 import type { PluginPackage } from './pluginPackage';
+import { normalizePath } from './moduleGraph';
+import {
+  consentNeed, loadLocalPackage, loadVerdict, localPluginsAvailable, refreshLocalPlugins,
+} from './localPlugins';
+import { developerModeEnabled } from './developerMode';
+import {
+  killNativePlugin, loadNativePlugin, manifestForStaged, stageNativeBinary, stagingPlatformKey,
+  sweepStagedNative, unstageNativePlugin, watchNativeEvents, type NativeStatus,
+} from './native';
 import { activatesOnStartup, expandPermissions, type PluginPermission } from './manifest';
 import { checkCapabilities, hostCapabilities } from './capabilities';
 import { forgetGlobalStorage, loadGlobalStorage } from './pluginStorage';
@@ -89,8 +109,14 @@ const EXPORT_STEP_TIMEOUT_MS = 60_000;
  * into one object type whose only keys are the ones they all share, so
  * `phase: 'frame'` would typecheck without `pixels`.
  */
-/** What a host-driven worker task resolves to: export bytes, or decoded pixels. */
-type HostTaskReply = ArrayBuffer | undefined | { width: number; height: number; pixels: ArrayBuffer };
+/** What a host-driven worker task resolves to: export bytes, decoded pixels, or
+ *  a generator's raw frame (wrapped, so a generator returning `undefined` is
+ *  distinguishable from an export step that resolves with nothing). */
+type HostTaskReply =
+  | ArrayBuffer
+  | undefined
+  | { width: number; height: number; pixels: ArrayBuffer }
+  | { generated: unknown };
 
 type ExportStepInput<T = Extract<HostMessage, { k: 'export' }>> =
   T extends unknown ? Omit<T, 'id'> : never;
@@ -162,6 +188,8 @@ class PluginHost {
    *  import React, and the host is booted in tests where there is no dock. */
   private showPanelHook: ((pluginId: string, panelId: string) => void) | null = null;
   private hidePanelHook: ((pluginId: string, panelId: string) => void) | null = null;
+  /** Make one of `pluginId`'s tools the active tool. Absent in tests. */
+  private activateToolHook: ((pluginId: string, toolId: string) => void) | null = null;
   /** Plugin frames allowed on the postMessage bridge → their expected origin. */
   private readonly frames = new Map<MessageEventSource, string>();
   private workerFactory: WorkerFactory | null = null;
@@ -178,6 +206,85 @@ class PluginHost {
 
   constructor() {
     this.setupPostMessageBridge();
+    /*
+      The two UI registries that have to reach a worker.
+
+      Injected rather than imported the other way round: the viewport paints a
+      draw list and the animation engine calls an expression function, and
+      neither may pull the plugin host into a test that has no worker. This is
+      the only place that knows both halves.
+    */
+    configurePluginCanvas({
+      deliver: (pluginId, event) => { this.deliverCanvasEvent(pluginId, event); },
+    });
+    // `plugin.<namespace>.<fn>()` in an expression. The animation package holds
+    // one injected provider rather than importing any of this, so an engine
+    // test evaluates expressions with no plugin host in the graph at all.
+    setPluginExpressionScope(pluginExpressionScope);
+    configurePluginExpressions({
+      compute: (pluginId, name, args) => { this.requestExpressionValue(pluginId, name, args); },
+      // A value that lands between frames has to reach the next one. The scene
+      // bump is what every sampled value in the app already rebuilds from.
+      onValue: () => { this.emit(); },
+    });
+  }
+
+  /**
+   * Post one viewport event to the plugin that drew the thing it landed on.
+   *
+   * Activates first — the plugin may have been asleep since launch, and a
+   * gesture that starts by waking it is the same contract `invokeCommand` has.
+   * The event is dropped rather than queued if the worker cannot be started:
+   * replaying a pointer-down after an 8-second boot would land it somewhere the
+   * user is no longer pointing.
+   */
+  private deliverCanvasEvent(pluginId: string, event: PluginCanvasEvent): void {
+    const live = this.runtimes.get(pluginId);
+    if (live?.info.status === 'running') {
+      try { live.worker.postMessage({ k: 'canvas', event } satisfies HostMessage); } catch { /* terminated */ }
+      return;
+    }
+    void this.ensureActive(pluginId).then((started) => {
+      if (!started) return;
+      const rt = this.runtimes.get(pluginId);
+      try { rt?.worker.postMessage({ k: 'canvas', event } satisfies HostMessage); } catch { /* terminated */ }
+    });
+  }
+
+  /** Ask a plugin for one expression value. Never waits — see `uiExpressions.ts`. */
+  private requestExpressionValue(pluginId: string, name: string, args: readonly number[]): void {
+    void this.ensureActive(pluginId).then((started) => {
+      if (!started) return;
+      const rt = this.runtimes.get(pluginId);
+      try {
+        rt?.worker.postMessage({ k: 'expression', name, args: [...args] } satisfies HostMessage);
+      } catch { /* terminated */ }
+    });
+  }
+
+  /**
+   * Tell a plugin the user picked (or left) one of its tools.
+   *
+   * Public because the toolbar is what knows, and it reaches the host rather
+   * than the worker — a tool is selectable while its plugin is asleep, and
+   * selecting it is what wakes it (`onTool:<id>`).
+   */
+  notifyToolChanged(pluginId: string, toolId: string, active: boolean): void {
+    if (!active) {
+      // Its drawing goes with it. A gizmo left on the canvas after the user
+      // switched to Select is chrome nothing on screen explains.
+      clearPluginDrawList(pluginId);
+      const rt = this.runtimes.get(pluginId);
+      try { rt?.worker.postMessage({ k: 'tool', toolId, active: false } satisfies HostMessage); } catch { /* gone */ }
+      return;
+    }
+    void this.ensureActive(pluginId).then((started) => {
+      if (!started) return;
+      const rt = this.runtimes.get(pluginId);
+      try {
+        rt?.worker.postMessage({ k: 'tool', toolId, active: true } satisfies HostMessage);
+      } catch { /* terminated */ }
+    });
   }
 
   /**
@@ -195,6 +302,8 @@ class PluginHost {
     /** Hide it again — also called when a plugin stops, so a panel cannot
      *  outlive the worker that was answering it. */
     hidePanel?: (pluginId: string, panelId: string) => void;
+    /** Select one of `pluginId`'s contributed tools. Absent in tests and pop-outs. */
+    activateTool?: (pluginId: string, toolId: string) => void;
   }): void {
     // Enforced, not documented. "`hydrate()` must run before `configure()`" is
     // call-order discipline, and call-order discipline is violated eventually —
@@ -216,6 +325,7 @@ class PluginHost {
     this.selectionProvider = opts.getSelection;
     this.showPanelHook = opts.showPanel ?? null;
     this.hidePanelHook = opts.hidePanel ?? null;
+    this.activateToolHook = opts.activateTool ?? null;
 
     /*
       Two plugin behaviours, hooked at the ONE place an authored property write
@@ -273,6 +383,8 @@ class PluginHost {
     */
     void loadGlobalStorage();
 
+    this.watchNative();
+
     this.bringUpEnabled();
 
     /*
@@ -284,6 +396,136 @@ class PluginHost {
       arrives rather than at the next restart.
     */
     this.checkRevocations();
+
+    void this.refreshFolderPlugins();
+    void this.sweepNativeStaging();
+  }
+
+  /** Unsubscribe for the native host's event stream. Null until `configure`. */
+  private nativeEventsOff: (() => void) | null = null;
+
+  /**
+   * Listen to what the native host has to say, and put it in the plugin's log.
+   *
+   * A crash, a call that timed out and a session disable all happen to a
+   * PROCESS, so none of them is the return value of anything — they arrive as
+   * events, often while the plugin is idle, and before this they arrived
+   * nowhere. A user whose compiled effect stopped working saw the effect stop
+   * working, and the log that exists precisely to tell them why said nothing.
+   *
+   * One line per EVENT, never per frame: a crashed plugin's calls each fail as
+   * well, and those are the scheduler's business (`takeNativeErrors`, which the
+   * export gate drains). The three events here are the ones that change what the
+   * plugin IS, and there are at most four of them before it is disabled for the
+   * session.
+   */
+  private watchNative(): void {
+    this.nativeEventsOff?.();
+    this.nativeEventsOff = watchNativeEvents((event) => {
+      if (event.type === 'crashed') {
+        const n = event.restarts ?? 0;
+        this.appendLog(
+          event.pluginId,
+          'error',
+          `native module: the process stopped unexpectedly${event.message ? ` — ${event.message}` : ''}`
+          + (n > 0 ? ` (restart ${n})` : ''),
+        );
+      } else if (event.type === 'disabled') {
+        this.appendLog(
+          event.pluginId,
+          'error',
+          event.message
+            ?? 'native module: it crashed repeatedly and is off for the rest of this session.',
+        );
+      }
+      // `ready` and `stopped` are not logged. A process starting and stopping is
+      // the tier working, and a line per idle-timeout would push the crash that
+      // matters off the end of a bounded log.
+    });
+  }
+
+  /** Stop listening. Paired with `watchNative`, for a host that is torn down. */
+  stopWatchingNative(): void {
+    this.nativeEventsOff?.();
+    this.nativeEventsOff = null;
+  }
+
+  /**
+   * Collect staging directories left behind by plugins that are gone.
+   *
+   * At boot and nowhere else: it is the one moment the whole installed list is
+   * known and nothing is mid-install, so an id that is staged and not installed
+   * is an orphan rather than a race. Not awaited, like every other boot tidy
+   * here — a directory that survives one more launch costs nothing, and a
+   * filesystem walk in front of the editor's own startup costs the user.
+   */
+  private async sweepNativeStaging(): Promise<void> {
+    try {
+      const installed = usePluginStore.getState().plugins.map((p) => p.manifest.id);
+      await sweepStagedNative(installed);
+    } catch {
+      // No bridge, or a staging root that could not be listed. A sweep that
+      // does not happen is the state this code was added to improve on.
+    }
+  }
+
+  /**
+   * Re-read the plugins folders at boot, for packages the user already said
+   * yes to.
+   *
+   * This is the half of the folder tier that makes it feel like a plugins
+   * folder rather than an importer. An AE plugin is in `MediaCore` and is there
+   * at the next launch; a Premation one would have been a thing you pressed
+   * "Load" on every session, which is not an install — it is an import with
+   * extra steps.
+   *
+   * The boundary is strict, and it is what makes this safe to do with nobody
+   * watching:
+   *
+   *   • Only an id ALREADY INSTALLED on this machine. A new folder appearing is
+   *     never started by itself — it waits in the panel for the consent screen.
+   *   • Only when `consentNeed` says nothing changed: same tier, no permission
+   *     the user has not already granted, no new publisher key.
+   *   • Only what the trust gate allows — a signature, or Developer Mode.
+   *
+   * So what this can do is replace an installed copy with the newer bytes of
+   * the same plugin, with the same grants. A plugin cannot widen what it may do
+   * by editing a file on disk; that path goes through the panel and the sheet.
+   *
+   * Not awaited by `configure`, for the same reason the revocation check is
+   * not: reading packages off a disk must not sit in front of the editor's own
+   * startup.
+   */
+  private async refreshFolderPlugins(): Promise<void> {
+    if (!localPluginsAvailable()) return;
+    try {
+      const { plugins } = await refreshLocalPlugins();
+      for (const candidate of plugins) {
+        const manifest = candidate.manifest;
+        if (!manifest) continue;
+        const existing = usePluginStore.getState().get(manifest.id);
+        if (!existing) continue;
+        if (!loadVerdict(candidate).allowed) continue;
+
+        const { pkg, errors, signature, native } = await loadLocalPackage(candidate);
+        if (!pkg) {
+          this.appendLog(manifest.id, 'warn', `Could not re-read this plugin from disk: ${errors.join(' ')}`);
+          continue;
+        }
+        if (consentNeed(pkg.manifest, existing, signature) !== 'none') continue;
+
+        const error = this.install(pkg, existing.granted, {
+          source: candidate.kind === 'archive' ? 'file' : 'folder',
+          ...(signature?.ok && signature.publisherKey ? { publisherKey: signature.publisherKey } : {}),
+          ...(native ? { native } : {}),
+        });
+        if (error) this.appendLog(manifest.id, 'warn', error);
+      }
+    } catch {
+      // A bridge that answered badly, or a folder that vanished mid-scan. The
+      // panel re-scans on demand and says what it found; a failure here must
+      // not be the thing that stops the editor booting.
+    }
   }
 
   /**
@@ -351,6 +593,15 @@ class PluginHost {
        *  uses it — see `InstalledPlugin.nextPublisherKey`. */
       nextPublisherKey?: string;
       nextPublisherKeyMethod?: 'backup' | 'dashboard';
+      /**
+       * A FOLDER install's compiled modules: where they are, and what the main
+       * process measured them to hash to (`loadLocalPackage`).
+       *
+       * Absent for everything else, and absence is not "no native module" — an
+       * archive's binary is staged out of `pkg.binaries` instead, because a file
+       * inside a zip cannot be loaded where it lies. See `bringUpNative`.
+       */
+      native?: { dir: string; hashes: Record<string, string> };
     } = {},
   ): string | null {
     const id = pkg.manifest.id;
@@ -386,6 +637,17 @@ class PluginHost {
     const entry: InstalledPlugin = {
       manifest: pkg.manifest,
       files: pkg.files,
+      /*
+        The binaries, which this used to DROP.
+
+        `PluginPackage` has carried them since packages were allowed to ship
+        media, and `pluginStore.put` writes them to IndexedDB — but the record
+        built here never set the key, so every install arrived with its assets
+        missing and only `hydrate()` (which reads the payload back) could see
+        them. Harmless while nothing could read a package file; not harmless now
+        that `package.read` is the whole point of shipping one.
+      */
+      ...(pkg.binaries && Object.keys(pkg.binaries).length > 0 ? { binaries: pkg.binaries } : {}),
       granted: pkg.manifest.permissions.filter((p) => granted.includes(p)),
       enabled: true,
       installedAt: existing?.installedAt ?? Date.now(),
@@ -427,7 +689,97 @@ class PluginHost {
     }
     this.emit();
     this.bringUp(entry);
+    // Not awaited, and not allowed to fail the install: a compiled module that
+    // will not come up is a plugin that runs its JavaScript path, which is what
+    // every native call site already does when there is no process. See below.
+    void this.bringUpNative(pkg, origin);
     return null;
+  }
+
+  /**
+   * Bring a plugin's COMPILED module up, if it declared one.
+   *
+   * Returns on the first line for every plugin without a `native` block, which
+   * is all of them today: no process, no staging, no hash, nothing written.
+   *
+   * Two shapes arrive and only one of them is already a file. A FOLDER's binary
+   * is loaded where it lies, from the hashes the scan measured. An ARCHIVE's is
+   * written out first — `require` cannot open a file inside a zip — and the
+   * manifest it is loaded with names the STAGED file rather than the author's
+   * path inside the package, which is what `manifestForStaged` is for.
+   *
+   * Asynchronous while `install` is synchronous, so it is fire-and-forget. The
+   * consent sheet's button and the folder re-scan both call `install` inside a
+   * render, and a load that has to launch a process and wait for `describe()`
+   * cannot sit in front of either. What a caller would have done with the
+   * answer is what happens here instead: it goes in the plugin's own log.
+   */
+  private async bringUpNative(
+    pkg: PluginPackage,
+    origin: { publisherKey?: string; native?: { dir: string; hashes: Record<string, string> } },
+  ): Promise<void> {
+    const manifest = pkg.manifest;
+    if (!manifest.native) return;
+
+    try {
+      // A pinned key IS the signature verdict here: nothing sets it that did not
+      // verify the bytes against it first, and nothing else on this side knows
+      // any more about the signature than that.
+      const signature = origin.publisherKey ? { ok: true, publisherKey: origin.publisherKey } : null;
+      const developerMode = developerModeEnabled();
+
+      if (origin.native) {
+        this.reportNativeLoad(await loadNativePlugin({
+          manifest,
+          dir: origin.native.dir,
+          hashes: origin.native.hashes,
+          signature,
+          developerMode,
+        }));
+        return;
+      }
+
+      const staged = await stageNativeBinary(manifest, pkg.binaries ?? {});
+      if (!staged) return; // No bridge — a browser build has no processes at all.
+      if (staged.error || !staged.dir) {
+        this.appendLog(manifest.id, 'error', `native module: ${staged.error ?? 'it could not be staged.'}`);
+        return;
+      }
+      /*
+        The staged file's own name, and the platform key it now stands for.
+
+        `stageNativeBinary` keys its hash map by the BASENAME the file landed
+        under, and the key is read from the bridge rather than guessed from the
+        manifest because two platforms may legitimately declare the same file
+        name — the example SDK package declares `motion_example.node` for all
+        four — and matching on the name alone would rewrite the wrong entry.
+      */
+      const fileName = Object.keys(staged.hashes)[0] ?? '';
+      this.reportNativeLoad(await loadNativePlugin({
+        manifest: manifestForStaged(manifest, stagingPlatformKey(), fileName),
+        dir: staged.dir,
+        hashes: staged.hashes,
+        signature,
+        developerMode,
+      }));
+    } catch (err) {
+      // A bridge that answered badly, a staging directory that is not writable.
+      // The plugin is installed and its JavaScript runs; this is the note the
+      // author needs to know why the fast path did not.
+      this.appendLog(manifest.id, 'error', `native module: ${(err as Error).message}`);
+    }
+  }
+
+  /** One log line for a native load that did not end with a running process. */
+  private reportNativeLoad(status: NativeStatus): void {
+    if (status.loaded || status.code === 'not-declared') return;
+    // A package that ships no binary for THIS machine is a fact to list, not a
+    // fault to report — see `NativeStatus.unavailableHere`.
+    this.appendLog(
+      status.pluginId,
+      status.unavailableHere ? 'warn' : 'error',
+      `native module: ${status.error ?? status.code ?? 'it did not load.'}`,
+    );
   }
 
   /**
@@ -448,6 +800,17 @@ class PluginHost {
    */
   uninstall(id: string, opts: { keepData?: boolean } = {}): void {
     this.stop(id);
+    /*
+      The compiled module, and everything staged for it.
+
+      `killNativePlugin` drops the consent and the process; `unstageNativePlugin`
+      deletes the bytes. Both, because they are two different leaks: a consent
+      record that outlives its plugin would silently authorise the NEXT install
+      of the same id, and a staging directory that outlives it is a copy of a
+      binary nothing will ever load again sitting in the user's profile.
+    */
+    void killNativePlugin(id);
+    void unstageNativePlugin(id);
     this.unregisterContributions(id);
     usePluginStore.getState().remove(id);
     this.logs.delete(id);
@@ -492,6 +855,11 @@ class PluginHost {
       if (entry) this.bringUp(entry);
     } else {
       this.stop(id);
+      // The compiled module too. "Off" that left a process running — holding
+      // memory, holding a file mapped, still answering calls the render path
+      // made before it noticed — would make the switch a lie about the half of
+      // the plugin that is not in the sandbox.
+      void killNativePlugin(id);
       // Disabling takes the contributions out of the palette too. An inactive
       // plugin's commands are meant to be there; a DISABLED one's are not, and
       // leaving them would make "off" mean nothing the user can see.
@@ -608,6 +976,10 @@ class PluginHost {
       // grant and restarts the plugin, but reading through means a batch can
       // never be judged against a set the user has already revoked.
       granted: () => expandPermissions(usePluginStore.getState().get(id)?.granted ?? []),
+      // Read live for the same reason `granted` is: the record is replaced
+      // wholesale on update, and a captured payload would serve a file from
+      // the version the worker happened to boot with.
+      readPackageFile: (path, as) => this.readPackageFile(id, path, as),
       emitLayerChanged: (event) => {
         // Guarded: a worker that died between the edit and the coalesce window
         // is the normal case for a plugin that crashed mid-drag.
@@ -635,10 +1007,27 @@ class PluginHost {
       return;
     }
 
+    /*
+      The whole module graph, not only the entry.
+
+      A blob URL has no directory, so `import './util.js'` inside the entry
+      module used to resolve against the blob origin and fail — which made a
+      plugin exactly one file. The worker now builds a blob per file and
+      rewrites each relative specifier to the URL its target landed at, so what
+      it needs is every TEXT file in the package.
+
+      `code` stays, and is still the entry's source. The worker prefers `files`
+      when it is there; keeping both means a graph that cannot be planned (a
+      cycle, a bare npm specifier) still reports its own error rather than
+      failing to boot at all. Binaries are deliberately NOT sent: they can be
+      hundreds of megabytes, and `package.read` fetches the one that is wanted.
+    */
     const boot: HostMessage = {
       k: 'boot',
       manifest: entry.manifest,
       code,
+      files: entry.files,
+      entry: entry.manifest.main.replace(/^\.\//, ''),
       permissions: [...entry.granted],
       // Resolved at boot, not at module load: `webgpu` depends on the renderer
       // tier, which is decided during app startup.
@@ -651,6 +1040,81 @@ class PluginHost {
         this.setError(id, 'The plugin did not finish loading within 8 seconds and was stopped.');
       }
     }, ACTIVATE_TIMEOUT_MS);
+  }
+
+  /**
+   * One file out of a plugin's own installed package — the `package.read` verb.
+   *
+   * The containment argument, in one sentence: there is no path here that is
+   * not a key of the package record, so "reach outside the package" is not a
+   * thing this can be asked to do — `..` folds away in `normalizePath`, and a
+   * folded path that names nothing in the record is a miss, not an escape.
+   *
+   * Bytes are COPIED before they leave. The reply is transferred (see
+   * `collectTransferables`), and transferring the stored array would neuter the
+   * installed record — the second read of the same file would come back empty,
+   * with nothing in the message to say why.
+   */
+  /**
+   * The same file, for the HOST's own use — a generator's sprite atlas.
+   *
+   * Routed through `readPackageFile` rather than reaching into the store
+   * beside it, so there is exactly one implementation of "resolve a path inside
+   * an installed payload" and a future narrowing of it cannot apply to the
+   * plugin's route and miss the host's. It REJECTS with the same sentences a
+   * plugin would have been told, which is what the caller turns into a log line
+   * naming the file; swallowing them would leave "no such file" and "this
+   * plugin is gone" indistinguishable.
+   */
+  async readPackageBytes(pluginId: string, path: string): Promise<Uint8Array> {
+    const buffer = await this.readPackageFile(pluginId, path, 'bytes');
+    return new Uint8Array(buffer as ArrayBuffer);
+  }
+
+  /**
+   * A named failure from a host subsystem working on a plugin's behalf — a
+   * packaged texture that would not decode, say.
+   *
+   * The plugin's OWN log, which is the surface a user opens when something a
+   * plugin contributed does not appear. A console line would be invisible
+   * there, and a toast would fire at frame rate.
+   */
+  reportError(id: string, text: string): void {
+    this.appendLog(id, 'error', text);
+  }
+
+  private async readPackageFile(
+    pluginId: string,
+    rawPath: unknown,
+    as: unknown,
+  ): Promise<string | ArrayBuffer> {
+    const entry = usePluginStore.getState().get(pluginId);
+    if (!entry) throw new Error('This plugin is no longer installed.');
+    if (typeof rawPath !== 'string' || rawPath.trim() === '') {
+      throw new Error('package.read(path) needs the path of a file in your package.');
+    }
+    if (as !== undefined && as !== null && as !== 'text' && as !== 'bytes') {
+      throw new Error('The second argument to package.read is "text" or "bytes".');
+    }
+
+    const path = normalizePath(rawPath);
+    const text = entry.files[path];
+    const bytes = entry.binaries?.[path];
+    if (text === undefined && bytes === undefined) {
+      throw new Error(`"${rawPath}" is not in this plugin's package.`);
+    }
+
+    if (as === 'text') {
+      return text !== undefined ? text : new TextDecoder().decode(bytes);
+    }
+    if (text !== undefined) {
+      // A text file asked for as bytes. Encoded rather than refused: `.wgsl`
+      // and `.json` are text in the package and bytes to whatever the plugin
+      // hands them to, and making the author care which side of that line a
+      // file fell on would be an implementation detail leaking into an API.
+      return new TextEncoder().encode(text).buffer as ArrayBuffer;
+    }
+    return bytes!.slice().buffer as ArrayBuffer;
   }
 
   stop(id: string): void {
@@ -741,6 +1205,18 @@ class PluginHost {
         if (!pending) break; // A reply to a step whose export was already torn down.
         this.exportWaiters.delete(msg.id);
         if (msg.ok) pending.resolve(msg.bytes);
+        else pending.reject(new Error(msg.error));
+        break;
+      }
+
+      case 'generateResult': {
+        const pending = this.exportWaiters.get(msg.id);
+        // Normal, and frequent: the scheduler abandons a frame the moment the
+        // playhead moves past it, so a reply to a superseded scrub arrives with
+        // nobody waiting. Dropping it is the whole of "latest-wins" on this side.
+        if (!pending) break;
+        this.exportWaiters.delete(msg.id);
+        if (msg.ok) pending.resolve({ generated: msg.value });
         else pending.reject(new Error(msg.error));
         break;
       }
@@ -862,10 +1338,24 @@ class PluginHost {
 
     for (const spec of entry.manifest.contributes.commands) {
       const cid = asCommandId(`plugin.${pid}.${spec.id}`);
+      /*
+        The chord, if the plugin asked for one AND nothing else holds it.
+
+        Checked here rather than at parse time, because the answer depends on
+        what is installed and on what the user has rebound — neither of which a
+        manifest validator can see, and both of which change after install. A
+        refusal is a log line, never a failed install: the command still works
+        from the menu and the palette, and the user can bind their own chord in
+        Customize…, which walks this registry.
+      */
+      const wanted = entry.manifest.contributes.shortcuts.find((s) => s.command === spec.id);
+      const clash = wanted ? findShortcutClash(wanted.key, cid as unknown as string) : null;
+      if (wanted && clash) this.appendLog(pid, 'warn', describeClash(wanted.chord, clash));
       getCommandRegistry().register({
         id: cid,
         label: `${entry.manifest.name}: ${spec.label}`,
         icon: spec.icon ?? 'plugin',
+        ...(wanted && !clash ? { shortcut: wanted.key } : {}),
         // Deliberately NOT gated on the plugin running. A command that greys
         // out until you have started the thing it starts is a loop the user
         // cannot get into.
@@ -873,6 +1363,37 @@ class PluginHost {
         execute: () => { void this.invokeCommand(pid, spec.id); },
       });
       ids.push(cid);
+    }
+
+    /*
+      Tools, on ENABLE like everything else here.
+
+      A tool has to be on the toolbar before its worker has ever run — picking
+      it is the `onTool:<id>` activation event, and a tool that only appears
+      once the plugin is awake can only be reached by a route that requires it
+      to be awake already.
+    */
+    registerPluginTools(pid, entry.manifest.name, entry.manifest.contributes.tools);
+    for (const tool of entry.manifest.contributes.tools) {
+      const cid = asCommandId(`plugin.${pid}.tool.${tool.id}`);
+      getCommandRegistry().register({
+        id: cid,
+        label: `${entry.manifest.name}: ${tool.label}`,
+        icon: tool.icon as Command['icon'],
+        enabled: () => true,
+        execute: () => { this.activateToolHook?.(pid, tool.id); },
+      });
+      ids.push(cid);
+    }
+
+    /*
+      Expression functions. Registered on enable for the same reason effects
+      are: an expression using one must keep evaluating with the worker
+      stopped, answering from the cache and from the declared default, rather
+      than throwing in a document the user opened without touching the plugin.
+    */
+    for (const problem of registerPluginExpressions(pid, entry.manifest.contributes.expressions)) {
+      this.appendLog(pid, 'error', problem);
     }
 
     // One "open" command per declared panel, so a plugin's UI is reachable from
@@ -920,6 +1441,17 @@ class PluginHost {
     // layer nothing can drive, and a document that gains a reference to a
     // plugin the user has already turned off.
     unregisterLayerKinds(id);
+    // And the geometry its generator kinds produced. Keeping it would leave a
+    // stopped plugin's particles on screen — a layer that draws content nothing
+    // can now regenerate, which reads as the plugin still running.
+    resetGeneratorsForPlugin(id);
+    // And the images it shipped, decoded from its package. This path is also
+    // the developer-mode RELOAD (a re-registered plugin unregisters first), and
+    // that is the case that matters: an author editing `atlas.png` and
+    // reloading must see the new file, not the bitmap the app decoded at
+    // startup. A stale texture after a reload looks exactly like the edit not
+    // having saved.
+    forgetPluginAssetTextures(id);
     // Its callbacks go with its kinds. A listener for a plugin that is no
     // longer running is a message posted into a dead worker every time a user
     // touches a layer it used to manage.
@@ -928,6 +1460,22 @@ class PluginHost {
     // keep drawing — including one the user disabled BECAUSE it was implicated
     // in a device loss, which is the case where that matters most.
     unregisterEffects(id);
+    /*
+      And its UI. All four for the same reason, which is the one this whole
+      block is about: a contribution that outlives the plugin is a control the
+      user can operate and nothing can answer.
+
+      A tool left on the toolbar swallows clicks; a drawing left in the viewport
+      is chrome nothing explains; a status line is a claim from a plugin that is
+      gone; an expression function would keep answering from a cache the user
+      has no way to see is stale. Contributed PARAMETERS are deliberately not
+      cleared — those are values in the user's document, and they read back as
+      an inert, read-only section exactly as a missing layer kind's do.
+    */
+    unregisterPluginTools(id);
+    clearPluginDrawList(id);
+    clearPluginStatus(id);
+    unregisterPluginExpressions(id);
   }
 
   /**
@@ -1224,10 +1772,44 @@ class PluginHost {
     const reply = await this.runExportStep(pluginId, {
       k: 'import', importerId, fileName, bytes,
     } as never);
-    if (!reply || reply instanceof ArrayBuffer) {
+    // Narrowed by SHAPE rather than by elimination: the waiter map is shared
+    // with exports and generator frames, so "not an ArrayBuffer" stopped being
+    // enough to mean "decoded pixels" the moment a third reply kind existed.
+    if (!reply || reply instanceof ArrayBuffer || !('pixels' in reply)) {
       throw new Error(`"${entry.manifest.name}" did not return an image for "${fileName}".`);
     }
     return reply;
+  }
+
+  /**
+   * Produce one frame of a plugin's `render: "generator"` layer kind.
+   *
+   * ── Why this needs no permission ─────────────────────────────────────────
+   *
+   * `openExport` and `runImport` both check one, because both push the USER's
+   * data into a worker — every rendered pixel, or a file they opened. This
+   * pushes the layer's own declared properties, the composition's size and the
+   * time, at a layer OF THIS PLUGIN'S OWN KIND. A plugin that can read its own
+   * layer's properties has learned nothing it did not write, and `composition
+   * .get` is already ungated for the same reason.
+   *
+   * The plugin is NOT started on demand. `openExport` does, because the user
+   * picked that format by name; here the trigger is the playhead moving, and a
+   * document that happens to contain a generator layer must not wake a worker
+   * during playback. A stopped plugin's generator simply produces nothing and
+   * the layer draws empty — which is the same thing that happens when the
+   * plugin is uninstalled, and is what `render: "generator"` costs.
+   */
+  async runGenerate(pluginId: string, kindId: string, request: unknown): Promise<unknown> {
+    const live = this.runtimes.get(pluginId);
+    if (!live || live.info.status !== 'running') {
+      throw new Error(`The plugin "${pluginId}" is not running, so its generator layers cannot be drawn.`);
+    }
+    const reply = await this.runExportStep(pluginId, { k: 'generate', kindId, request } as never);
+    if (!reply || reply instanceof ArrayBuffer || !('generated' in reply)) {
+      throw new Error(`The plugin "${pluginId}" did not return a frame for "${kindId}".`);
+    }
+    return reply.generated;
   }
 
   /**
@@ -1299,6 +1881,11 @@ class PluginHost {
       // the next thing that lazily activates it.
       usePluginStore.getState().setEnabled(id, false);
       this.stop(id);
+      // A takedown has to reach the process as well as the worker. The sandbox
+      // is what makes a revoked SANDBOXED plugin harmless once it is stopped;
+      // a compiled one is native code in a process of its own, and leaving it
+      // running would make the strongest refusal this system has the weakest.
+      void killNativePlugin(id);
       this.unregisterContributions(id);
 
       // The operator's own words. A plugin that disappears with no explanation
@@ -1517,4 +2104,35 @@ class PluginHost {
 }
 
 export const pluginHost = new PluginHost();
+
+/*
+  Give the generator scheduler its route to plugin code.
+
+  Injected rather than imported from the other side, and that direction is the
+  point: `generatorScheduler` is reached from `buildSnapshot`, which runs in the
+  render-tests harness and in the export worker, neither of which has a plugin
+  host, a store or a Worker. A scheduler that imported this file would drag all
+  three into every snapshot build in the repo.
+
+  Here, in the app graph, the wiring is one line and it happens the moment
+  anything touches the host at all.
+*/
+setGeneratorRunner({
+  generate: (pluginId, kindId, request) => pluginHost.runGenerate(pluginId, kindId, request),
+});
+
+/*
+  And the route to a plugin's own packaged FILES, for the same reason and by the
+  same rule: the texture cache is reached from the render path, which runs in
+  the harness and the export worker with no store behind it.
+
+  `readPackageFile` is the `package.read` implementation — the identical
+  resolution, inside the identical installed payload — so the host reading a
+  plugin's sprite atlas can reach exactly what the plugin itself could, and
+  nothing else on the machine.
+*/
+setPluginAssetHost({
+  read: (pluginId, path) => pluginHost.readPackageBytes(pluginId, path),
+  log: (pluginId, message) => pluginHost.reportError(pluginId, message),
+});
 export default pluginHost;

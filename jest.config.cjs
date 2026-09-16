@@ -18,7 +18,10 @@ module.exports = {
   // discovered twice — once as .ts source, once as compiled .js. Same doubling
   // as the worktree case above, same misreading as extra coverage, plus the
   // compiled copy can be stale and pass while the source fails.
-  testPathIgnorePatterns: ['/node_modules/', '<rootDir>/dist/', '<rootDir>/dist-electron/'],
+  // `*.bench.test.ts` are timed benchmarks, not tests: minutes of wall time
+  // and numbers that mean nothing under a parallel run. `npm run bench` runs
+  // them alone (jest.bench.config.cjs).
+  testPathIgnorePatterns: ['/node_modules/', '<rootDir>/dist/', '<rootDir>/dist-electron/', '\\.bench\\.test\\.[jt]sx?$'],
   transform: {
     '^.+\\.tsx?$': 'ts-jest',
   },

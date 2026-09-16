@@ -20,7 +20,27 @@ import type { SceneNode, ID } from '@core/types';
 const THUMB_W = 96;
 const THUMB_H = 64;
 
+/**
+ * Rendered thumbnails as PNG data URLs, in recency order (hits re-insert).
+ *
+ * Bounded. Keys include `createdAt`, so every re-save of a component minted a
+ * new key and the previous data URL (~5–15 KB of base64 each) stayed for the
+ * rest of the session; a library browsed for an afternoon only ever grew. The
+ * cap is well above a grid's worth of cards, and an evicted card simply
+ * re-renders through the queue below the next time it is shown.
+ */
+const MAX_CACHED_THUMBS = 128;
 const cache = new Map<string, string>();
+
+function cacheThumb(key: string, url: string): void {
+  cache.delete(key);
+  cache.set(key, url);
+  while (cache.size > MAX_CACHED_THUMBS) {
+    const oldest = cache.keys().next();
+    if (oldest.done) break;
+    cache.delete(oldest.value);
+  }
+}
 
 interface SerializedNodeLike {
   name: string;
@@ -206,7 +226,7 @@ async function renderThumbAsync(def: ComponentDef, key: string): Promise<void> {
     if (!ctx) throw new Error('no 2d context');
     ctx.drawImage(canvas, 0, 0);
     const url = scratch.toDataURL('image/png');
-    cache.set(key, url);
+    cacheThumb(key, url);
     listeners.forEach((fn) => fn());
   } catch {
     // Rendering unavailable (tests without canvas/GPU) — leave uncached so the
@@ -225,12 +245,25 @@ async function renderThumbAsync(def: ComponentDef, key: string): Promise<void> {
 export function componentThumb(def: ComponentDef): string | null {
   const key = `${def.id}:${def.createdAt}`;
   const hit = cache.get(key);
-  if (hit) return hit;
+  if (hit) {
+    cacheThumb(key, hit); // refresh recency
+    return hit;
+  }
   if (!pending.has(key)) {
     pending.add(key);
     void enqueueThumb(() => renderThumbAsync(def, key)).finally(() => pending.delete(key));
   }
   return null;
+}
+
+/** Test seam: install a rendered thumbnail as if its GPU render had landed. */
+export function primeComponentThumb(def: Pick<ComponentDef, 'id' | 'createdAt'>, url: string): void {
+  cacheThumb(`${def.id}:${def.createdAt}`, url);
+}
+
+/** Test seam: how many thumbnails are held. */
+export function componentThumbCacheSize(): number {
+  return cache.size;
 }
 
 /** Drop a component's cached thumbnail (call when it is re-saved). */

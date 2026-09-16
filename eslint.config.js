@@ -159,6 +159,11 @@ export default tseslint.config(
       '.cursor/**',
       '.gemini/**',
       'packages/render-tests/dist-harness/**',
+      // Render-test and bench OUTPUT (gitignored): PNG frames, diffs, bench JSON.
+      // Not source — and the golden gate rewrites it while it runs, so a lint
+      // pass started alongside a gate crashed with ENOENT walking a folder the
+      // harness had just replaced.
+      '**/.artifacts/**',
       '**/*.min.js',
       '**/*.umd.js',
     ],

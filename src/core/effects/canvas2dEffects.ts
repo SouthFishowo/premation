@@ -49,6 +49,9 @@ import {
 import { photoFilterData, blackAndWhiteData, tritoneData, thresholdData } from './aeColor';
 import { drawCheckerboard, drawGrid, cellPatternData } from './generatePatterns';
 import { drawVegas } from './vegas';
+import { pathStrokeEffectData } from './pathStroke';
+import { scribbleEffectData } from './scribble';
+import { writeOnUsesBrush, writeOnBrushEffectData } from './writeOnBrush';
 import { defaultWarpPoints, bezierWarpData, isRestWarp, type WarpPoints } from './bezierWarp';
 import { turbulentNoiseData, addGrainData, medianData } from './noiseEffects';
 import { applyLutToImageData, fromStoredLut } from './cubeLut';
@@ -200,6 +203,14 @@ const CANVAS2D_ONLY = new Set<string>([
   // no shader form for it any more than there is for Median. It also DRAWS,
   // like the three above.
   'vegas',
+  // Stroke-like paint effects (2026-09-15). AE Stroke and Scribble lay a brush
+  // along the layer's MASKS, resolved per frame into params, and a fragment
+  // shader has no form for a variable-length list of polylines any more than
+  // it does for Vegas. Both are pure buffer kernels (`pathStroke.ts`,
+  // `scribble.ts`). Write-on's brush form bakes too, but by `effectFollowsPath`
+  // (effectBake.ts), since its classic form keeps the shader.
+  'path-stroke',
+  'scribble',
   // Noise family. Turbulent Noise generates a field, Add Grain disturbs the
   // pixels, Median is a rank filter over the neighbourhood — no shader form for
   // any of the three.
@@ -531,6 +542,10 @@ export function applyCanvas2dEffect(
       return applyCellPattern(oc, w, h, e);
     case 'vegas':
       return drawVegas(oc, w, h, e);
+    case 'path-stroke':
+      return applyRemapEffect(oc, w, h, (d) => pathStrokeEffectData(d, w, h, e));
+    case 'scribble':
+      return applyRemapEffect(oc, w, h, (d) => scribbleEffectData(d, w, h, e));
     case 'turbulent-noise':
       return applyTurbulentNoise(oc, w, h, e);
     case 'add-grain':
@@ -2980,6 +2995,12 @@ function applyRainfall(oc: CanvasRenderingContext2D, w: number, h: number, e: Ef
 }
 
 function applyWriteOn(oc: CanvasRenderingContext2D, w: number, h: number, e: Effect): void {
+  // Mode ▸ Brush Position: AE's recorded brush (writeOnBrush.ts). Everything
+  // below is the Classic Line / Path form, unchanged.
+  if (writeOnUsesBrush(paramsOf(e))) {
+    applyRemapEffect(oc, w, h, (d) => writeOnBrushEffectData(d, w, h, e));
+    return;
+  }
   // A resolved mask-path polyline switches the geometry: the brush follows the
   // path (buildSnapshot filled `pathPoints` from `pathMaskId` at this frame's
   // time), and Start/End/Wobble stop meaning anything — the path is the shape.

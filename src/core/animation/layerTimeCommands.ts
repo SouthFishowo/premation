@@ -39,6 +39,8 @@ import { getNodeLayerTime, updateNodeLayerTime, type FrameBlend } from '@core/sc
 import { compToKeyframeTime, getTimelineController } from '@core/timeline/TimelineController';
 import { runAnimEdit } from './animationCommands';
 import { runAsOneHistoryEntrySync } from '@core/composition/compositeEdit';
+import { hasRetime, RETIME_PROPS, SPEED_PROP, type RetimeMode } from './retime';
+import { SPEED_PRESETS, applySpeedPreset, setRetimeMode } from './retimeCommands';
 
 /** Same prop names PrecompControl writes — one track, two surfaces. */
 const REMAP = 'timeRemap';
@@ -116,14 +118,16 @@ export function setFrameBlend(ids: ReadonlyArray<string>, frameBlend: FrameBlend
   for (const id of ids) updateNodeLayerTime(id, { frameBlend });
 }
 
+/** Retimed in either mode — Speed % or Frame Number. */
 export function hasTimeRemap(nodeId: string): boolean {
-  return defaultAnimation.isAnimated(nodeId, REMAP) || defaultAnimation.isAnimated(nodeId, LEGACY_REMAP);
+  return hasRetime(defaultAnimation, nodeId);
 }
 
 /**
  * Enable time remapping: one keyframe at the playhead holding the current
  * source time (the identity — nothing moves until a second keyframe does),
- * exactly what PrecompControl's switch writes. Remove drops both tracks.
+ * exactly what PrecompControl's switch writes. Remove drops every retime
+ * track, Speed % included, so the layer is back to normal playback.
  */
 export function toggleTimeRemap(ids: ReadonlyArray<string>, compTime: number): void {
   const anyOff = ids.some((id) => !hasTimeRemap(id));
@@ -134,8 +138,7 @@ export function toggleTimeRemap(ids: ReadonlyArray<string>, compTime: number): v
         const remapT = compToKeyframeTime(id, compTime, REMAP);
         defaultAnimation.setKeyframe(id, REMAP, remapT, compTime);
       } else {
-        defaultAnimation.removeTrack(id, REMAP);
-        defaultAnimation.removeTrack(id, LEGACY_REMAP);
+        for (const prop of RETIME_PROPS) defaultAnimation.removeTrack(id, prop);
       }
     }
   }));
@@ -375,7 +378,7 @@ export function clampSignedStretch(percent: number): number {
   return percent < 0 ? -clampStretch(-percent) : clampStretch(percent);
 }
 
-const REMAP_TRACKS: ReadonlySet<string> = new Set([REMAP, LEGACY_REMAP]);
+const REMAP_TRACKS: ReadonlySet<string> = new Set([REMAP, LEGACY_REMAP, SPEED_PROP]);
 
 /** A baked stretch: the new bars, and the affine map every keyframe time takes. */
 export interface StretchBake {
@@ -608,8 +611,7 @@ export function freezeOnLastFrame(ids: ReadonlyArray<string>): number {
   // independent of the extension.
   runAnimEdit('Freeze On Last Frame', () => defaultAnimation.batch(() => {
     for (const { id, inSec, lastSec } of plans) {
-      defaultAnimation.removeTrack(id, REMAP);
-      defaultAnimation.removeTrack(id, LEGACY_REMAP);
+      for (const prop of RETIME_PROPS) defaultAnimation.removeTrack(id, prop);
       defaultAnimation.setKeyframe(id, REMAP, compToKeyframeTime(id, inSec, REMAP), inSec, 'linear');
       defaultAnimation.setKeyframe(id, REMAP, compToKeyframeTime(id, lastSec, REMAP), lastSec, 'step');
     }
@@ -698,6 +700,34 @@ export function buildLayerTimeCommands(deps: LayerTimeCommandDeps = {}): Readonl
       enabled,
       execute: () => toggleTimeRemap(timeTargets(), playhead()),
     },
+    // The two retime modes Twixtor and AE's Timewarp offer, plus the way back.
+    // Switching converts what the layer had (see `retimeCommands.setRetimeMode`).
+    ...([
+      ['speed', 'Retime: Speed %', 'Keyframe playback speed as a percentage — ramps and velocity edits'],
+      ['frames', 'Retime: Frame Number', 'Keyframe which source frame shows at each moment'],
+      ['normal', 'Retime: Normal Speed', 'Remove speed and frame retiming from the selected layers'],
+    ] as ReadonlyArray<[RetimeMode, string, string]>).map(([mode, label, description]) => ({
+      id: asCommandId(`time.retime.${mode}`),
+      label,
+      description,
+      icon: 'clock',
+      enabled,
+      execute: () => {
+        if (setRetimeMode(timeTargets(), mode)) {
+          notify('Converted to Speed %. The frames at your old keys are kept; check the curve between them.');
+        }
+      },
+    })),
+    ...SPEED_PRESETS.map((p) => ({
+      id: asCommandId(`time.speedPreset.${p.id}`),
+      label: `Speed Preset: ${p.label}`,
+      description: `${p.hint} — across each selected clip`,
+      icon: 'clock',
+      enabled,
+      execute: () => {
+        if (applySpeedPreset(timeTargets(), p.id) === 0) notify('The selected layers have no clip bar to shape a preset across.');
+      },
+    })),
     ...([
       ['none', 'Frame Blend: Off'],
       ['mix', 'Frame Blend: Frame Mix'],

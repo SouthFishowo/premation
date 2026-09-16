@@ -64,6 +64,13 @@ export interface ValueFieldProps {
   disabled?: boolean;
   'aria-label'?: string;
   /**
+   * A short muted tag drawn inside the left edge — the axis of a pair ("X",
+   * "Y", "W", "H"). Press-dragging it scrubs exactly like the rest of the
+   * field, which is the point: in a two-field row the letter IS the handle
+   * people grab. Decorative for assistive tech; `aria-label` names the field.
+   */
+  prefix?: string;
+  /**
    * The field describes SEVERAL values that disagree — a multi-selection.
    * Shows `—` instead of a number, and switches the gestures to RELATIVE:
    * a scrub reports a delta through `onRelative` rather than an absolute
@@ -172,6 +179,7 @@ function ValueFieldBase({
   unit,
   disabled = false,
   'aria-label': ariaLabel,
+  prefix,
   mixed = false,
   onRelative,
   onCommitText,
@@ -516,6 +524,11 @@ function ValueFieldBase({
           }
         : {})}
     >
+      {prefix ? (
+        <span className={styles.prefix} aria-hidden="true" data-value-prefix>
+          {prefix}
+        </span>
+      ) : null}
       {editing ? (
         <input
           ref={inputRef}

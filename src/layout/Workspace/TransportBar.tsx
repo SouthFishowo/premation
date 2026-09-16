@@ -46,7 +46,7 @@ import { ViewportDisplayControlsView, displayOverflowItems, useViewportDisplayMo
 import { ZoomField, useZoomPercent, zoomMenuItems } from './ZoomField';
 import { framesToTimecode } from '@core/time/timecode';
 import { useWorkspaceStore } from '@stores/projectStore';
-import { useCurrentTime } from '@stores/playbackClockStore';
+import { LiveTimecode } from '@layout/Timeline/LiveTimecode';
 import { useCompositionStore } from '@stores/compositionStore';
 import { useSelectionStore } from '@stores/selectionStore';
 import { usePreferenceStore } from '@stores/preferenceStore';
@@ -73,8 +73,8 @@ export function TransportBar(): JSX.Element {
     setLooping(getTimelineController().isLooping());
   }, [activeTabId]);
 
-  // The live clock — the tab record above is only a ≤4Hz mirror while playing.
-  const time = useCurrentTime();
+  // No live clock subscription here: the timecode is a `LiveTimecode` leaf that
+  // writes its own text every frame, so playback does not re-render the bar.
 
   const barRef = useRef<HTMLDivElement>(null);
   const level = useTransportDemote(barRef);
@@ -213,7 +213,7 @@ export function TransportBar(): JSX.Element {
           className={styles.timecode}
           title={`Current time — minutes : seconds : frames @ ${fps} fps`}
         >
-          {framesToTimecode(time, fps, startFrame)}
+          <LiveTimecode fps={fps} startFrame={startFrame} />
           <span className={styles.timecodeTotal}>/ {framesToTimecode(duration, fps, startFrame)}</span>
         </div>
 

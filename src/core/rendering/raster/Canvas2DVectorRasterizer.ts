@@ -11,14 +11,19 @@ import { paintMaskMatte } from '@core/effects/mask';
 import { applyEffectChain, layerIsBaked } from '@core/effects/effectBake';
 import { scaleEffectLengths } from '@core/effects/effects';
 import {
+  drawPaintStack,
   fillStyleFor,
+  hasOrderedPaint,
+  paintRenderOrder,
   shapePath,
   strokeShape,
   strokeShapeProfiled,
   subpathBatches,
   traceBatch,
 } from './vectorDraw';
+import type { Stroke } from '@core/paint/stroke';
 import { paintTextInBox } from './textPaint';
+import { drawPaint, hasPaintStrokes } from '@core/paint/paintRaster';
 
 /** Cache statistics reported by the rasterizer (defined locally — not in @motion/renderer). */
 export interface RasterStats {
@@ -172,6 +177,22 @@ export class Canvas2DVectorRasterizer implements VectorRasterizer {
     }
   }
 
+  /**
+   * A cache hit without a request: refresh `cacheKey` in the LRU and count the
+   * hit, exactly as `rasterize` does when it finds the key. False when the
+   * entry has been evicted — the caller must then take the full `rasterize`
+   * path. Lets a provider that already knows its key is unchanged skip
+   * rebuilding the request (see AppTextureProvider's reuse records).
+   */
+  touch(cacheKey: string): boolean {
+    const cached = this.cache.get(cacheKey);
+    if (!cached) return false;
+    this.hits++;
+    this.cache.delete(cacheKey);
+    this.cache.set(cacheKey, cached);
+    return true;
+  }
+
   rasterize(req: RasterRequest): RasterResult {
     const { drawable, resolutionScale, padding } = req;
     const key = rasterCacheKey(drawable.contentHash, resolutionScale, padding);
@@ -303,6 +324,14 @@ export class Canvas2DVectorRasterizer implements VectorRasterizer {
     // Everything below lays out in the UNPADDED box, so shift into it once.
     ctx.translate(pad, pad);
     paintTextInBox(ctx, spec);
+    if (hasPaintStrokes(spec.paint)) {
+      // Paint over the glyphs, before the bake's mask and chain — the path
+      // raster's order. Strokes live in the box's CENTRED space.
+      ctx.save();
+      ctx.translate(spec.width / 2, spec.height / 2);
+      drawPaint(ctx, spec.paint);
+      ctx.restore();
+    }
     return finishBake();
   }
 
@@ -340,20 +369,56 @@ export class Canvas2DVectorRasterizer implements VectorRasterizer {
         // field from fill/stroke rather than folded into them.
         const alpha = batch.paint?.opacity ?? 1;
         if (alpha < 1) ctx.globalAlpha *= alpha;
+        const batchFills = [batch.paint?.fill ?? layer.fillPaint];
+        const batchStrokes: Stroke[] = batch.paint?.stroke ? [batch.paint.stroke] : strokeStack;
+        // AE Composite / per-paint blend: the ordered stack, only when a paint
+        // asks for it — see the note on the unbatched branch below.
+        if (hasOrderedPaint(batchFills, batchStrokes)) {
+          drawPaintStack(
+            ctx, paintRenderOrder(batchFills, batchStrokes), trace,
+            (f) => fillStyleFor(ctx, f, layer.fill, layer.width, layer.height),
+            (s) => {
+              if (strokeShapeProfiled(ctx, s, layer, layer.width, layer.height, batch.runs)) return;
+              strokeShape(ctx, s, trace, layer.width, layer.height);
+            },
+          );
+          ctx.restore();
+          continue;
+        }
         trace();
         ctx.fillStyle = fillStyleFor(
           ctx, batch.paint?.fill ?? layer.fillPaint, layer.fill, layer.width, layer.height,
         );
         ctx.fill();
-        for (const s of batch.paint?.stroke ? [batch.paint.stroke] : strokeStack) {
+        for (const s of batchStrokes) {
           // Taper/Wave fill a variable-width ribbon instead of stroking; the
-          // call returns false for anything it does not own (identity profile,
-          // non-path, dashed) and the ordinary stroke runs.
-          if (strokeShapeProfiled(ctx, s, layer, layer.width, layer.height)) continue;
+          // call returns false for anything it does not own (identity profile)
+          // and the ordinary stroke runs. It gets THIS batch's runs — given
+          // none it would ribbon every run once per batch, in each batch's
+          // paint.
+          if (strokeShapeProfiled(ctx, s, layer, layer.width, layer.height, batch.runs)) continue;
           strokeShape(ctx, s, trace, layer.width, layer.height);
         }
         ctx.restore();
       }
+    } else if (hasOrderedPaint(
+      layer.fillPaints && layer.fillPaints.length > 0 ? layer.fillPaints : [layer.fillPaint],
+      strokeStack,
+    )) {
+      // AE's ORDERED paint stack: a paint set to Composite Above, or with its
+      // own blend mode, interleaves fills and strokes in Contents order. Taken
+      // ONLY when a paint asks for it — the branch below draws the same order
+      // for the all-default case with a different call sequence (one trace for
+      // every fill), and keeping it is what keeps those layers byte-identical.
+      const fills = layer.fillPaints && layer.fillPaints.length > 0 ? layer.fillPaints : [layer.fillPaint];
+      drawPaintStack(
+        ctx, paintRenderOrder(fills, strokeStack), () => shapePath(ctx, layer),
+        (f) => fillStyleFor(ctx, f, layer.fill, layer.width, layer.height),
+        (s) => {
+          if (strokeShapeProfiled(ctx, s, layer, layer.width, layer.height)) return;
+          strokeShape(ctx, s, () => shapePath(ctx, layer), layer.width, layer.height);
+        },
+      );
     } else {
       shapePath(ctx, layer);
       if (layer.fillPaints && layer.fillPaints.length > 0) {
@@ -407,129 +472,11 @@ export class Canvas2DVectorRasterizer implements VectorRasterizer {
     return canvas;
   }
 
+  /** The layer's paint over its content, in the path raster's centred local
+   *  transform. The pass itself is shared with the text raster and the
+   *  image/video bakes — see `drawPaint` in paintRaster. */
   private drawPaint(ctx: CanvasRenderingContext2D, layer: any): void {
-    const strokes = layer.paint?.strokes;
-    if (!strokes || strokes.length === 0) return;
-    // Clone strokes sample the layer's content BENEATH the paint — one
-    // snapshot before any stroke lands, shared by every clone stroke, so a
-    // clone cannot recursively pick up earlier paint (matching AE's Clone
-    // Stamp sampling the source frame, and keeping the pass order-stable).
-    const cloneSource = strokes.some((s: { mode: string }) => s.mode === 'clone')
-      ? (() => {
-          const snap = document.createElement('canvas');
-          snap.width = ctx.canvas.width;
-          snap.height = ctx.canvas.height;
-          const sc = snap.getContext('2d');
-          if (!sc) return null;
-          sc.drawImage(ctx.canvas, 0, 0);
-          return snap;
-        })()
-      : null;
-    ctx.save();
-    for (const s of strokes) {
-      if (s.points.length === 0 || s.size <= 0 || s.opacity <= 0) continue;
-      if (s.mode === 'clone') {
-        this.drawCloneStroke(ctx, s, cloneSource);
-        continue;
-      }
-      ctx.globalCompositeOperation = s.mode === 'erase' ? 'destination-out' : 'source-over';
-      ctx.globalAlpha = Math.max(0, Math.min(1, s.opacity));
-      ctx.strokeStyle = s.mode === 'erase' ? '#000' : s.color;
-      ctx.lineWidth = s.size;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.filter = s.hardness < 1 ? `blur(${((1 - s.hardness) * s.size) / 3}px)` : 'none';
-      if (s.points.length === 1) {
-        const p = s.points[0]!;
-        ctx.beginPath();
-        ctx.fillStyle = s.mode === 'erase' ? '#000' : s.color;
-        ctx.arc(p.x, p.y, s.size / 2, 0, Math.PI * 2);
-        ctx.fill();
-      } else {
-        ctx.beginPath();
-        ctx.moveTo(s.points[0]!.x, s.points[0]!.y);
-        for (let i = 1; i < s.points.length; i++) ctx.lineTo(s.points[i]!.x, s.points[i]!.y);
-        ctx.stroke();
-      }
-    }
-    ctx.filter = 'none';
-    ctx.restore();
-  }
-
-  /**
-   * One clone stroke: the snapshot shifted by the clone offset, clipped to the
-   * stroke's own shape, composited at the stroke's opacity.
-   *
-   * All the canvas work happens in DEVICE space so the snapshot lines up with
-   * the target pixel-for-pixel; the LOCAL offset is carried across by mapping
-   * it through the context's current transform (linear part only — an offset
-   * is a vector, not a point).
-   */
-  private drawCloneStroke(
-    ctx: CanvasRenderingContext2D,
-    s: {
-      points: ReadonlyArray<{ x: number; y: number }>;
-      size: number; opacity: number; hardness: number;
-      cloneOffsetX?: number; cloneOffsetY?: number;
-    },
-    source: HTMLCanvasElement | null,
-  ): void {
-    if (!source) return;
-    try {
-      const m = ctx.getTransform();
-      const ox = s.cloneOffsetX ?? 0;
-      const oy = s.cloneOffsetY ?? 0;
-      const devX = m.a * ox + m.c * oy;
-      const devY = m.b * ox + m.d * oy;
-      const w = ctx.canvas.width;
-      const h = ctx.canvas.height;
-
-      // Stroke-shaped alpha mask, drawn under the SAME transform.
-      const mask = document.createElement('canvas');
-      mask.width = w;
-      mask.height = h;
-      const mc = mask.getContext('2d');
-      if (!mc) return;
-      mc.setTransform(m);
-      mc.strokeStyle = '#fff';
-      mc.fillStyle = '#fff';
-      mc.lineWidth = s.size;
-      mc.lineCap = 'round';
-      mc.lineJoin = 'round';
-      mc.filter = s.hardness < 1 ? `blur(${((1 - s.hardness) * s.size) / 3}px)` : 'none';
-      if (s.points.length === 1) {
-        mc.beginPath();
-        mc.arc(s.points[0]!.x, s.points[0]!.y, s.size / 2, 0, Math.PI * 2);
-        mc.fill();
-      } else {
-        mc.beginPath();
-        mc.moveTo(s.points[0]!.x, s.points[0]!.y);
-        for (let i = 1; i < s.points.length; i++) mc.lineTo(s.points[i]!.x, s.points[i]!.y);
-        mc.stroke();
-      }
-
-      // Shifted content, clipped to the mask. Sampling FROM p+offset and
-      // painting AT p means drawing the snapshot moved by −offset.
-      const fill = document.createElement('canvas');
-      fill.width = w;
-      fill.height = h;
-      const fc = fill.getContext('2d');
-      if (!fc) return;
-      fc.drawImage(source, -devX, -devY);
-      fc.globalCompositeOperation = 'destination-in';
-      fc.drawImage(mask, 0, 0);
-
-      ctx.save();
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.globalAlpha = Math.max(0, Math.min(1, s.opacity));
-      ctx.filter = 'none';
-      ctx.drawImage(fill, 0, 0);
-      ctx.restore();
-    } catch {
-      // A lost context or unreadable snapshot: skip the stroke rather than
-      // aborting the whole paint pass.
-    }
+    if (hasPaintStrokes(layer.paint)) drawPaint(ctx, layer.paint);
   }
 
   private drawMask(layer: any, _tier: number): HTMLCanvasElement {

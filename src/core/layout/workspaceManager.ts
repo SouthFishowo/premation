@@ -90,13 +90,15 @@ export const BUILTIN_WORKSPACES: ReadonlyArray<WorkspaceSnapshot> = [
       rightInspector: { size: 340, collapsed: false },
       bottomTimeline: { size: 260, collapsed: false },
     },
+    // The permanent sets from `panelDefs.ts` and nothing else —
+    // Default is what a fresh session looks like, so the two must agree.
     panelOrder: {
-      leftSidebar: ['scene', 'effectControls', 'assets', 'library', 'ai'],
-      rightInspector: ['properties', 'rig', 'effects', 'motion', 'presets'],
+      leftSidebar: ['scene', 'assets', 'library', 'ai'],
+      rightInspector: ['properties', 'effects', 'presets', 'marketplace', 'audio'],
       centerWorkspace: [],
       bottomTimeline: [],
     },
-    activePanelByRegion: { leftSidebar: 'scene', rightInspector: 'properties' },
+    activePanelByRegion: { leftSidebar: 'assets', rightInspector: 'properties' },
   },
   {
     id: 'motion-design',
@@ -107,13 +109,15 @@ export const BUILTIN_WORKSPACES: ReadonlyArray<WorkspaceSnapshot> = [
       rightInspector: { size: 340, collapsed: false },
       bottomTimeline: { size: 380, collapsed: false },
     },
+    // Default plus the Graph panel: shaping motion is the job, and its curve +
+    // expression editor is the one on-demand surface this layout exists for.
     panelOrder: {
-      leftSidebar: ['scene', 'effectControls', 'assets', 'library'],
-      rightInspector: ['properties', 'effects', 'motion'],
+      leftSidebar: ['assets', 'library'],
+      rightInspector: ['properties', 'motion', 'audio'],
       centerWorkspace: [],
       bottomTimeline: [],
     },
-    activePanelByRegion: { leftSidebar: 'scene', rightInspector: 'properties' },
+    activePanelByRegion: { leftSidebar: 'assets', rightInspector: 'properties' },
   },
   {
     id: 'ai-focus',
@@ -128,8 +132,8 @@ export const BUILTIN_WORKSPACES: ReadonlyArray<WorkspaceSnapshot> = [
       bottomTimeline: { size: 200, collapsed: false },
     },
     panelOrder: {
-      leftSidebar: ['ai', 'scene', 'effectControls', 'assets'],
-      rightInspector: ['properties', 'effects', 'presets'],
+      leftSidebar: ['ai', 'assets', 'library'],
+      rightInspector: ['properties', 'audio'],
       centerWorkspace: [],
       bottomTimeline: [],
     },
@@ -144,13 +148,15 @@ export const BUILTIN_WORKSPACES: ReadonlyArray<WorkspaceSnapshot> = [
       rightInspector: { size: 320, collapsed: false },
       bottomTimeline: { size: 440, collapsed: false },
     },
+    // Keyframing lives in the tall timeline; the right dock carries the three
+    // editors that answer it — values, curves + expressions, and the rig.
     panelOrder: {
-      leftSidebar: ['scene'],
-      rightInspector: ['properties', 'rig'],
+      leftSidebar: ['assets'],
+      rightInspector: ['properties', 'motion', 'rig'],
       centerWorkspace: [],
       bottomTimeline: [],
     },
-    activePanelByRegion: { leftSidebar: 'scene', rightInspector: 'properties' },
+    activePanelByRegion: { leftSidebar: 'assets', rightInspector: 'properties' },
   },
   {
     id: 'color-grading',
@@ -162,14 +168,14 @@ export const BUILTIN_WORKSPACES: ReadonlyArray<WorkspaceSnapshot> = [
       bottomTimeline: { size: 220, collapsed: false },
     },
     panelOrder: {
-      leftSidebar: ['effectControls', 'scene', 'assets'],
-      // The library stays on the right (add); Effect Controls leads on the
-      // left (tune). That is the split this workspace exists to make obvious.
-      rightInspector: ['effects', 'properties'],
+      leftSidebar: ['effectControls', 'assets'],
+      // Effect Controls leads on the left (tune); on the right Scopes leads so
+      // the result is measured, then Properties and the Effects library (add).
+      rightInspector: ['scopes', 'properties', 'effects'],
       centerWorkspace: [],
       bottomTimeline: [],
     },
-    activePanelByRegion: { leftSidebar: 'effectControls', rightInspector: 'effects' },
+    activePanelByRegion: { leftSidebar: 'effectControls', rightInspector: 'scopes' },
   },
   {
     // Grading: the viewport with Scopes docked BESIDE it — leading the right
@@ -187,12 +193,12 @@ export const BUILTIN_WORKSPACES: ReadonlyArray<WorkspaceSnapshot> = [
       bottomTimeline: { size: 220, collapsed: false },
     },
     panelOrder: {
-      leftSidebar: ['scene', 'assets', 'effectControls'],
-      rightInspector: ['scopes', 'properties', 'effects', 'swatches'],
+      leftSidebar: ['assets', 'effectControls'],
+      rightInspector: ['scopes', 'properties', 'swatches'],
       centerWorkspace: [],
       bottomTimeline: [],
     },
-    activePanelByRegion: { leftSidebar: 'scene', rightInspector: 'scopes' },
+    activePanelByRegion: { leftSidebar: 'assets', rightInspector: 'scopes' },
   },
   {
     id: 'dual-monitor-studio',
@@ -420,3 +426,37 @@ export class WorkspaceManager {
 }
 
 export const getWorkspaceManager = (): WorkspaceManager => WorkspaceManager.getInstance();
+
+/**
+ * After a layout-schema migration, re-apply the active BUILTIN workspace's
+ * panel lists — and only those.
+ *
+ * `layoutStore` drops a pre-2 persisted tab order so the new permanent sets
+ * reach existing users. For someone on Default that is exactly right. For
+ * someone who last applied Color or Animation it would silently demote their
+ * workspace to Default's panels while the Workspace menu still ticks "Color".
+ * The builtin's CURRENT lists are what they chose, so those come back.
+ *
+ * Deliberately NOT the builtin's region sizes (the migration kept the user's
+ * geometry, which is newer than the preset's) and NOT a user-saved workspace:
+ * that holds the user's own old lists, and replaying it would resurrect the
+ * permanent panels the migration exists to retire. Returns whether it applied.
+ */
+export function reconcileActiveWorkspace(): boolean {
+  let activeId: string;
+  try {
+    activeId = getSettingsManager().get<string>(ACTIVE_WORKSPACE_KEY, 'default');
+  } catch {
+    return false;
+  }
+  const manager = getWorkspaceManager();
+  const target = manager.listWorkspaces().find((w) => w.id === activeId && w.builtin);
+  if (!target?.panelOrder) return false;
+  useLayoutStore.getState().applyWorkspaceLayout({
+    name: target.name,
+    regions: {},
+    panelOrder: target.panelOrder,
+    activePanelByRegion: target.activePanelByRegion,
+  });
+  return true;
+}

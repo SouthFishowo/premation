@@ -89,8 +89,10 @@
   /* The dock rail — one icon per docked panel down a sidebar's outer edge —
      and therefore the width a sidebar collapses TO. Mirrored by
      `COLLAPSED_SIDEBAR_SIZE` in stores/layoutStore.ts; the two must agree or a
-     collapsed sidebar clips its own rail. 36 = 28 (lg control) + 4 + 4. */
-  --dock-rail-width: 36px;
+     collapsed sidebar clips its own rail. 56 fits a 28px (lg control) icon
+     over a one-line micro label such as "Properties" (2026-09-15; was 36 when
+     the rail was icons only). */
+  --dock-rail-width: 56px;
 
   /* Layout-specific (composed) */
   --space-panel-padding:    var(--space-6);

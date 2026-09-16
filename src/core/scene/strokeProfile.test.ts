@@ -31,6 +31,7 @@
 import {
   taperWidthFactorAt, waveOffsetAt, easeRamp,
   isIdentityTaper, isIdentityWave,
+  taperForLength, waveForLength, wrapPhase,
   IDENTITY_TAPER, IDENTITY_WAVE,
   type StrokeTaper, type StrokeWave,
 } from './strokeProfile';
@@ -50,11 +51,12 @@ describe('the fixtures are unclean, as the rules require', () => {
     expect(TAPER.startLength).not.toBe(TAPER.endLength);
   });
 
-  it('POSITIVE CONTROL: the ramp midpoint cannot see ease, so nothing probes it there', () => {
-    // smoothstep(0.5) === 0.5. Recorded as a fact, not a belief.
-    expect(easeRamp(0.5, 0)).toBeCloseTo(easeRamp(0.5, 1), 12);
-    // …and away from the midpoint it very much can.
-    expect(easeRamp(0.25, 0)).not.toBeCloseTo(easeRamp(0.25, 1), 3);
+  it('POSITIVE CONTROL: ease 0 is EXACTLY the straight ramp, and both signs move it', () => {
+    // Exact, not close: an uneased taper must be byte-identical to one from
+    // before eases existed, so ease 0 returns its input untouched.
+    for (const u of [0, 0.125, 0.25, 0.5, 0.9, 1]) expect(easeRamp(u, 0)).toBe(u);
+    expect(easeRamp(0.25, 1)).not.toBeCloseTo(0.25, 3);
+    expect(easeRamp(0.25, -1)).not.toBeCloseTo(0.25, 3);
   });
 });
 
@@ -125,10 +127,40 @@ describe('taper — values derived on paper, anchored to WHICH END', () => {
     expect(taperWidthFactorAt(eased, eQuarterUp)).toBeCloseTo(taperWidthFactorAt(TAPER, eQuarterUp), 9);
   });
 
-  it('ease flattens the ramp near its foot — smoothstep(0.25) = 0.15625', () => {
-    // 0.2 + 0.8·0.15625 = 0.325, derived rather than recorded from output.
+  it('POSITIVE ease is ROUND: the width swells straight out of the tip (AE)', () => {
+    // round(0.25) = √(1 − 0.75²) = √0.4375; 0.2 + 0.8·√0.4375 — derived on paper.
     const eased: StrokeTaper = { ...TAPER, startEase: 1 };
-    expect(taperWidthFactorAt(eased, TAPER.startLength * 0.25)).toBeCloseTo(0.325, 9);
+    expect(taperWidthFactorAt(eased, TAPER.startLength * 0.25)).toBeCloseTo(0.2 + 0.8 * Math.sqrt(0.4375), 9);
+    // Above the straight ramp at the foot — the direction AE's round ease takes.
+    expect(taperWidthFactorAt(eased, TAPER.startLength * 0.25)).toBeGreaterThan(taperWidthFactorAt(TAPER, TAPER.startLength * 0.25));
+  });
+
+  it('NEGATIVE ease is POINTY: the tip stays thin for longer (AE)', () => {
+    // pointy(0.25) = 0.25² = 0.0625 — derived on paper.
+    const eased: StrokeTaper = { ...TAPER, startEase: -1 };
+    expect(taperWidthFactorAt(eased, TAPER.startLength * 0.25)).toBeCloseTo(0.2 + 0.8 * 0.0625, 9);
+    expect(taperWidthFactorAt(eased, TAPER.startLength * 0.25)).toBeLessThan(taperWidthFactorAt(TAPER, TAPER.startLength * 0.25));
+  });
+
+  it('POINTY meets full width at a FINITE slope — no step where the ramp ends', () => {
+    // The first pointy curve, 1 − √(1 − u²), was vertical at u = 1: its last
+    // 0.1% of ramp covered ~4.5% of the width, which the sampled ribbon edge drew
+    // as a visible step (golden stroke-taper-ease-signs). u² has slope 2 there.
+    const h = 1e-3;
+    const slopeAtTop = (easeRamp(1, -1) - easeRamp(1 - h, -1)) / h;
+    expect(slopeAtTop).toBeLessThan(2.01);
+    expect(slopeAtTop).toBeGreaterThan(1.99);
+    // And still flat at the tip: the needle.
+    expect(easeRamp(h, -1) / h).toBeLessThan(0.01);
+  });
+
+  it('a half ease blends halfway toward its family, and eases stay within the ramp', () => {
+    const u = 0.25;
+    expect(easeRamp(u, 0.5)).toBeCloseTo(u + (Math.sqrt(0.4375) - u) * 0.5, 12);
+    for (const e of [-1, -0.5, 0.5, 1]) {
+      expect(easeRamp(0, e)).toBeCloseTo(0, 12);
+      expect(easeRamp(1, e)).toBeCloseTo(1, 12);
+    }
   });
 
   it('OVERLAPPING ramps stay continuous and never exceed full width', () => {
@@ -200,5 +232,34 @@ describe('wave — values derived on paper', () => {
     const big = waveOffsetAt({ ...WAVE, amount: 20 }, 25);
     expect(big).toBeCloseTo(2 * waveOffsetAt(WAVE, 25), 9);
     expect(waveOffsetAt(WAVE, 25)).toBeCloseTo(-waveOffsetAt(WAVE, 75), 9);
+  });
+});
+
+describe('units — AE Taper Length Units and Wave Units', () => {
+  it('a PERCENT taper is returned as the same object (byte-identity for every existing taper)', () => {
+    expect(taperForLength(TAPER, 300)).toBe(TAPER);
+  });
+
+  it('a PIXEL taper becomes fractions of THIS run, clamped at the whole path', () => {
+    const px: StrokeTaper = { ...TAPER, startLength: 50, endLength: 400, lengthUnits: 'pixels' };
+    expect(taperForLength(px, 200)).toEqual({ ...TAPER, startLength: 0.25, endLength: 1 });
+    // The same 50px on a path twice as long is half the fraction — the point of px.
+    expect(taperForLength(px, 400).startLength).toBe(0.125);
+  });
+
+  it('CYCLES become a px wavelength of run length / cycles; PIXELS pass through', () => {
+    expect(waveForLength({ ...WAVE, wavelength: 4, units: 'cycles' }, 300)).toEqual({ amount: 10, wavelength: 75, phase: 0 });
+    expect(waveForLength(WAVE, 300)).toBe(WAVE);
+    // Zero cycles is off, not a division by zero.
+    expect(isIdentityWave(waveForLength({ ...WAVE, wavelength: 0, units: 'cycles' }, 300))).toBe(true);
+  });
+
+  it('N whole cycles meet at the seam of a closed path: offset(0) = offset(length)', () => {
+    const w = waveForLength({ amount: 6, wavelength: 5, phase: 37, units: 'cycles' }, 283.5);
+    expect(waveOffsetAt(w, 0)).toBeCloseTo(waveOffsetAt(w, 283.5), 9);
+  });
+
+  it('wrapPhase folds the displayed phase into [0, 360)', () => {
+    expect([wrapPhase(370), wrapPhase(-30), wrapPhase(360), wrapPhase(0), wrapPhase(NaN)]).toEqual([10, 330, 0, 0, 0]);
   });
 });

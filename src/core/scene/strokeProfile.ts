@@ -23,40 +23,65 @@
  *
  * ## Units, which differ between the two and are easy to get wrong
  *
- *   • Taper lengths are a FRACTION OF PATH LENGTH (0..1). "Taper the first 20%"
- *     is resolution- and scale-independent, which is what makes a tapered stroke
- *     survive a resize.
- *   • Wave's wavelength is ABSOLUTE ARC LENGTH IN PX. A wave whose period
- *     scaled with the path would change its look when the shape is resized,
- *     which is not what a wave is for.
+ *   • Taper lengths are a FRACTION OF PATH LENGTH (0..1) by default. "Taper the
+ *     first 20%" is resolution- and scale-independent, which is what makes a
+ *     tapered stroke survive a resize. AE's Length Units = Pixels reads them as
+ *     arc-length px instead (`taperForLength` converts per run).
+ *   • Wave's wavelength is ABSOLUTE ARC LENGTH IN PX by default. A wave whose
+ *     period scaled with the path would change its look when the shape is
+ *     resized, which is not what a wave is for — except on a closed outline,
+ *     which is what Units = Cycles is for (`waveForLength`).
  *
  * Both are pure: no clock, no randomness, no engine access.
  */
 
+/**
+ * AE's Taper "Length Units". `percent` (absent) is the original model — the
+ * lengths are fractions of the path; `pixels` makes them arc-length px, so a
+ * taper keeps its size when the path grows (AE 17.1's second option).
+ */
+export type TaperLengthUnits = 'percent' | 'pixels';
+
 /** AE's Taper group. Widths are FRACTIONS of the stroke's own width. */
 export interface StrokeTaper {
-  /** Fraction of the path the start ramp occupies, 0..1. */
+  /** Length of the start ramp: a fraction of the path 0..1, or px when `lengthUnits` is 'pixels'. */
   startLength: number;
-  /** Fraction of the path the end ramp occupies, 0..1. */
+  /** Length of the end ramp, in the same units as `startLength`. */
   endLength: number;
   /** Width at the very start, as a fraction of stroke width (0 = a point). */
   startWidth: number;
   /** Width at the very end, as a fraction of stroke width. */
   endWidth: number;
-  /** 0 = a straight ramp, 1 = fully smoothed. */
+  /**
+   * −1..1, AE's sign convention: negative bends the ramp POINTY (concave — the
+   * width stays thin near the tip and swells late), 0 is a straight ramp,
+   * positive bends it ROUND (convex — the width swells straight out of the tip
+   * and eases into full width).
+   */
   startEase: number;
-  /** 0 = a straight ramp, 1 = fully smoothed. */
+  /** −1..1, same convention as `startEase`. */
   endEase: number;
+  /** Absent = 'percent', which every taper authored before units existed is. */
+  lengthUnits?: TaperLengthUnits;
 }
+
+/**
+ * AE's Wave "Units". `pixels` (absent) reads `wavelength` as arc-length px;
+ * `cycles` reads it as the number of whole waves along the path — the only
+ * setting under which a wave on a CLOSED path meets itself at the seam.
+ */
+export type WaveUnits = 'pixels' | 'cycles';
 
 /** AE's Wave group. `phase` is the one that animates. */
 export interface StrokeWave {
   /** Peak displacement from the centreline, in px. */
   amount: number;
-  /** Period along the path, in PX of arc length. */
+  /** Period along the path: PX of arc length, or a cycle count when `units` is 'cycles'. */
   wavelength: number;
-  /** Degrees. Advancing it travels the wave along the path. */
+  /** Degrees. Advancing it travels the wave along the path; 360 is a full turn. */
   phase: number;
+  /** Absent = 'pixels'. */
+  units?: WaveUnits;
 }
 
 export const IDENTITY_TAPER: StrokeTaper = {
@@ -92,21 +117,84 @@ export function isIdentityWave(w: StrokeWave | undefined): boolean {
 }
 
 /**
- * Bend a 0..1 ramp by an ease amount.
+ * Bend a 0..1 ramp by an ease amount, with AE's sign convention.
  *
- * `ease` 0 leaves it straight; 1 gives smoothstep, which is flat at both ends.
- * Intermediate values are a straight blend of the two, so the control is
- * monotonic in feel rather than switching curve families partway.
+ * `u` runs from the TIP (0, where the width is the taper's end width) to the
+ * top of the ramp (1, full width). `ease`:
  *
- * Derived rather than tuned: smoothstep is 3u²−2u³, its derivative is 6u(1−u),
- * which is 0 at both ends — that is exactly the "eases out of the ramp" look,
- * and it needs no magic constants.
+ *   • 0      — the straight ramp, returned exactly (not recomputed), so an
+ *              uneased taper is byte-identical to the one before eases existed;
+ *   • 1      — ROUND: a quarter circle, √(1 − (1−u)²). Vertical at the tip, so
+ *              the stroke swells straight out of its point, and flat at the top,
+ *              so it meets full width without a crease;
+ *   • −1     — POINTY: u². Flat at the tip, so the point is a long needle, and
+ *              it meets full width at a FINITE slope (2). The first version was
+ *              the mirror of round, 1 − √(1 − u²), whose slope is VERTICAL where
+ *              the ramp meets full width — the ribbon's sampled edge drew that
+ *              as a visible step in the stroke (golden stroke-taper-ease-signs);
+ *   • between — a straight blend toward whichever family the sign names, so the
+ *              control is monotonic in feel.
+ *
+ * CORRECTED 2026-09-15. This used to take 0..1 and blend toward smoothstep,
+ * which is flat at BOTH ends — neither of AE's two looks, and it made positive
+ * ease read pointy, the opposite of AE. Documents that stored a positive ease
+ * now draw round, as AE does; see the golden note in the harness scene.
+ *
+ * Circles rather than powers because both limits then have the tangent AE's
+ * shapes show — a power curve is never vertical at the tip.
  */
 export function easeRamp(u: number, ease: number): number {
   const x = u < 0 ? 0 : u > 1 ? 1 : u;
-  const e = ease < 0 ? 0 : ease > 1 ? 1 : ease;
-  const smooth = x * x * (3 - 2 * x);
-  return x + (smooth - x) * e;
+  const e = ease < -1 ? -1 : ease > 1 ? 1 : ease;
+  if (e === 0 || !Number.isFinite(e)) return x;
+  const target = e > 0
+    ? Math.sqrt(Math.max(0, 1 - (1 - x) * (1 - x)))
+    : x * x;
+  return x + (target - x) * Math.abs(e);
+}
+
+/**
+ * The taper with its lengths as FRACTIONS of a path `totalLength` px long.
+ *
+ * `taperWidthFactorAt` works in fractions; a pixel taper is converted once per
+ * run here rather than the factor function growing a second unit. Clamped to
+ * 1, because a 300px taper on a 200px path is a taper over the whole path, not
+ * one that extrapolates past its end. A percent taper is returned AS IS — the
+ * same object — so nothing about the original path changes.
+ */
+export function taperForLength(taper: StrokeTaper, totalLength: number): StrokeTaper {
+  if (taper.lengthUnits !== 'pixels') return taper;
+  const total = totalLength > 0 ? totalLength : 1;
+  const frac = (px: number): number => Math.max(0, Math.min(1, px / total));
+  return {
+    startLength: frac(taper.startLength), endLength: frac(taper.endLength),
+    startWidth: taper.startWidth, endWidth: taper.endWidth,
+    startEase: taper.startEase, endEase: taper.endEase,
+  };
+}
+
+/**
+ * The wave with its wavelength in PX for a path `totalLength` px long.
+ *
+ * `cycles` → `totalLength / cycles`, so N cycles lay exactly N whole periods
+ * along the path and a closed outline meets itself. A pixel wave is returned as
+ * is (same object), keeping the original path byte-identical.
+ */
+export function waveForLength(wave: StrokeWave, totalLength: number): StrokeWave {
+  if (wave.units !== 'cycles') return wave;
+  const cycles = wave.wavelength;
+  return {
+    amount: wave.amount,
+    wavelength: cycles > 0 && totalLength > 0 ? totalLength / cycles : 0,
+    phase: wave.phase,
+  };
+}
+
+/** Degrees folded into [0, 360) — the Phase field's display, which AE wraps. */
+export function wrapPhase(deg: number): number {
+  if (!Number.isFinite(deg)) return 0;
+  const d = deg % 360;
+  return d < 0 ? d + 360 : d;
 }
 
 /**
