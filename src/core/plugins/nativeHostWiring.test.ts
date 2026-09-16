@@ -140,6 +140,11 @@ describe('installing brings a declared module up', () => {
     });
 
     expect(pluginHost.install(nativePackage(bytes), [], { source: 'file', publisherKey: 'KEY' })).toBeNull();
+    // Hashing the binary runs on Node's thread pool, so no fixed number of
+    // ticks is guaranteed to outlast it on a loaded CI runner.
+    for (let i = 0; i < 100 && bridge.load.mock.calls.length === 0; i += 1) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     await settle();
 
     expect(bridge.stage).toHaveBeenCalledTimes(1);
