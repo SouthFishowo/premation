@@ -9,7 +9,7 @@
  * vertex for a corner (see `MaskPoint`).
  */
 
-import { ellipseMask, rectangleMask, type MaskPath, type MaskPoint } from '@core/effects/mask';
+import { ellipseMask, rectangleMask, type MaskPath, type MaskPoint, type MaskPointEditState } from '@core/effects/mask';
 
 export interface ViewFit {
   scale: number;
@@ -46,7 +46,12 @@ export function moveVertex(points: ReadonlyArray<MaskPoint>, index: number, dx: 
 
 /**
  * Put one handle of vertex `index` at (x, y). Unless `broken` (Alt in AE), the
- * opposite handle mirrors it through the vertex, keeping the curve smooth.
+ * opposite handle turns to point straight away from it, keeping the curve
+ * smooth — and keeps its OWN length, as AE does. Mirroring the length too
+ * flattened every asymmetric curve the moment one handle was touched. A
+ * retracted opposite handle has no length to keep, so it mirrors at full
+ * length (pulling handles out of a corner). `points` is the drag's START
+ * snapshot, so the kept length cannot drift over the drag.
  */
 export function moveHandle(
   points: ReadonlyArray<MaskPoint>,
@@ -58,10 +63,22 @@ export function moveHandle(
 ): MaskPoint[] {
   return points.map((p, i) => {
     if (i !== index) return p;
-    const mx = 2 * p.x - x;
-    const my = 2 * p.y - y;
-    if (which === 'out') return { ...p, outX: x, outY: y, ...(broken ? {} : { inX: mx, inY: my }) };
-    return { ...p, inX: x, inY: y, ...(broken ? {} : { outX: mx, outY: my }) };
+    const moved = which === 'out' ? { ...p, outX: x, outY: y } : { ...p, inX: x, inY: y };
+    // A pair once broken with Alt STAYS broken (the viewport's Direct
+    // Selection stores the same `broken` flag), so a later plain drag in
+    // either editor moves one handle only.
+    const stored = (p as MaskPoint & MaskPointEditState).broken === true;
+    if (broken || stored) return { ...moved, broken: true } as MaskPoint;
+    const dx = x - p.x;
+    const dy = y - p.y;
+    const len = Math.hypot(dx, dy);
+    // On the vertex the dragged handle has no direction: leave the other be.
+    if (len < 1e-9) return moved;
+    const opposite = which === 'out' ? Math.hypot(p.inX - p.x, p.inY - p.y) : Math.hypot(p.outX - p.x, p.outY - p.y);
+    const k = opposite > 1e-9 ? opposite / len : 1;
+    const mx = p.x - dx * k;
+    const my = p.y - dy * k;
+    return which === 'out' ? { ...moved, inX: mx, inY: my } : { ...moved, outX: mx, outY: my };
   });
 }
 

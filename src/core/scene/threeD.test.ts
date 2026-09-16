@@ -10,7 +10,14 @@ function node(props: Record<string, unknown>): SceneNode {
 }
 
 describe('threeD helpers', () => {
-  const ZERO = { z: 0, rotationX: 0, rotationY: 0, orientationX: 0, orientationY: 0, orientationZ: 0, anchorZ: 0, extrusionDepth: 0, bevelDepth: 0, bevelStyle: 'angular' };
+  // Hole Bevel Depth defaults to 100 % (holes bevel like the rim), not 0.
+  const ZERO = { z: 0, rotationX: 0, rotationY: 0, orientationX: 0, orientationY: 0, orientationZ: 0, anchorZ: 0, extrusionDepth: 0, bevelDepth: 0, bevelStyle: 'angular', holeBevelDepth: 100 };
+
+  it('reads Hole Bevel Depth back, clamped to 0–100 %', () => {
+    expect(readNode3D(node({ z: 0, holeBevelDepth: 40 })).holeBevelDepth).toBe(40);
+    expect(readNode3D(node({ z: 0, holeBevelDepth: 250 })).holeBevelDepth).toBe(100);
+    expect(readNode3D(node({ z: 0, holeBevelDepth: -5 })).holeBevelDepth).toBe(0);
+  });
 
   it('a plain 2D layer is not 3D and reads zeros', () => {
     const n = node({ x: 10, y: 20, rotation: 0 });

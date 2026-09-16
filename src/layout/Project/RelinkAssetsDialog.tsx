@@ -35,6 +35,10 @@ export function RelinkBody({
       if (relinkLiveAsset(ref.nodeId, url)) {
         setLeft((prev) => prev.filter((m) => m.nodeId !== ref.nodeId));
         bumpScene();
+      } else {
+        // The node was not relinked (it vanished, or has no src slot), so no
+        // layer will ever load this URL — release the file it pins.
+        URL.revokeObjectURL(url);
       }
     });
     input.click();

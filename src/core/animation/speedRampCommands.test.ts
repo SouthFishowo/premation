@@ -1,12 +1,14 @@
 /**
  * The command layer's decisions, against the real animation engine.
  *
- * `speedRamp.test.ts` proves the curve is the correct integral. What is tested
- * here is what the command does with it: that ramps COMPOSE (a second ramp
- * starts from the speed the first one left behind, rather than snapping back
- * to 100%), that the footage continues from the frame on screen instead of
- * jumping to the head of the source, and that it refuses layers where a
- * time-remap track would be silently inert.
+ * `retime.test.ts` proves the speed integral is exact. What is tested here is
+ * what the command does with it: that ramps COMPOSE (a second ramp starts from
+ * the speed the first one left behind, rather than snapping back to 100%),
+ * that the footage continues from the frame on screen instead of jumping, and
+ * that it refuses layers where a retime would be silently inert.
+ *
+ * Ramps write Speed % points. A layer already keyed in Frame Number keeps
+ * ramping its remap curve — that path is pinned at the bottom.
  */
 
 import { defaultAnimation } from '@motion/animation';
@@ -16,6 +18,7 @@ import { useProjectStore } from '@stores/projectStore';
 import { useCompositionStore } from '@stores/compositionStore';
 import { setCommandSystem, CommandSystem } from '@core/commands/CommandSystem';
 import { buildSpeedRampCommands, rampTargets } from './speedRampCommands';
+import { SPEED_PROP, readRetimeMode, retimedChainTime } from './retime';
 
 /** `runAnimEdit` records an undo entry, so the command system has to exist. */
 function bootCommandSystem(): void {
@@ -59,12 +62,15 @@ function addNode(id: string, kind: string, precomp = false): void {
 const command = (suffix: string) =>
   buildSpeedRampCommands().find((c) => String(c.id) === `time.speedRamp.${suffix}`)!;
 
-/** Speed the remap curve is running at, as its slope. */
+/** Source position the renderer resolves for the precomp (no bar: identity clip map). */
+function sourceAt(t: number): number {
+  return retimedChainTime(defaultAnimation, PRECOMP, t, null) ?? t;
+}
+
+/** Speed the layer plays at, as the slope of its source position. */
 function speedAt(t: number): number {
   const dt = 1 / 240;
-  const a = defaultAnimation.sample(PRECOMP, 'timeRemap', t) ?? 0;
-  const b = defaultAnimation.sample(PRECOMP, 'timeRemap', t + dt) ?? 0;
-  return (b - a) / dt;
+  return (sourceAt(t + dt) - sourceAt(t)) / dt;
 }
 
 function setPlayhead(t: number): void {
@@ -82,6 +88,7 @@ beforeEach(() => {
   addNode(SOLID, 'solid');
   addNode(VIDEO, 'video');
   defaultAnimation.setKeyframes(PRECOMP, 'timeRemap', []);
+  defaultAnimation.setKeyframes(PRECOMP, SPEED_PROP, []);
   useCompositionStore.setState({ durationSeconds: 10 } as never);
   useSelectionStore.setState({ ids: [PRECOMP] });
   setPlayhead(0);
@@ -95,15 +102,15 @@ describe('rampTargets', () => {
   it('accepts a video layer — the main thing anyone ramps', () => {
     // The regression. Ramps were restricted to precomps on the belief that a
     // footage layer had no self-remap hook; the general layer path samples
-    // `timeRemap` for every node, and `speedRampRender.test.ts` shows a video
+    // the retime for every node, and `speedRampRender.test.ts` shows a video
     // layer's `sourceTime` following the curve.
     useSelectionStore.setState({ ids: [VIDEO] });
     expect(rampTargets()).toEqual([VIDEO]);
     expect(command('quarter').enabled!()).toBe(true);
   });
 
-  it('refuses a shape, where a remap track really would be inert', () => {
-    // `timeRemap` feeds `sourceTime` and nothing else — it does not move the
+  it('refuses a shape, where a retime really would be inert', () => {
+    // A retime feeds `sourceTime` and nothing else — it does not move the
     // layer's own transform keyframes. A solid has no source to retime, so
     // nothing would read the value.
     useSelectionStore.setState({ ids: [SOLID] });
@@ -118,6 +125,12 @@ describe('rampTargets', () => {
 });
 
 describe('speed ramp commands', () => {
+  it('writes Speed % points, not a remap curve', () => {
+    command('quarter').execute({} as never);
+    expect(readRetimeMode(defaultAnimation, PRECOMP)).toBe('speed');
+    expect(defaultAnimation.isAnimated(PRECOMP, 'timeRemap')).toBe(false);
+  });
+
   it('eases from full speed to a quarter and holds it', () => {
     command('quarter').execute({} as never);
 
@@ -128,9 +141,8 @@ describe('speed ramp commands', () => {
   });
 
   it('composes: a second ramp starts from the speed the first left', () => {
-    // The property that makes ramps usable in sequence. Reading the speed from
-    // the curve's slope rather than assuming 100% is what buys it — otherwise
-    // ramping back up would start with a jump from 25% to 100%.
+    // The property that makes ramps usable in sequence — otherwise ramping
+    // back up would start with a jump from 25% to 100%.
     command('quarter').execute({} as never);
     setPlayhead(4);
     command('normal').execute({} as never);
@@ -139,18 +151,18 @@ describe('speed ramp commands', () => {
     expect(speedAt(6)).toBeCloseTo(1, 1);
   });
 
-  it('continues from the frame on screen rather than the head of the source', () => {
+  it('continues from the frame on screen rather than jumping', () => {
     setPlayhead(3);
+    const before = sourceAt(3);
     command('half').execute({} as never);
-    // Identity before any ramp: source 3s is showing at comp 3s.
-    expect(defaultAnimation.sample(PRECOMP, 'timeRemap', 3)).toBeCloseTo(3, 5);
+    expect(sourceAt(3)).toBeCloseTo(before, 5);
   });
 
   it('never runs the footage backwards through a deceleration', () => {
     command('quarter').execute({} as never);
     let prev = -Infinity;
     for (let t = 0; t <= 6; t += 0.02) {
-      const v = defaultAnimation.sample(PRECOMP, 'timeRemap', t) ?? 0;
+      const v = sourceAt(t);
       expect(v).toBeGreaterThanOrEqual(prev - 1e-6);
       prev = v;
     }
@@ -158,8 +170,7 @@ describe('speed ramp commands', () => {
 
   it('holds the frame when ramped to a freeze', () => {
     command('freeze').execute({} as never);
-    const held = defaultAnimation.sample(PRECOMP, 'timeRemap', 2) ?? 0;
-    expect(defaultAnimation.sample(PRECOMP, 'timeRemap', 8)).toBeCloseTo(held, 4);
+    expect(sourceAt(8)).toBeCloseTo(sourceAt(2), 4);
   });
 
   it('speeds up as well as down', () => {
@@ -167,17 +178,25 @@ describe('speed ramp commands', () => {
     expect(speedAt(2)).toBeCloseTo(2, 1);
   });
 
-  it('leaves keyframes before the playhead alone', () => {
+  it('leaves the curve before the playhead alone', () => {
     command('quarter').execute({} as never);
-    const early = defaultAnimation.sample(PRECOMP, 'timeRemap', 0.25) ?? 0;
+    const early = sourceAt(0.25);
     setPlayhead(5);
     command('normal').execute({} as never);
-    expect(defaultAnimation.sample(PRECOMP, 'timeRemap', 0.25)).toBeCloseTo(early, 5);
+    expect(sourceAt(0.25)).toBeCloseTo(early, 5);
   });
 
   it('does nothing when there is no room left for a ramp', () => {
     setPlayhead(9.9);
     command('quarter').execute({} as never);
-    expect(defaultAnimation.isAnimated(PRECOMP, 'timeRemap')).toBe(false);
+    expect(readRetimeMode(defaultAnimation, PRECOMP)).toBe('normal');
+  });
+
+  it('keeps ramping the remap curve of a layer already in Frame Number mode', () => {
+    defaultAnimation.setKeyframe(PRECOMP, 'timeRemap', 0, 0, 'linear');
+    defaultAnimation.setKeyframe(PRECOMP, 'timeRemap', 10, 10, 'linear');
+    command('quarter').execute({} as never);
+    expect(readRetimeMode(defaultAnimation, PRECOMP)).toBe('frames');
+    expect(speedAt(5)).toBeCloseTo(0.25, 2);
   });
 });

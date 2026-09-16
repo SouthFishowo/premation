@@ -118,6 +118,16 @@ export type TextureSource = (
       format?: TextureFormat;
     }
   | { type: 'canvas'; canvas: HTMLCanvasElement | OffscreenCanvas }
+  /**
+   * A decoded WebCodecs frame, uploaded straight from the decoder's buffer
+   * with no CPU-side copy. The texture is sized at the frame's DISPLAY size
+   * (what `drawImage` renders). Colour conversion is the browser's default
+   * YUV → sRGB on both backends — the same conversion a 2D canvas `drawImage`
+   * applies — no flip, and premultiply is moot (decoded video is opaque).
+   * The caller keeps ownership and closes the frame; both backends take what
+   * they need during the call.
+   */
+  | { type: 'videoFrame'; frame: VideoFrame }
 ) & {
   /**
    * True when this source's bytes are ALREADY premultiplied but the source does

@@ -355,6 +355,35 @@ function meshPathScenes(): Scene[] {
       }));
       light(graph);
     }, 0.04), // Arial outlines + bevel AA drift ~3.5% across OS/SwiftShader; 2.5% is too tight.
+    scene('ext-mesh-text-styled', 'Lit extruded TEXT carrying layer styles (drop shadow + stroke + bevel & emboss) — the styles must not cost the text its solid body.', (graph) => {
+      graph.addNode(node('t', {
+        kind: 'text',
+        position: CENTER,
+        transform: {
+          extrusionDepth: 50, bevelDepth: 6, bevelStyle: 'convex',
+          rotationY: 30, rotationX: -14, z: 0, acceptsLights: true,
+        },
+        components: [
+          {
+            id: 't_text',
+            type: 'Text',
+            props: { content: 'Text', fontSize: 110, fontWeight: 700, opacity: 100, fontFamily: 'Arial', align: 'center', fill: '#4f8fd6' },
+          },
+          {
+            id: 't_fx',
+            type: 'fx',
+            props: {
+              layerStyles: {
+                dropShadow: { enabled: true, color: '#000000', opacity: 0.5, distance: 8, angle: 90, blur: 8, spread: 0 },
+                stroke: { enabled: true, color: '#ffffff', opacity: 1, size: 3, position: 'outside' },
+                bevel: { enabled: true, size: 6, depth: 100, direction: 'up', angle: 135, altitude: 45, highlightColor: '#ffffff', highlightOpacity: 0.75, shadowColor: '#000000', shadowOpacity: 0.75 },
+              },
+            },
+          },
+        ],
+      }));
+      light(graph);
+    }, 0.04),
     scene('ext-mesh-gradient-walls', 'A gradient-filled extruded card, yawed so the WALL is in view — the ramp must continue onto it, not stop at the front edge.', (graph) => {
       graph.addNode(node('card', {
         kind: 'shape',

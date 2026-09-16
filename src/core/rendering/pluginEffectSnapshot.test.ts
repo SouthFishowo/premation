@@ -26,6 +26,7 @@ import {
 } from '@core/plugins/pluginEffects';
 import type { EffectContribution } from '@core/plugins/effectSchema';
 import { UNIFORM_HEADER_BYTES } from '@core/plugins/effectSchema';
+import { setPluginHostFrame } from './pluginHostFrame';
 import { useUIStore } from '@stores/uiStore';
 import type { RenderLayer } from './RenderBackend';
 
@@ -392,5 +393,215 @@ describe('a multi-pass effect reaching the scene', () => {
     // The regression that would matter most, since every published effect is
     // one pass: the chain loop must not turn them into two draws.
     expect(spatialOf(layerWith(ID))).toHaveLength(1);
+  });
+});
+
+/*
+ * ── Round C2: host inputs, identity, per-side expand, four layer inputs ──────
+ *
+ * Everything below is about what the SCENE ENTRY carries. The renderer draws
+ * what it is handed and knows nothing about plugins, so a field missing here is
+ * a capability that exists in the manifest and nowhere else — which is the exact
+ * shape of gap this round was opened to close.
+ */
+
+const HOST_PLUGIN = 'studio.acme.host';
+
+/** Register one contribution as the only effect, compiled and ready. */
+async function only(contributions: EffectContribution[], compiler: EffectCompiler = ok): Promise<void> {
+  resetEffectsForTests();
+  registerEffects(HOST_PLUGIN, 'Acme', contributions);
+  for (const c of contributions) await compileEffect(`${HOST_PLUGIN}.${c.id}`, compiler);
+}
+
+describe('host-filled inputs reach the scene', () => {
+  const clock: EffectContribution = {
+    id: 'clock',
+    label: 'Clock',
+    shader: '@fragment fn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(params.time); }',
+    params: {},
+  };
+
+  beforeEach(async () => { await only([clock]); });
+  afterEach(() => setPluginHostFrame(null));
+
+  it('carries the frame the walk was started with', () => {
+    setPluginHostFrame({ compWidth: 1920, compHeight: 1080, compTime: 2, fps: 24 });
+    const layer = {
+      width: 640, height: 360,
+      effects: [{ type: `${HOST_PLUGIN}.clock`, params: {} }],
+    } as unknown as RenderLayer;
+    const [entry] = extractSpatialEffects(layer) as Array<{ hostInputs?: Record<string, number> }>;
+
+    expect(entry!.hostInputs).toMatchObject({
+      compWidth: 1920, compHeight: 1080, compTime: 2, fps: 24,
+      layerWidth: 640, layerHeight: 360, frame: 48,
+    });
+  });
+
+  it('prefers the LAYER own time where it has one', () => {
+    // A retimed layer runs its own clock; an effect animating with its layer
+    // has to follow that one or it drifts against the picture it is drawn on.
+    setPluginHostFrame({ compWidth: 100, compHeight: 100, compTime: 3, fps: 30 });
+    const layer = {
+      width: 10, height: 10, sourceTime: 0.5,
+      effects: [{ type: `${HOST_PLUGIN}.clock`, params: {} }],
+    } as unknown as RenderLayer;
+    const [entry] = extractSpatialEffects(layer) as Array<{ hostInputs?: { time: number; compTime: number } }>;
+
+    expect(entry!.hostInputs!.time).toBe(0.5);
+    expect(entry!.hostInputs!.compTime).toBe(3);
+  });
+
+  it('gives an effect instance a seed that does not move between frames', () => {
+    setPluginHostFrame({ compWidth: 100, compHeight: 100, compTime: 0, fps: 30 });
+    const layer = {
+      width: 10, height: 10,
+      effects: [{ id: 'fx_7', type: `${HOST_PLUGIN}.clock`, params: {} }],
+    } as unknown as RenderLayer;
+    const first = (extractSpatialEffects(layer) as Array<{ hostInputs?: { seed: number } }>)[0]!.hostInputs!.seed;
+    setPluginHostFrame({ compWidth: 100, compHeight: 100, compTime: 9, fps: 30 });
+    const later = (extractSpatialEffects(layer) as Array<{ hostInputs?: { seed: number } }>)[0]!.hostInputs!.seed;
+
+    // A noise field reseeded per frame boils; one seeded from the clock is a
+    // different picture in preview and in export.
+    expect(later).toBe(first);
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(first).toBeLessThan(1);
+  });
+
+  it('falls back to zeros outside a scene walk rather than to stale values', () => {
+    setPluginHostFrame(null);
+    const layer = {
+      width: 10, height: 10,
+      effects: [{ type: `${HOST_PLUGIN}.clock`, params: {} }],
+    } as unknown as RenderLayer;
+    const [entry] = extractSpatialEffects(layer) as Array<{ hostInputs?: { compWidth: number; downsample: number } }>;
+
+    expect(entry!.hostInputs!.compWidth).toBe(0);
+    // 1, not 0, for the scale factors: a kernel dividing by either gets the
+    // identity rather than an infinity.
+    expect(entry!.hostInputs!.downsample).toBe(1);
+  });
+});
+
+describe('an effect that declares when it does nothing', () => {
+  const FS = '@fragment fn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(params.amount); }';
+  const idle: EffectContribution = {
+    id: 'idle',
+    label: 'Idle',
+    shader: FS,
+    params: { amount: { type: 'number', default: 50 } },
+    identity: [{ param: 'amount', equals: 0 }],
+  };
+
+  beforeEach(async () => { await only([idle]); });
+
+  it('emits no pass at all at the identity value', () => {
+    // An effect stack is full of effects sitting at zero, each otherwise
+    // costing a full-screen pass, a target and a pipeline bind every frame.
+    expect(extractSpatialEffects(layerWith(`${HOST_PLUGIN}.idle`, { amount: 0 }))).toBeUndefined();
+  });
+
+  it('draws at every other value', () => {
+    expect(spatialOf(layerWith(`${HOST_PLUGIN}.idle`, { amount: 1 }))).toHaveLength(1);
+  });
+
+  it('reads the DECLARED DEFAULT for a parameter nobody has touched', () => {
+    // An untouched effect is at its default, not at zero — treating absence as
+    // zero would skip the first frame of every effect whose default is not the
+    // identity value.
+    expect(spatialOf(layerWith(`${HOST_PLUGIN}.idle`, {}))).toHaveLength(1);
+  });
+
+  it('skips the WHOLE chain, never half of it', async () => {
+    await only([{
+      id: 'idle',
+      label: 'Idle',
+      shader: FS,
+      params: { amount: { type: 'number', default: 1 } },
+      identity: [{ param: 'amount', equals: 0 }],
+      passes: [
+        { name: 'a', wgsl: FS, scale: 1, reads: 'previous' },
+        { name: 'b', wgsl: FS, scale: 1, reads: 'previous' },
+      ],
+    }]);
+    // Half a skipped chain would leave the layer holding an intermediate step.
+    expect(extractSpatialEffects(layerWith(`${HOST_PLUGIN}.idle`, { amount: 0 }))).toBeUndefined();
+  });
+});
+
+describe('per-side expand', () => {
+  const shadow: EffectContribution = {
+    id: 'shade',
+    label: 'Shade',
+    shader: '@fragment fn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(params.distance); }',
+    params: { distance: { type: 'number', default: 10 } },
+    expand: { right: { param: 'distance' }, bottom: { param: 'distance' } },
+  };
+
+  beforeEach(async () => { await only([shadow]); });
+
+  it('reaches on the sides it declared and nowhere else', () => {
+    // A drop shadow offset down-right reaches on two sides; budgeting its
+    // offset on all four enlarges every 3D layer's buffer for margin nothing
+    // draws into.
+    const [entry] = spatialOf(layerWith(`${HOST_PLUGIN}.shade`, { distance: 12 })) as Array<{
+      expandPx?: { left: number; top: number; right: number; bottom: number };
+    }>;
+    expect(entry!.expandPx).toEqual({ left: 0, top: 0, right: 12, bottom: 12 });
+  });
+
+  it('is absent for the majority of effects, which declare none', async () => {
+    await only([{ ...shadow, expand: undefined }]);
+    const [entry] = spatialOf(layerWith(`${HOST_PLUGIN}.shade`, { distance: 12 })) as Array<{ expandPx?: unknown }>;
+    expect(entry!.expandPx).toBeUndefined();
+  });
+});
+
+describe('four layer inputs', () => {
+  const composite: EffectContribution = {
+    id: 'mix',
+    label: 'Mix',
+    shader: '@fragment fn fs(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> { return textureSample(src, samp, uv); }',
+    params: {
+      a: { type: 'layer', default: '' },
+      b: { type: 'layer', default: '' },
+      c: { type: 'layer', default: '' },
+    },
+  };
+
+  beforeEach(async () => { await only([composite]); });
+
+  it('carries the first as `mapLayerId` and the rest positionally', () => {
+    const [entry] = spatialOf(layerWith(`${HOST_PLUGIN}.mix`, { a: 'n_1', b: 'n_2', c: 'n_3' })) as Array<{
+      mapLayerId?: string; extraLayerIds?: readonly string[]; readsMap?: boolean;
+    }>;
+    // The first keeps the name and the binding every published effect already
+    // used; only the inputs that did not exist arrive under a new one.
+    expect(entry!.mapLayerId).toBe('n_1');
+    expect(entry!.extraLayerIds).toEqual(['n_2', 'n_3']);
+    expect(entry!.readsMap).toBe(true);
+  });
+
+  it('keeps a slot for an input the user has not chosen', () => {
+    // The material declares one binding per DECLARED parameter, so a shorter
+    // list would leave a declared binding empty — an invalid pipeline, which
+    // is a dead viewport rather than a missing input.
+    const [entry] = spatialOf(layerWith(`${HOST_PLUGIN}.mix`, { a: 'n_1' })) as Array<{
+      extraLayerIds?: readonly string[];
+    }>;
+    expect(entry!.extraLayerIds).toEqual(['', '']);
+  });
+
+  it('emits nothing new for a single-input effect', async () => {
+    // The shape every published effect has: one input, and a scene entry
+    // byte-identical to what it produced before four inputs existed.
+    await only([{ ...composite, params: { a: { type: 'layer', default: '' } } }]);
+    const [entry] = spatialOf(layerWith(`${HOST_PLUGIN}.mix`, { a: 'n_1' })) as Array<{
+      extraLayerIds?: unknown; mapLayerId?: string;
+    }>;
+    expect(entry!.mapLayerId).toBe('n_1');
+    expect(entry!.extraLayerIds).toBeUndefined();
   });
 });

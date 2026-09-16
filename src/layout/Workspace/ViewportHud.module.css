@@ -33,6 +33,26 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* The stages disclosure — the HUD's only clickable element, so it alone opts
+   back into pointer events. Spans both columns. */
+.toggle {
+  grid-column: 1 / -1;
+  justify-self: start;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  opacity: 0.6;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.toggle:hover,
+.toggle:focus-visible {
+  opacity: 1;
+}
+
 /* A number that has crossed into "this is why it feels slow" territory. */
 .warn {
   color: var(--color-warning);

@@ -22,6 +22,41 @@ import type { NodeId, OverlayHandle, WorkspaceNode } from '../ports';
 import type { Vec2 } from '../math/Vec2';
 import type { BezierPoint } from '../math/BezierPoint';
 import { corner as bezierCorner } from '../math/BezierPoint';
+import {
+  deleteVertex,
+  deleteVertices,
+  bendSegment,
+  rotoBezierPoints,
+  transformVertices,
+  reversePath,
+  type PathTopologyEdit,
+} from '../math/pathTopology';
+import type { Corners } from '../math/OrientedBox';
+import {
+  beginVertexGesture,
+  commitOutline,
+  convertClick,
+  convertDrag,
+  finishPoints,
+  hasHandles,
+  insertVertex,
+  mapBezierPoint,
+  moveGestureVertex,
+  outlineKey,
+  outlineOf,
+  pickSegment,
+  pickVertex,
+  placeHandle,
+  sameOutline,
+  selectedOutlines,
+  snapVertex,
+  withBroken,
+  type Outline,
+  type OutlineId,
+  type SegmentHit,
+  type VertexGesture,
+} from './pathEdit';
+import { AddVertexTool, ConvertVertexTool, DeleteVertexTool, MaskFeatherTool } from './pathTools';
 import { commands } from '../commands/WorkspaceCommands';
 import * as Mat from '../math/Mat2D';
 import { layerBoxPoints, resolveAnchorSnap } from '../snap/anchorSnap';
@@ -1112,7 +1147,7 @@ export class PenTool implements Tool {
   readonly id: string = 'pen';
   readonly label: string = 'Pen';
   readonly shortcut: string = 'g';
-  readonly cursor = 'pen' as const;
+  readonly cursor = 'pen' as CursorType;
 
   /**
    * When true the finished path becomes a mask on the selected layer instead of
@@ -1125,8 +1160,44 @@ export class PenTool implements Tool {
   private points: BezierPoint[] = [];
   /** Preview: mouse position for rubber-band display. */
   private mouse: Vec2 | null = null;
-  /** Drag state: we're pulling the tangent for the most recent point. */
+  /** Drag state: we're pulling the tangents of vertex `dragIndex`. */
   private draggingHandle = false;
+  private dragIndex = -1;
+  /**
+   * The press landed on the first vertex: the outline closes on RELEASE, not on
+   * press, so a drag in between can still shape the closing vertex's handles —
+   * AE's click-and-drag on the start point.
+   */
+  private closing = false;
+  /**
+   * Space is held while dragging a new vertex: the drag REPOSITIONS the vertex
+   * (handles and all) instead of pulling its handles — AE's Space-while-drawing.
+   */
+  private repositioning = false;
+  private lastDragWorld: Vec2 | null = null;
+  /**
+   * Continuing an existing OPEN path (a click on one of its end vertices). The
+   * draft is seeded with that outline in world space, oriented so the clicked
+   * end is the draft's last vertex; `base` is how many of the draft's vertices
+   * were already there.
+   */
+  private continuing: { id: OutlineId; atStart: boolean; base: number; matrix: Mat.Mat2D; moved: boolean } | null = null;
+  /** The continue press itself: a drag pulls only the end vertex's OUTGOING handle. */
+  private continuePress = false;
+  /**
+   * A gesture on an existing outline, with no draft in progress — the Pen's
+   * auto-behaviours: over a segment it is Add Vertex (the new vertex follows a
+   * drag), over a vertex it is Convert Vertex (click toggles, drag redraws
+   * handles), and with Ctrl/Cmd it is a temporary Direct Selection.
+   */
+  private gesture: { kind: 'add' | 'convert'; g: VertexGesture } | { kind: 'select' } | null = null;
+  private readonly directSelect = new DirectSelectionTool();
+  private hoverCursor: { type: CursorType; pop: () => void } | null = null;
+  private hud: ToolHud | null = null;
+
+  activate(_ctx: ToolContext): void {
+    this.points = [];
+  }
 
   deactivate(ctx: ToolContext): void {
     // Switching tools mid-draw should KEEP the path, not silently discard it —
@@ -1134,6 +1205,20 @@ export class PenTool implements Tool {
     this.finish(ctx);
     this.mouse = null;
     this.draggingHandle = false;
+    this.closing = false;
+    this.repositioning = false;
+    this.gesture = null;
+    this.setHoverCursor(ctx, null);
+  }
+
+  /**
+   * Enough outline to close. Three corners make the smallest real polygon; two
+   * vertices are allowed once either carries a handle, because two curved
+   * segments already enclose an area (a lens) — AE closes those too.
+   */
+  private canClose(): boolean {
+    const n = this.points.length;
+    return n >= 3 || (n === 2 && this.points.some(hasHandles));
   }
 
   /** Expose pending bezier path so the Workspace can draw a live preview. */
@@ -1146,8 +1231,66 @@ export class PenTool implements Tool {
     return this.mouse;
   }
 
-  onPointerMove(e: ToolPointerEvent, _ctx: ToolContext): void {
+  /** The vertices of the selected outlines, so there is something to add to, convert or continue. */
+  getHandles(ctx: ToolContext): readonly OverlayHandle[] {
+    if (this.points.length > 0) return [];
+    if (this.gesture?.kind === 'select') return this.directSelect.getHandles(ctx);
+    const out: OverlayHandle[] = [];
+    for (const o of selectedOutlines(ctx)) {
+      o.points.forEach((p, i) => {
+        out.push({
+          id: `penv:${outlineKey(o)}:${i}`,
+          position: Mat.apply(o.matrix, { x: p.x, y: p.y }),
+          kind: 'point',
+          ...(i === 0 && o.points.length > 1 ? { first: true } : {}),
+        });
+      });
+    }
+    return out;
+  }
+
+  getHud(_ctx: ToolContext): ToolHud | null {
+    return this.hud;
+  }
+
+  /** What a press here would do to an existing outline (no draft in progress). */
+  private targetAt(ctx: ToolContext, world: Vec2, alt: boolean):
+    | { kind: 'continue' | 'convert'; outline: Outline; index: number }
+    | { kind: 'add'; hit: SegmentHit }
+    | null {
+    if (this.points.length > 0 || !ctx.camera) return null;
+    const outlines = selectedOutlines(ctx);
+    if (outlines.length === 0) return null;
+    const v = pickVertex(ctx, world, outlines);
+    if (v) {
+      const n = v.outline.points.length;
+      const isEnd = !v.outline.closed && n >= 2 && (v.index === 0 || v.index === n - 1);
+      return { kind: isEnd && !alt ? 'continue' : 'convert', outline: v.outline, index: v.index };
+    }
+    const hit = pickSegment(ctx, world, outlines);
+    return hit ? { kind: 'add', hit } : null;
+  }
+
+  /** Swap the transient cursor that says what a press will do (null = the pen's own). */
+  private setHoverCursor(ctx: ToolContext, type: CursorType | null): void {
+    if ((this.hoverCursor?.type ?? null) === type) return;
+    this.hoverCursor?.pop();
+    this.hoverCursor = null;
+    if (type && ctx.cursor?.pushOverride) this.hoverCursor = { type, pop: ctx.cursor.pushOverride(type) };
+  }
+
+  onPointerMove(e: ToolPointerEvent, ctx: ToolContext): void {
     this.mouse = e.world;
+    if (this.draggingHandle || this.gesture) return;
+    if (this.points.length > 0) {
+      const first = this.points[0];
+      const near = first && this.canClose() && ctx.camera
+        && Math.hypot(e.world.x - first.x, e.world.y - first.y) <= ctx.camera.screenDistanceToWorld(HANDLE_PICK_RADIUS);
+      this.setHoverCursor(ctx, near ? 'pen-close' : null);
+      return;
+    }
+    const t = this.targetAt(ctx, e.world, e.modifiers.alt);
+    this.setHoverCursor(ctx, t ? (t.kind === 'add' ? 'pen-add' : t.kind === 'continue' ? 'pen-continue' : 'pen-convert') : null);
   }
 
   onPointerLeave(_e: ToolPointerEvent, ctx: ToolContext): void {
@@ -1156,57 +1299,209 @@ export class PenTool implements Tool {
   }
 
   onPointerDown(e: ToolPointerEvent, ctx: ToolContext): void {
-    // Close by clicking near the first point (AE pen), once we have enough
-    // vertices for a real polygon. Threshold is in world px — small enough
-    // not to steal intentional nearby clicks, large enough to hit easily.
-    if (this.maskMode && this.points.length >= 3) {
-      const first = this.points[0]!;
-      const dx = e.world.x - first.x;
-      const dy = e.world.y - first.y;
-      if (dx * dx + dy * dy <= 10 * 10) {
-        this.finish(ctx);
+    this.hud = null;
+    this.lastDragWorld = e.world;
+    if (this.points.length === 0) {
+      const target = this.targetAt(ctx, e.world, e.modifiers.alt);
+      if (e.modifiers.mod && target?.kind !== 'continue') {
+        // Ctrl/Cmd: a temporary Direct Selection for this one gesture (AE).
+        this.gesture = { kind: 'select' };
+        this.directSelect.onPointerDown(e, ctx);
+        return;
+      }
+      if (target?.kind === 'continue') {
+        this.startContinue(target.outline, target.index);
+        return;
+      }
+      if (target?.kind === 'convert') {
+        this.gesture = { kind: 'convert', g: beginVertexGesture(target.outline, target.index, e.world) };
+        return;
+      }
+      if (target?.kind === 'add') {
+        const done = insertVertex(ctx, target.hit);
+        if (done) {
+          const g = beginVertexGesture({ ...target.hit.outline, points: done.points }, done.index, e.world);
+          this.gesture = { kind: 'add', g };
+          ctx.requestRender();
+          return;
+        }
+      }
+    }
+    // Close by clicking the first vertex (AE pen) — in BOTH modes. This used to
+    // be mask-only, so a Pen shape could never be closed and was always an
+    // open stroke. The radius is in SCREEN px, like every other grab radius: a
+    // world-px radius shrank to nothing zoomed out and swallowed nearby clicks
+    // zoomed in.
+    const first = this.points[0];
+    if (first && this.canClose()) {
+      const r = ctx.camera.screenDistanceToWorld(HANDLE_PICK_RADIUS);
+      if (Math.hypot(e.world.x - first.x, e.world.y - first.y) <= r) {
+        this.closing = true;
+        this.dragIndex = 0;
+        this.draggingHandle = true;
         return;
       }
     }
+    // Shift-click constrains the new segment to 15° steps from the previous
+    // vertex, keeping the clicked distance. Otherwise the vertex snaps (to the
+    // draft's own vertices, then the scene's features) when snapping is on.
+    const prev = this.points[this.points.length - 1];
+    let at = e.modifiers.shift && prev ? constrainAngle15(prev, e.world) : e.world;
+    if (!e.modifiers.shift) {
+      const snapped = snapVertex(ctx, at, { own: this.points.map((p) => ({ x: p.x, y: p.y })) });
+      at = snapped.point;
+      ctx.setSnapLines?.(snapped.lines);
+    }
     // We commit the new point on pointer-down, and set draggingHandle=true
     // so that onDrag can stretch the out-handle.
-    this.points.push(bezierCorner(e.world.x, e.world.y));
+    this.points.push(bezierCorner(at.x, at.y));
+    this.dragIndex = this.points.length - 1;
     this.draggingHandle = true;
   }
 
-  onPointerUp(_e: ToolPointerEvent, ctx: ToolContext): void {
+  /**
+   * Seed the draft with an existing open outline so drawing carries on from
+   * its end (AE: click — or Ctrl-click — an end vertex, then keep drawing).
+   * Clicking the FIRST vertex continues backwards: the draft is the outline
+   * reversed, and `finish` reverses the new run back before prepending it.
+   */
+  private startContinue(outline: Outline, index: number): void {
+    const world = outline.points.map((p) => mapBezierPoint(outline.matrix, p));
+    const atStart = index === 0;
+    this.points = atStart ? reversePath(world) : world;
+    this.continuing = {
+      id: { nodeId: outline.nodeId, maskId: outline.maskId },
+      atStart,
+      base: world.length,
+      matrix: outline.matrix,
+      moved: false,
+    };
+    this.dragIndex = this.points.length - 1;
+    this.draggingHandle = true;
+    this.continuePress = true;
+  }
+
+  onPointerUp(e: ToolPointerEvent, ctx: ToolContext): void {
+    const gesture = this.gesture;
+    if (gesture) {
+      this.gesture = null;
+      if (gesture.kind === 'select') {
+        this.directSelect.onPointerUp(e, ctx);
+      } else if (gesture.kind === 'convert' && !gesture.g.moved) {
+        const { points, hud } = convertClick(gesture.g);
+        commitOutline(ctx, gesture.g.id, points);
+        this.hud = hud;
+      }
+      ctx.requestRender();
+      return;
+    }
     this.draggingHandle = false;
+    this.repositioning = false;
+    this.continuePress = false;
+    ctx.setSnapLines?.([]);
+    if (this.closing) {
+      this.closing = false;
+      this.finish(ctx, true);
+      return;
+    }
     ctx.requestRender();
+  }
+
+  onClick(e: ToolPointerEvent, ctx: ToolContext): void {
+    if (this.gesture?.kind === 'select') this.directSelect.onClick(e, ctx);
+  }
+
+  onDragStart(e: ToolDragEvent, ctx: ToolContext): void {
+    if (this.gesture?.kind === 'select') this.directSelect.onDragStart(e, ctx);
   }
 
   onDrag(e: ToolDragEvent, ctx: ToolContext): void {
-    if (!this.draggingHandle || this.points.length === 0) return;
-    const last = this.points[this.points.length - 1]!;
-    // Out-handle mirrors in-handle (smooth symmetric bezier like AE)
-    const dx = e.currentWorld.x - last.x;
-    const dy = e.currentWorld.y - last.y;
-    this.points[this.points.length - 1] = {
-      ...last,
-      outX: last.x + dx,
-      outY: last.y + dy,
-      inX:  last.x - dx,
-      inY:  last.y - dy,
-    };
+    const gesture = this.gesture;
+    if (gesture) {
+      if (gesture.kind === 'select') {
+        this.directSelect.onDrag(e, ctx);
+        return;
+      }
+      gesture.g.moved = true;
+      if (gesture.kind === 'add') {
+        commitOutline(ctx, gesture.g.id, moveGestureVertex(gesture.g, e.currentWorld));
+      } else {
+        const res = convertDrag(gesture.g, e.currentWorld);
+        this.hud = res.hud;
+        commitOutline(ctx, gesture.g.id, res.points);
+      }
+      ctx.requestRender();
+      return;
+    }
+    if (!this.draggingHandle) return;
+    const i = this.dragIndex;
+    const pt = this.points[i];
+    if (!pt) return;
+    const last = this.lastDragWorld ?? e.startWorld ?? e.currentWorld;
+    this.lastDragWorld = e.currentWorld;
+    if (this.repositioning && last) {
+      // Space held: the vertex follows the pointer, handles and all.
+      const dx = e.currentWorld.x - last.x;
+      const dy = e.currentWorld.y - last.y;
+      this.points[i] = { ...pt, x: pt.x + dx, y: pt.y + dy, inX: pt.inX + dx, inY: pt.inY + dy, outX: pt.outX + dx, outY: pt.outY + dy };
+      ctx.requestRender();
+      return;
+    }
+    // Shift constrains the handle to 15° steps, as it does the segment.
+    const tip = e.modifiers.shift ? constrainAngle15(pt, e.currentWorld) : e.currentWorld;
+    const dx = tip.x - pt.x;
+    const dy = tip.y - pt.y;
+    // The out-handle follows the pointer and the in-handle mirrors it (smooth
+    // symmetric bezier, like AE). Alt breaks the pair: only the outgoing handle
+    // moves, so the incoming segment keeps whatever it had — and the vertex
+    // remembers it is broken. Continuing a path pulls the outgoing handle only
+    // too: the incoming one belongs to the segment that already exists.
+    const alone = e.modifiers.alt || this.continuePress;
+    this.points[i] = alone
+      ? withBroken({ ...pt, outX: pt.x + dx, outY: pt.y + dy }, e.modifiers.alt || pt.broken === true)
+      : withBroken({ ...pt, outX: pt.x + dx, outY: pt.y + dy, inX: pt.x - dx, inY: pt.y - dy }, false);
+    if (this.continuePress && this.continuing) this.continuing.moved = true;
     ctx.requestRender();
   }
 
-  onDragEnd(_e: ToolDragEvent, ctx: ToolContext): void {
+  onDragEnd(e: ToolDragEvent, ctx: ToolContext): void {
+    if (this.gesture?.kind === 'select') {
+      this.directSelect.onDragEnd(e, ctx);
+      return;
+    }
     this.draggingHandle = false;
+    this.repositioning = false;
     ctx.requestRender();
   }
 
   onDoubleClick(_e: ToolPointerEvent, ctx: ToolContext): void {
+    const base = this.continuing?.base ?? 0;
     // Remove the extra point added by the click part of doubleclick
-    if (this.points.length > 0) this.points.pop();
+    if (this.points.length > base) this.points.pop();
+    // A double-click ON the previous last vertex (AE: "double-click the last
+    // vertex") closes the outline. Its first click stacked one more vertex on
+    // top of that one; a double-click in empty space placed a vertex nowhere
+    // near it, and just finishes the open path as before.
+    const n = this.points.length;
+    if (n >= 3 && n - 1 > base) {
+      const last = this.points[n - 1]!;
+      const prev = this.points[n - 2]!;
+      const r = ctx.camera.screenDistanceToWorld(HANDLE_PICK_RADIUS);
+      if (Math.hypot(last.x - prev.x, last.y - prev.y) <= r) {
+        this.points.pop();
+        this.finish(ctx, this.canClose());
+        return;
+      }
+    }
     this.finish(ctx);
   }
 
   onKeyDown(e: ToolKeyEvent, ctx: ToolContext): boolean {
+    if ((e.code === 'Space' || e.key === ' ') && this.draggingHandle && !this.closing) {
+      this.repositioning = true;
+      return true;
+    }
+    if (this.gesture?.kind === 'select') return this.directSelect.onKeyDown(e, ctx);
     // Only with an outline in progress. With none, Escape is the viewport's own
     // — clear the selection — and claiming it here would break that everywhere
     // the pen happens to be the active tool.
@@ -1217,19 +1512,43 @@ export class PenTool implements Tool {
     }
     if (e.key === 'Escape') {
       this.points = [];
+      this.continuing = null;
       this.mouse = null;
+      ctx.requestRender();
+      return true;
+    }
+    if (e.key === 'Backspace' || e.key === 'Delete') {
+      // Take back the last vertex placed, not the whole draft — and never the
+      // selected LAYER, which is what the viewport's Delete would do. A
+      // continued path's own vertices are not the draft's to take back.
+      if (this.points.length > (this.continuing?.base ?? 0)) this.points.pop();
+      this.draggingHandle = false;
+      this.closing = false;
       ctx.requestRender();
       return true;
     }
     return false;
   }
 
-  private finish(ctx: ToolContext): void {
+  onKeyUp(e: ToolKeyEvent, _ctx: ToolContext): void {
+    if (e.code === 'Space' || e.key === ' ') this.repositioning = false;
+  }
+
+  claimedKeys(): readonly string[] {
+    return this.points.length > 0 ? ['enter', 'escape', 'delete', 'backspace'] : [];
+  }
+
+  private finish(ctx: ToolContext, closed = false): void {
+    if (this.continuing) {
+      this.finishContinue(ctx, closed);
+      return;
+    }
     if (this.points.length >= 2) {
       const bounds = R.bounds(this.points.map((p) => R.rect(p.x, p.y, 0, 0))) ?? R.rect();
       const cx = bounds.x + bounds.width / 2;
       const cy = bounds.y + bounds.height / 2;
       const localPoints: BezierPoint[] = this.points.map((p) => ({
+        ...p,
         x: p.x - cx, y: p.y - cy,
         inX: p.inX - cx, inY: p.inY - cy,
         outX: p.outX - cx, outY: p.outY - cy,
@@ -1239,11 +1558,45 @@ export class PenTool implements Tool {
       const selection = ctx.selectionIds();
       const maskTargetId =
         this.maskMode && selection.length === 1 ? selection[0] : undefined;
-      ctx.execute(commands.createNode('Path', bounds, localPoints, maskTargetId));
+      ctx.execute(commands.createNode('Path', bounds, localPoints, maskTargetId, closed));
     }
     this.points = [];
     ctx.requestRender();
   }
+
+  /**
+   * Hand a continued path back to its layer: the full outline at the playhead
+   * as `points`, and the drawn run as an `extend` topology so an animated path
+   * gains the same vertices in every keyframe (see `pathTopology.ts`).
+   */
+  private finishContinue(ctx: ToolContext, closed: boolean): void {
+    const c = this.continuing!;
+    this.continuing = null;
+    const inv = Mat.invert(c.matrix);
+    const local = this.points.map((p) => mapBezierPoint(inv, p));
+    this.points = [];
+    const added = local.slice(c.base);
+    if (added.length > 0 || closed || c.moved) {
+      const full = c.atStart ? reversePath(local) : local;
+      const extra = c.atStart ? reversePath(added) : added;
+      const topology: PathTopologyEdit | undefined = extra.length > 0
+        ? { op: 'extend', points: extra, atStart: c.atStart }
+        : undefined;
+      commitOutline(ctx, c.id, full, topology, closed ? { closed: true } : undefined);
+    }
+    ctx.requestRender();
+  }
+}
+
+/** `p` rotated about `origin` onto the nearest 15° step, same distance (AE Shift). */
+function constrainAngle15(origin: Vec2, p: Vec2): Vec2 {
+  const dx = p.x - origin.x;
+  const dy = p.y - origin.y;
+  const len = Math.hypot(dx, dy);
+  if (len === 0) return { x: p.x, y: p.y };
+  const step = Math.PI / 12;
+  const a = Math.round(Math.atan2(dy, dx) / step) * step;
+  return { x: origin.x + Math.cos(a) * len, y: origin.y + Math.sin(a) * len };
 }
 
 /**
@@ -1860,6 +2213,12 @@ export class CurvatureTool implements Tool {
       ctx.requestRender();
       return true;
     }
+    if (e.key === 'Backspace' || e.key === 'Delete') {
+      // As on the Pen: take back the last point placed.
+      this.pts.pop();
+      ctx.requestRender();
+      return true;
+    }
     return false;
   }
 
@@ -2115,19 +2474,70 @@ function anchorWorld(node: { worldMatrix: Mat.Mat2D; anchor?: Vec2 }): Vec2 {
 // second implementation of the same idea that nothing could select.
 
 /** Which outline a handle belongs to: the layer's geometry, or one of its masks. */
-interface OutlineRef {
-  nodeId: NodeId;
-  /** null = the node's own `pathPoints`; otherwise a mask id. */
-  maskId: string | null;
+interface OutlineRef extends OutlineId {
   index: number;
   kind: 'point' | 'tangent-in' | 'tangent-out';
 }
 
+/** One vertex of one outline. */
+interface VertexRef extends OutlineId {
+  index: number;
+}
+
+/** The Free Transform Points box grips, clockwise from top-left. */
+const FTP_GRIPS = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'] as const;
+type FtpGrip = (typeof FTP_GRIPS)[number];
+
+/** A grip's position in box-local units (±1 on each axis). */
+const GRIP_UNIT: Record<FtpGrip, Vec2> = {
+  nw: { x: -1, y: -1 }, n: { x: 0, y: -1 }, ne: { x: 1, y: -1 }, e: { x: 1, y: 0 },
+  se: { x: 1, y: 1 }, s: { x: 0, y: 1 }, sw: { x: -1, y: 1 }, w: { x: -1, y: 0 },
+};
+
+/** The Free Transform Points box: oriented, in world space. */
+interface FreeTransformBox {
+  center: Vec2;
+  w: number;
+  h: number;
+  angle: number;
+  anchor: Vec2;
+}
+
+/** An outline's start state for a gesture that edits several vertices at once. */
+interface OutlineSnapshot {
+  id: OutlineId;
+  points: BezierPoint[];
+  matrix: Mat.Mat2D;
+  closed: boolean;
+  rotoBezier: boolean;
+  indices: number[];
+}
+
+const vertexKey = (v: VertexRef): string => `${outlineKey(v)}${v.index}`;
+
+const ARROW_DELTAS: Record<string, Vec2> = {
+  ArrowLeft: { x: -1, y: 0 }, ArrowRight: { x: 1, y: 0 }, ArrowUp: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 },
+};
+
+/**
+ * Direct Selection (A) — AE's Selection tool over path vertices.
+ *
+ *  • click a vertex selects it; Shift-click adds/removes; drag moves every
+ *    selected vertex (one undo step — the host coalesces a gesture);
+ *  • drag in empty space marquee-selects vertices of the selected layers;
+ *  • drag a SEGMENT bends it through the grabbed point (`bendSegment`);
+ *  • arrows nudge the selected vertices (Shift ×10), Delete removes them;
+ *  • Ctrl/Cmd+T or a double-click on the path opens Free Transform Points;
+ *  • Alt-click deletes a vertex, Alt-drag pulls fresh handles (Convert
+ *    Vertex), Ctrl+Alt-click toggles smooth/corner, Shift-click ON a segment
+ *    adds a vertex. Alt-dragging a handle breaks the pair for good (the vertex
+ *    remembers it in `broken`), so a later plain drag keeps it broken.
+ */
 export class DirectSelectionTool implements Tool {
-  readonly id = 'direct-select';
-  readonly label = 'Direct Selection';
-  readonly shortcut = 'a';
-  readonly cursor = 'default' as const;
+  readonly id: string = 'direct-select';
+  readonly label: string = 'Direct Selection';
+  readonly shortcut: string = 'a';
+  readonly cursor = 'default' as CursorType;
 
   /**
    * handle id → what it edits.
@@ -2139,154 +2549,787 @@ export class DirectSelectionTool implements Tool {
    */
   private refs = new Map<string, OutlineRef>();
   private drag: OutlineRef | null = null;
-  /** Which vertex is expanded to show tangents, and on which outline. */
-  private active: { maskId: string | null; index: number } | null = null;
+  /** The vertex selection, keyed by `vertexKey`. */
+  private selected = new Map<string, VertexRef>();
+  /**
+   * An Alt press on a vertex, not yet resolved. Alt means two things in AE
+   * depending on what the pointer does NEXT: released in place, the vertex is
+   * deleted (Ctrl+Alt: toggled between smooth and corner); dragged, fresh
+   * symmetric handles are pulled out of it (Convert Vertex). Neither can be
+   * decided on press, so the press parks here until `onClick` or `onDrag`.
+   */
+  private convert: { ref: OutlineRef; toggle: boolean } | null = null;
+  /**
+   * The length the OPPOSITE handle keeps while one handle of a smooth vertex is
+   * dragged, captured at press. AE mirrors only the direction; mirroring the
+   * length too flattened every asymmetric curve the moment a handle was
+   * touched. Null = pull symmetric handles (a Convert Vertex drag, or a vertex
+   * whose opposite handle is retracted and so has no length to keep).
+   */
+  private oppositeLength: number | null = null;
+  /**
+   * This drag began as an Alt-drag on a vertex. Alt is still HELD for the whole
+   * of it, and must not then be read as "break the handles" — the gesture is
+   * pulling symmetric ones.
+   */
+  private converting = false;
+  /** Pointer + start state of a multi-vertex move, captured on the first drag tick. */
+  private press: { world: Vec2; grabbed: Vec2 | null; snapshots: OutlineSnapshot[] } | null = null;
+  /** Where the last press landed, world — the move's reference point. */
+  private pressWorld: Vec2 | null = null;
+  /** A press on a segment: a drag bends it. */
+  private bend: { snapshot: OutlineSnapshot; segment: number; u: number; start: Vec2 } | null = null;
+  /** A press in empty space, unresolved: a click selects layers, a drag marquees vertices. */
+  private pendingEmpty: ToolPointerEvent | null = null;
+  private marquee: { start: Vec2; current: Vec2; additive: boolean } | null = null;
+  /** Free Transform Points, while open. */
+  private ftp: FreeTransformBox | null = null;
+  private ftpDrag: {
+    mode: FtpGrip | 'move' | 'rotate' | 'anchor';
+    start: Vec2;
+    box: FreeTransformBox;
+    snapshots: OutlineSnapshot[];
+    live: Mat.Mat2D | null;
+    sx: number;
+    sy: number;
+    theta: number;
+  } | null = null;
+  private hud: ToolHud | null = null;
 
-  /** Every editable outline on a node: its geometry, then each of its masks. */
-  private outlinesOf(node: WorkspaceNode): Array<{ maskId: string | null; points: readonly BezierPoint[] }> {
-    const out: Array<{ maskId: string | null; points: readonly BezierPoint[] }> = [];
-    if (node.pathPoints) out.push({ maskId: null, points: node.pathPoints });
-    for (const m of node.maskPaths ?? []) out.push({ maskId: m.id, points: m.points });
+  deactivate(ctx: ToolContext): void {
+    this.ftp = null;
+    this.ftpDrag = null;
+    this.marquee = null;
+    this.pendingEmpty = null;
+    ctx.setSnapLines?.([]);
+  }
+
+  // ── Vertex selection ─────────────────────────────────────────────
+
+  private isVertexSelected(v: VertexRef): boolean {
+    return this.selected.has(vertexKey(v));
+  }
+
+  private selectOnly(v: VertexRef): void {
+    this.selected.clear();
+    this.selected.set(vertexKey(v), { nodeId: v.nodeId, maskId: v.maskId, index: v.index });
+  }
+
+  private toggleVertex(v: VertexRef): void {
+    const k = vertexKey(v);
+    if (this.selected.has(k)) this.selected.delete(k);
+    else this.selected.set(k, { nodeId: v.nodeId, maskId: v.maskId, index: v.index });
+  }
+
+  /** Add vertices of one outline to the selection (Free Transform Points on a whole path). */
+  selectVertices(id: OutlineId, indices: readonly number[]): void {
+    for (const index of indices) {
+      const v: VertexRef = { nodeId: id.nodeId, maskId: id.maskId, index };
+      this.selected.set(vertexKey(v), v);
+    }
+  }
+
+  /** Forget the vertex selection — after an edit that renumbers vertices (Set First Vertex, Reverse). */
+  clearVertexSelection(): void {
+    this.selected.clear();
+    this.ftp = null;
+  }
+
+  /** The selected vertex indices of `id`, ascending. */
+  selectedIndices(id: OutlineId): number[] {
+    const out: number[] = [];
+    for (const v of this.selected.values()) if (sameOutline(v, id)) out.push(v.index);
+    return out.sort((a, b) => a - b);
+  }
+
+  /**
+   * The outlines holding selected vertices, each with its indices — also what
+   * the host's path commands (Set First Vertex, Closed, …) act on.
+   */
+  selectedVertexOutlines(ctx: ToolContext): Array<{ outline: Outline; indices: number[] }> {
+    this.prune(ctx);
+    const out: Array<{ outline: Outline; indices: number[] }> = [];
+    const seen = new Set<string>();
+    for (const v of this.selected.values()) {
+      const k = outlineKey(v);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      const outline = outlineOf(ctx, v);
+      if (outline) out.push({ outline, indices: this.selectedIndices(v) });
+    }
     return out;
   }
 
-  private pointsFor(node: WorkspaceNode, maskId: string | null): readonly BezierPoint[] | undefined {
-    return maskId === null
-      ? node.pathPoints
-      : node.maskPaths?.find((m) => m.id === maskId)?.points;
+  /** Drop selected vertices whose layer is no longer selected or whose index is gone. */
+  private prune(ctx: ToolContext): void {
+    if (this.selected.size === 0) return;
+    const layers = new Set(ctx.selectionIds());
+    for (const [k, v] of this.selected) {
+      const o = layers.has(v.nodeId) ? outlineOf(ctx, v) : null;
+      if (!o || v.index >= o.points.length) this.selected.delete(k);
+    }
+    if (this.selected.size === 0 && this.ftp) this.ftp = null;
   }
 
-  private commit(ctx: ToolContext, ref: OutlineRef, points: BezierPoint[]): void {
-    ctx.execute(
-      ref.maskId === null
-        ? commands.updateNodePath(ref.nodeId, points)
-        : commands.updateMaskPath(ref.nodeId, ref.maskId, points),
-    );
+  private snapshotsOfSelection(ctx: ToolContext): OutlineSnapshot[] {
+    return this.selectedVertexOutlines(ctx).map(({ outline, indices }) => ({
+      id: { nodeId: outline.nodeId, maskId: outline.maskId },
+      points: outline.points.map((p) => ({ ...p })),
+      matrix: outline.matrix,
+      closed: outline.closed,
+      rotoBezier: outline.rotoBezier,
+      indices,
+    }));
   }
+
+  // ── Overlay ──────────────────────────────────────────────────────
 
   getHandles(ctx: ToolContext): readonly OverlayHandle[] {
     this.refs.clear();
+    this.prune(ctx);
     const handles: OverlayHandle[] = [];
-    const add = (id: string, position: Vec2, kind: OverlayHandle['kind'], ref: OutlineRef): void => {
-      handles.push({ id, position, kind });
-      this.refs.set(id, ref);
+    const add = (h: OverlayHandle, ref: OutlineRef): void => {
+      handles.push(h);
+      this.refs.set(h.id, ref);
     };
 
-    for (const id of ctx.selectionIds()) {
-      const node = ctx.scene.getNode(id);
-      if (!node) continue;
-      for (const outline of this.outlinesOf(node)) {
-        const scope = outline.maskId ?? 'geom';
-        outline.points.forEach((pt, i) => {
-          const base = { nodeId: id, maskId: outline.maskId, index: i } as const;
-          add(`vert:${id}:${scope}:${i}`, Mat.apply(node.worldMatrix, { x: pt.x, y: pt.y }), 'point', { ...base, kind: 'point' });
+    for (const outline of selectedOutlines(ctx)) {
+      const id = outline.nodeId;
+      const scope = outline.maskId ?? 'geom';
+      outline.points.forEach((pt, i) => {
+        const base = { nodeId: id, maskId: outline.maskId, index: i } as const;
+        const vw = Mat.apply(outline.matrix, { x: pt.x, y: pt.y });
+        const selected = this.isVertexSelected(base);
+        add(
+          {
+            id: `vert:${id}:${scope}:${i}`, position: vw, kind: 'point',
+            ...(selected ? { selected: true } : {}),
+            ...(i === 0 && outline.points.length > 1 ? { first: true } : {}),
+          },
+          { ...base, kind: 'point' },
+        );
+        // Tangents for the selected vertices — none on a RotoBezier outline,
+        // whose handles are computed and cannot be dragged (AE hides them too).
+        if (selected && !outline.rotoBezier) {
+          add(
+            { id: `tin:${id}:${scope}:${i}`, position: Mat.apply(outline.matrix, { x: pt.inX, y: pt.inY }), kind: 'tangent-in', origin: vw },
+            { ...base, kind: 'tangent-in' },
+          );
+          add(
+            { id: `tout:${id}:${scope}:${i}`, position: Mat.apply(outline.matrix, { x: pt.outX, y: pt.outY }), kind: 'tangent-out', origin: vw },
+            { ...base, kind: 'tangent-out' },
+          );
+        }
+      });
+    }
 
-          // Tangents only for the active vertex of the active outline.
-          if (this.active?.index === i && this.active.maskId === outline.maskId) {
-            add(`tin:${id}:${scope}:${i}`, Mat.apply(node.worldMatrix, { x: pt.inX, y: pt.inY }), 'tangent-in', { ...base, kind: 'tangent-in' });
-            add(`tout:${id}:${scope}:${i}`, Mat.apply(node.worldMatrix, { x: pt.outX, y: pt.outY }), 'tangent-out', { ...base, kind: 'tangent-out' });
-          }
-        });
-      }
+    const box = this.liveBox();
+    if (box) {
+      for (const g of FTP_GRIPS) handles.push({ id: `ftp:${g}`, position: gripWorld(box, g), kind: 'resize' });
+      handles.push({ id: 'ftp:anchor', position: box.anchor, kind: 'anchor' });
     }
     return handles;
   }
 
+  getHud(_ctx: ToolContext): ToolHud | null {
+    return this.hud;
+  }
+
+  getMarquee(): Rect | null {
+    if (!this.marquee) return null;
+    return R.fromPoints(this.marquee.start, this.marquee.current);
+  }
+
+  getTransformBox(_ctx: ToolContext): { corners: Corners; anchor: Vec2 } | null {
+    const box = this.liveBox();
+    if (!box) return null;
+    return { corners: [gripWorld(box, 'nw'), gripWorld(box, 'ne'), gripWorld(box, 'se'), gripWorld(box, 'sw')], anchor: box.anchor };
+  }
+
+  claimedKeys(): readonly string[] {
+    const keys: string[] = [];
+    if (this.ftp) keys.push('enter', 'escape');
+    if (this.selected.size > 0) {
+      keys.push('delete', 'backspace', 'ctrl+t', 'meta+t');
+      for (const k of ['arrowleft', 'arrowright', 'arrowup', 'arrowdown']) keys.push(k, `shift+${k}`);
+    }
+    return keys;
+  }
+
+  /** The box as drawn right now — mid-drag it follows the live transform. */
+  private liveBox(): FreeTransformBox | null {
+    if (!this.ftp) return null;
+    const d = this.ftpDrag;
+    if (!d || !d.live) return this.ftp;
+    return transformBox(d.box, d.live, d.mode, d.sx, d.sy, d.theta);
+  }
+
+  // ── Picking ──────────────────────────────────────────────────────
+
+  /**
+   * The handle under the pointer — the NEAREST one, not the first listed.
+   *
+   * `getHandles` lists each vertex before its tangents, and a first-hit scan
+   * meant a tangent within reach of its own vertex could never be grabbed. On
+   * a corner the tangents sit exactly ON the vertex, so a corner could never
+   * be given handles at all. A retracted tangent is skipped outright (the
+   * vertex is the thing there), and a pulled-out tangent wins a near-tie
+   * (within a screen px) against the vertex — it is the smaller target.
+   */
+  private pick(ctx: ToolContext, world: Vec2, radius: number): OutlineRef | null {
+    const px = radius / HANDLE_PICK_RADIUS;
+    let best: OutlineRef | null = null;
+    let bestScore = Infinity;
+    for (const h of this.getHandles(ctx)) {
+      const ref = this.refs.get(h.id);
+      if (!ref) continue;
+      const d = Math.hypot(h.position.x - world.x, h.position.y - world.y);
+      if (d >= radius) continue;
+      let score = d;
+      if (ref.kind !== 'point') {
+        if (h.origin && Math.hypot(h.position.x - h.origin.x, h.position.y - h.origin.y) < px * 0.5) continue;
+        score -= px;
+      }
+      if (score < bestScore) {
+        bestScore = score;
+        best = ref;
+      }
+    }
+    return best;
+  }
+
+  /** What a press on the open Free Transform box grabs, or null outside its reach. */
+  private pickFtp(ctx: ToolContext, world: Vec2): FtpGrip | 'move' | 'rotate' | 'anchor' | null {
+    const box = this.ftp;
+    if (!box) return null;
+    const radius = ctx.camera.screenDistanceToWorld(HANDLE_PICK_RADIUS);
+    if (Math.hypot(box.anchor.x - world.x, box.anchor.y - world.y) <= radius) return 'anchor';
+    let bestGrip: FtpGrip | null = null;
+    let bestD = radius;
+    for (const g of FTP_GRIPS) {
+      const p = gripWorld(box, g);
+      const d = Math.hypot(p.x - world.x, p.y - world.y);
+      if (d <= bestD) { bestD = d; bestGrip = g; }
+    }
+    if (bestGrip) return bestGrip;
+    const local = Mat.apply(Mat.invert(boxMatrix(box)), world);
+    const ox = Math.max(0, Math.abs(local.x) - box.w / 2);
+    const oy = Math.max(0, Math.abs(local.y) - box.h / 2);
+    if (ox === 0 && oy === 0) return 'move';
+    if (Math.hypot(ox, oy) <= ctx.camera.screenDistanceToWorld(ROTATE_RING_PX)) return 'rotate';
+    return null;
+  }
+
+  // ── Pointer ──────────────────────────────────────────────────────
+
   onPointerDown(e: ToolPointerEvent, ctx: ToolContext): void {
-    const pickRadius = ctx.camera.screenDistanceToWorld(9);
-    const handles = this.getHandles(ctx);
-    for (const h of handles) {
-      if (Math.hypot(h.position.x - e.world.x, h.position.y - e.world.y) < pickRadius) {
-        const ref = this.refs.get(h.id);
-        if (!ref) continue;
-        if (ref.kind === 'point') {
-          if (e.modifiers.alt) {
-            // Delete the point.
-            const node = ctx.scene.getNode(ref.nodeId);
-            const pts = node ? this.pointsFor(node, ref.maskId) : undefined;
-            if (pts && pts.length > 2) {
-              const next = pts.map((p) => ({ ...p }));
-              next.splice(ref.index, 1);
-              this.commit(ctx, ref, next);
-            }
+    this.convert = null;
+    this.converting = false;
+    this.oppositeLength = null;
+    this.press = null;
+    this.bend = null;
+    this.pendingEmpty = null;
+    this.marquee = null;
+    this.ftpDrag = null;
+    this.hud = null;
+    this.pressWorld = e.world;
+
+    if (this.ftp) {
+      const grip = this.pickFtp(ctx, e.world);
+      if (grip) {
+        this.ftpDrag = {
+          mode: grip, start: e.world, box: { ...this.ftp, center: { ...this.ftp.center }, anchor: { ...this.ftp.anchor } },
+          snapshots: this.snapshotsOfSelection(ctx), live: null, sx: 1, sy: 1, theta: 0,
+        };
+        this.drag = null;
+        return;
+      }
+      // A press outside the box commits and closes it (AE).
+      this.ftp = null;
+    }
+
+    const pickRadius = ctx.camera.screenDistanceToWorld(HANDLE_PICK_RADIUS);
+    const ref = this.pick(ctx, e.world, pickRadius);
+    if (ref) {
+      if (ref.kind === 'point') {
+        const v: VertexRef = { nodeId: ref.nodeId, maskId: ref.maskId, index: ref.index };
+        if (e.modifiers.alt) {
+          // Resolved by what happens next — see `convert`. Ctrl/Cmd+Alt is
+          // AE's Convert Vertex chord from the selection tool.
+          if (!this.isVertexSelected(v)) this.selectOnly(v);
+          this.convert = { ref, toggle: e.modifiers.mod };
+          this.drag = null;
+          ctx.requestRender();
+          return;
+        }
+        if (e.modifiers.shift) {
+          this.toggleVertex(v);
+          if (!this.isVertexSelected(v)) {
             this.drag = null;
-            this.active = null;
             ctx.requestRender();
             return;
           }
-          this.active = { maskId: ref.maskId, index: ref.index };
+        } else if (!this.isVertexSelected(v)) {
+          this.selectOnly(v);
         }
-        this.drag = ref;
-        ctx.requestRender();
-        return;
+      } else {
+        const node = ctx.scene.getNode(ref.nodeId);
+        const v = node ? outlineOf(ctx, ref)?.points[ref.index] : undefined;
+        if (v) {
+          const len = ref.kind === 'tangent-out'
+            ? Math.hypot(v.inX - v.x, v.inY - v.y)
+            : Math.hypot(v.outX - v.x, v.outY - v.y);
+          this.oppositeLength = len > 1e-9 ? len : null;
+        }
       }
+      this.drag = ref;
+      ctx.requestRender();
+      return;
     }
-    // No handle hit — Shift+Click appends a point to the active outline.
-    if (e.modifiers.shift && ctx.selectionIds().length === 1) {
-      const selectedId = ctx.selectionIds()[0]!;
-      const node = ctx.scene.getNode(selectedId);
-      const maskId = this.active?.maskId ?? null;
-      const pts = node ? this.pointsFor(node, maskId) : undefined;
-      if (node && pts) {
-        const inv = Mat.invert(node.worldMatrix);
-        const localPt = Mat.apply(inv, e.world);
-        const next = [...pts.map((p) => ({ ...p })), bezierCorner(localPt.x, localPt.y)];
-        this.commit(ctx, { nodeId: selectedId, maskId, index: next.length - 1, kind: 'point' }, next);
-        ctx.requestRender();
-        return;
-      }
+    if (e.modifiers.shift && this.insertOnSegment(e.world, ctx)) return;
+
+    const seg = pickSegment(ctx, e.world, selectedOutlines(ctx));
+    if (seg && !e.modifiers.alt) {
+      // A segment press selects its two vertices (AE) and arms a bend.
+      const n = seg.outline.points.length;
+      const a: VertexRef = { nodeId: seg.outline.nodeId, maskId: seg.outline.maskId, index: seg.segment };
+      const b: VertexRef = { ...a, index: (seg.segment + 1) % n };
+      if (!e.modifiers.shift) this.selected.clear();
+      this.selected.set(vertexKey(a), a);
+      this.selected.set(vertexKey(b), b);
+      this.bend = {
+        snapshot: {
+          id: { nodeId: seg.outline.nodeId, maskId: seg.outline.maskId },
+          points: seg.outline.points.map((p) => ({ ...p })),
+          matrix: seg.outline.matrix,
+          closed: seg.outline.closed,
+          rotoBezier: seg.outline.rotoBezier,
+          indices: [a.index, b.index],
+        },
+        segment: seg.segment,
+        u: seg.u,
+        start: e.world,
+      };
+      this.drag = null;
+      ctx.requestRender();
+      return;
     }
-    // Otherwise, click selects node, clears active vertex
+
     this.drag = null;
-    this.active = null;
+    // Empty space. With editable outlines on the selection the press is not
+    // resolved yet: a DRAG marquees their vertices, a CLICK is the ordinary
+    // layer click (select / deselect) — decided in `onDragStart` / `onClick`.
+    if (selectedOutlines(ctx).length > 0) {
+      this.pendingEmpty = e;
+      return;
+    }
+    this.selected.clear();
     ctx.selection.clickAt(e.world, e.modifiers);
     ctx.requestRender();
   }
 
+  /** An Alt press released in place: delete the vertex, or (Ctrl+Alt) toggle it. Or a deferred layer click. */
+  onClick(e: ToolPointerEvent, ctx: ToolContext): void {
+    if (this.pendingEmpty) {
+      this.pendingEmpty = null;
+      if (!e.modifiers.shift) this.selected.clear();
+      ctx.selection.clickAt(e.world, e.modifiers);
+      ctx.requestRender();
+      return;
+    }
+    const pending = this.convert;
+    this.convert = null;
+    if (!pending) return;
+    const { ref, toggle } = pending;
+    const outline = outlineOf(ctx, ref);
+    if (!outline) return;
+    if (toggle) {
+      const { points, hud } = convertClick(beginVertexGesture(outline, ref.index, e.world));
+      commitOutline(ctx, ref, points);
+      this.hud = hud;
+    } else {
+      // Refuses below two vertices — nothing drawable would be left.
+      const next = deleteVertex(outline.points, ref.index);
+      if (next) commitOutline(ctx, ref, finishPoints(next, outline), { op: 'delete', index: ref.index });
+      this.drag = null;
+      this.selected.clear();
+    }
+    ctx.requestRender();
+  }
+
+  onDoubleClick(e: ToolPointerEvent, ctx: ToolContext): void {
+    // AE: double-click the path to Free Transform its points — the selected
+    // ones when the click lands on one of several selected vertices, else the
+    // whole outline.
+    const outlines = selectedOutlines(ctx);
+    const v = pickVertex(ctx, e.world, outlines);
+    const hitOutline = v?.outline ?? pickSegment(ctx, e.world, outlines)?.outline;
+    if (!hitOutline) return;
+    const selectedHere = this.selectedIndices(hitOutline);
+    if (!(v && selectedHere.length >= 2 && selectedHere.includes(v.index))) {
+      this.selected.clear();
+      hitOutline.points.forEach((_, index) => {
+        const ref: VertexRef = { nodeId: hitOutline.nodeId, maskId: hitOutline.maskId, index };
+        this.selected.set(vertexKey(ref), ref);
+      });
+    }
+    this.openFreeTransform(ctx);
+  }
+
+  onPointerUp(_e: ToolPointerEvent, ctx: ToolContext): void {
+    this.convert = null;
+    this.press = null;
+    this.bend = null;
+    ctx.setSnapLines?.([]);
+  }
+
+  /**
+   * Shift-click ON an outline adds a vertex there (AE's Add Vertex).
+   *
+   * This used to append a corner at the END of the active outline wherever the
+   * click landed, which drew a new segment straight across the shape. Now the
+   * click has to be within the grab radius of a segment of a selected layer's
+   * outline, and the segment is split at the nearest parameter by de Casteljau
+   * so the curve does not move. Anywhere else it is an ordinary Shift-click.
+   */
+  private insertOnSegment(world: Vec2, ctx: ToolContext): boolean {
+    const hit = pickSegment(ctx, world, selectedOutlines(ctx));
+    if (!hit) return false;
+    const done = insertVertex(ctx, hit);
+    if (!done) return false;
+    const v: VertexRef = { nodeId: hit.outline.nodeId, maskId: hit.outline.maskId, index: done.index };
+    this.drag = null;
+    this.selectOnly(v);
+    ctx.requestRender();
+    return true;
+  }
+
+  onDragStart(e: ToolDragEvent, _ctx: ToolContext): void {
+    if (this.pendingEmpty) {
+      this.marquee = { start: this.pendingEmpty.world, current: e.currentWorld, additive: this.pendingEmpty.modifiers.shift };
+      this.pendingEmpty = null;
+    }
+  }
+
   onDrag(e: ToolDragEvent, ctx: ToolContext): void {
+    if (this.ftpDrag) {
+      this.dragFreeTransform(e, ctx);
+      return;
+    }
+    if (this.marquee) {
+      this.marquee.current = e.currentWorld;
+      ctx.requestRender();
+      return;
+    }
+    if (this.bend) {
+      this.dragBend(e, ctx);
+      return;
+    }
+    if (this.convert) {
+      // Alt-DRAG on a vertex: Convert Vertex. The out-handle follows the
+      // pointer and the in-handle mirrors it at full length — fresh symmetric
+      // handles, which is also the only way to give a corner handles at all.
+      this.drag = { ...this.convert.ref, kind: 'tangent-out' };
+      this.oppositeLength = null;
+      this.converting = true;
+      this.convert = null;
+    }
     const ref = this.drag;
     if (!ref) return;
-    const node = ctx.scene.getNode(ref.nodeId);
-    if (!node) return;
-    const source = this.pointsFor(node, ref.maskId);
-    if (!source) return;
+    const outline = outlineOf(ctx, ref);
+    if (!outline) return;
 
-    const inv = Mat.invert(node.worldMatrix);
-    const localPt = Mat.apply(inv, e.currentWorld);
-    const pts = source.map((p) => ({ ...p }));
-    const pt = pts[ref.index];
-    if (!pt) return;
-    if (ref.kind === 'point') {
-      const dx = localPt.x - pt.x;
-      const dy = localPt.y - pt.y;
-      pt.x += dx;    pt.y += dy;
-      pt.inX += dx;  pt.inY += dy;
-      pt.outX += dx; pt.outY += dy;
-    } else if (ref.kind === 'tangent-out') {
-      pt.outX = localPt.x;
-      pt.outY = localPt.y;
-      // Mirror in-handle for smooth symmetric bezier (hold Alt to break)
-      if (!e.modifiers.alt) {
-        const dx = pt.outX - pt.x;
-        const dy = pt.outY - pt.y;
-        pt.inX = pt.x - dx;
-        pt.inY = pt.y - dy;
-      }
-    } else {
-      pt.inX = localPt.x;
-      pt.inY = localPt.y;
-      if (!e.modifiers.alt) {
-        const dx = pt.inX - pt.x;
-        const dy = pt.inY - pt.y;
-        pt.outX = pt.x - dx;
-        pt.outY = pt.y - dy;
-      }
+    if (ref.kind === 'point' && !this.converting) {
+      this.dragVertices(e, ctx, ref);
+      return;
     }
 
-    this.commit(ctx, ref, pts as BezierPoint[]);
+    const inv = Mat.invert(outline.matrix);
+    const localPt = Mat.apply(inv, e.currentWorld);
+    const pts = outline.points.map((p) => ({ ...p }));
+    const pt = pts[ref.index];
+    if (!pt) return;
+    if (this.converting && outline.rotoBezier) {
+      const g = beginVertexGesture(outline, ref.index, this.pressWorld ?? e.startWorld);
+      const res = convertDrag(g, e.currentWorld);
+      this.hud = res.hud;
+      commitOutline(ctx, ref, res.points);
+      ctx.requestRender();
+      return;
+    }
+    // Alt breaks the pair — for good: the vertex remembers it, so a later
+    // plain drag moves one handle too. Convert Vertex pulls symmetric handles
+    // and un-breaks it. Otherwise the opposite handle turns to stay opposite,
+    // keeping its own length (see `oppositeLength`).
+    const breaking = e.modifiers.alt && !this.converting;
+    const broken = !this.converting && (breaking || pt.broken === true);
+    const placed = placeHandle(
+      pt,
+      ref.kind === 'tangent-in' ? 'in' : 'out',
+      localPt,
+      broken ? 'broken' : this.converting ? null : this.oppositeLength,
+    );
+    pts[ref.index] = withBroken(placed, broken);
+    commitOutline(ctx, ref, pts);
+    ctx.requestRender();
+  }
+
+  /** Move every selected vertex by the drag, snapping the grabbed one. */
+  private dragVertices(e: ToolDragEvent, ctx: ToolContext, ref: OutlineRef): void {
+    if (!this.press) {
+      const grabbedOutline = outlineOf(ctx, ref);
+      const gp = grabbedOutline?.points[ref.index];
+      this.press = {
+        world: this.pressWorld ?? e.startWorld,
+        grabbed: gp && grabbedOutline ? Mat.apply(grabbedOutline.matrix, { x: gp.x, y: gp.y }) : null,
+        snapshots: this.snapshotsOfSelection(ctx),
+      };
+    }
+    const press = this.press;
+    let dx = e.currentWorld.x - press.world.x;
+    let dy = e.currentWorld.y - press.world.y;
+    if (press.grabbed) {
+      // Snap where the GRABBED vertex would land, against the path's other
+      // (unmoving) vertices, its layer box, and everything else in the scene.
+      const snap = press.snapshots.find((s) => sameOutline(s.id, ref));
+      const moving = new Set(snap?.indices ?? []);
+      const own = (snap?.points ?? [])
+        .filter((_, i) => !moving.has(i))
+        .map((p) => Mat.apply(snap!.matrix, { x: p.x, y: p.y }));
+      const target = { x: press.grabbed.x + dx, y: press.grabbed.y + dy };
+      const snapped = snapVertex(ctx, target, { nodeId: ref.nodeId, own });
+      dx += snapped.point.x - target.x;
+      dy += snapped.point.y - target.y;
+      ctx.setSnapLines?.(snapped.lines);
+    }
+    for (const s of press.snapshots) {
+      const d = Mat.applyVector(Mat.invert(s.matrix), { x: dx, y: dy });
+      const moving = new Set(s.indices);
+      const pts = s.points.map((p, i) =>
+        moving.has(i)
+          ? { ...p, x: p.x + d.x, y: p.y + d.y, inX: p.inX + d.x, inY: p.inY + d.y, outX: p.outX + d.x, outY: p.outY + d.y }
+          : { ...p },
+      );
+      commitOutline(ctx, s.id, finishPoints(pts, s));
+    }
+    this.hud = { anchorWorld: e.currentWorld, lines: [`Δ ${fmt(dx)}, ${fmt(dy)}`] };
+    ctx.requestRender();
+  }
+
+  /** Drag a segment: the curve passes through the pointer (`bendSegment`). */
+  private dragBend(e: ToolDragEvent, ctx: ToolContext): void {
+    const b = this.bend!;
+    const s = b.snapshot;
+    const d = Mat.applyVector(Mat.invert(s.matrix), { x: e.currentWorld.x - b.start.x, y: e.currentWorld.y - b.start.y });
+    let pts: BezierPoint[] | null;
+    if (s.rotoBezier) {
+      // A RotoBezier segment has no handles of its own to bend: move its ends.
+      const moving = new Set(s.indices);
+      pts = rotoBezierPoints(
+        s.points.map((p, i) => (moving.has(i) ? { ...p, x: p.x + d.x, y: p.y + d.y } : { ...p })),
+        s.closed,
+      );
+    } else {
+      pts = bendSegment(s.points, b.segment, b.u, d, s.closed);
+    }
+    if (!pts) return;
+    commitOutline(ctx, s.id, pts);
+    ctx.requestRender();
+  }
+
+  onDragEnd(_e: ToolDragEvent, ctx: ToolContext): void {
+    if (this.marquee) {
+      const rect = R.fromPoints(this.marquee.start, this.marquee.current);
+      if (!this.marquee.additive) this.selected.clear();
+      for (const o of selectedOutlines(ctx)) {
+        o.points.forEach((p, index) => {
+          if (!R.containsPoint(rect, Mat.apply(o.matrix, { x: p.x, y: p.y }))) return;
+          const v: VertexRef = { nodeId: o.nodeId, maskId: o.maskId, index };
+          this.selected.set(vertexKey(v), v);
+        });
+      }
+      this.marquee = null;
+    }
+    const f = this.ftpDrag;
+    if (f && this.ftp) {
+      this.ftp = f.mode === 'anchor' ? this.ftp : f.live ? transformBox(f.box, f.live, f.mode, f.sx, f.sy, f.theta) : this.ftp;
+    }
+    this.ftpDrag = null;
+    this.press = null;
+    this.bend = null;
+    this.converting = false;
+    this.hud = null;
+    ctx.setSnapLines?.([]);
+    ctx.requestRender();
+  }
+
+  // ── Keyboard ─────────────────────────────────────────────────────
+
+  onKeyDown(e: ToolKeyEvent, ctx: ToolContext): boolean {
+    if (this.ftp && (e.key === 'Enter' || e.key === 'Escape')) {
+      // AE: Enter and Esc both leave Free Transform, keeping the result.
+      this.ftp = null;
+      ctx.requestRender();
+      return true;
+    }
+    this.prune(ctx);
+    if (this.selected.size === 0) return false;
+    if ((e.key === 't' || e.key === 'T') && e.modifiers.mod) {
+      this.openFreeTransform(ctx);
+      return true;
+    }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      this.deleteSelected(ctx);
+      return true;
+    }
+    const arrow = ARROW_DELTAS[e.key];
+    if (arrow) {
+      const step = e.modifiers.shift ? 10 : 1;
+      this.nudge(ctx, arrow.x * step, arrow.y * step);
+      return true;
+    }
+    return false;
+  }
+
+  /** Remove every selected vertex — one topology edit per outline, replayed on its keyframes. */
+  private deleteSelected(ctx: ToolContext): void {
+    for (const { outline, indices } of this.selectedVertexOutlines(ctx)) {
+      const next = deleteVertices(outline.points, indices);
+      if (!next) continue;
+      const topology: PathTopologyEdit = indices.length === 1
+        ? { op: 'delete', index: indices[0]! }
+        : { op: 'deleteMany', indices };
+      commitOutline(ctx, outline, finishPoints(next, outline), topology);
+    }
+    this.selected.clear();
+    this.ftp = null;
+    ctx.requestRender();
+  }
+
+  /** Arrow-key nudge of the selected vertices, in world px. */
+  private nudge(ctx: ToolContext, dx: number, dy: number): void {
+    for (const s of this.snapshotsOfSelection(ctx)) {
+      const d = Mat.applyVector(Mat.invert(s.matrix), { x: dx, y: dy });
+      const moving = new Set(s.indices);
+      const pts = s.points.map((p, i) =>
+        moving.has(i)
+          ? { ...p, x: p.x + d.x, y: p.y + d.y, inX: p.inX + d.x, inY: p.inY + d.y, outX: p.outX + d.x, outY: p.outY + d.y }
+          : p,
+      );
+      commitOutline(ctx, s.id, finishPoints(pts, s));
+    }
+    if (this.ftp) {
+      this.ftp = {
+        ...this.ftp,
+        center: { x: this.ftp.center.x + dx, y: this.ftp.center.y + dy },
+        anchor: { x: this.ftp.anchor.x + dx, y: this.ftp.anchor.y + dy },
+      };
+    }
+    ctx.requestRender();
+  }
+
+  // ── Free Transform Points ────────────────────────────────────────
+
+  /** Open the box around the selected vertices (needs two, or there is nothing to scale). */
+  openFreeTransform(ctx: ToolContext): boolean {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let count = 0;
+    for (const { outline, indices } of this.selectedVertexOutlines(ctx)) {
+      for (const i of indices) {
+        const p = outline.points[i];
+        if (!p) continue;
+        const w = Mat.apply(outline.matrix, { x: p.x, y: p.y });
+        minX = Math.min(minX, w.x); minY = Math.min(minY, w.y);
+        maxX = Math.max(maxX, w.x); maxY = Math.max(maxY, w.y);
+        count += 1;
+      }
+    }
+    if (count < 2) return false;
+    const center = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+    this.ftp = { center, w: Math.max(maxX - minX, 1e-6), h: Math.max(maxY - minY, 1e-6), angle: 0, anchor: { ...center } };
+    ctx.requestRender();
+    return true;
+  }
+
+  /** Whether Free Transform Points is open (the host's command reads it). */
+  get freeTransforming(): boolean {
+    return this.ftp !== null;
+  }
+
+  private dragFreeTransform(e: ToolDragEvent, ctx: ToolContext): void {
+    const f = this.ftpDrag!;
+    const box = f.box;
+    const cur = e.currentWorld;
+    if (f.mode === 'anchor') {
+      this.ftp = { ...box, anchor: { x: box.anchor.x + cur.x - f.start.x, y: box.anchor.y + cur.y - f.start.y } };
+      ctx.requestRender();
+      return;
+    }
+    let M: Mat.Mat2D;
+    if (f.mode === 'move') {
+      M = Mat.translation(cur.x - f.start.x, cur.y - f.start.y);
+      this.hud = { anchorWorld: cur, lines: [`Δ ${fmt(cur.x - f.start.x)}, ${fmt(cur.y - f.start.y)}`] };
+    } else if (f.mode === 'rotate') {
+      const a = box.anchor;
+      let theta = Math.atan2(cur.y - a.y, cur.x - a.x) - Math.atan2(f.start.y - a.y, f.start.x - a.x);
+      // Shift constrains to 45° steps, as AE's free transform does.
+      if (e.modifiers.shift) theta = Math.round(theta / (Math.PI / 4)) * (Math.PI / 4);
+      f.theta = theta;
+      M = Mat.multiply(Mat.translation(a.x, a.y), Mat.multiply(Mat.rotation(theta), Mat.translation(-a.x, -a.y)));
+      this.hud = { anchorWorld: cur, lines: [`${fmt((theta * 180) / Math.PI)}°`] };
+    } else {
+      const B = boxMatrix(box);
+      const inv = Mat.invert(B);
+      const ls = Mat.apply(inv, f.start);
+      const lc = Mat.apply(inv, cur);
+      const unit = GRIP_UNIT[f.mode];
+      // Ctrl/Cmd scales about the anchor; otherwise about the opposite grip.
+      const pl = e.modifiers.mod
+        ? Mat.apply(inv, box.anchor)
+        : { x: (-unit.x * box.w) / 2, y: (-unit.y * box.h) / 2 };
+      const ratio = (c: number, s: number, p: number): number => (Math.abs(s - p) < 1e-9 ? 1 : (c - p) / (s - p));
+      let sx = unit.x !== 0 ? ratio(lc.x, ls.x, pl.x) : 1;
+      let sy = unit.y !== 0 ? ratio(lc.y, ls.y, pl.y) : 1;
+      if (e.modifiers.shift) {
+        // Shift keeps the proportions: the dominant axis drives both.
+        const s = unit.x === 0 ? sy : unit.y === 0 ? sx : Math.abs(sx) > Math.abs(sy) ? sx : sy;
+        sx = Math.sign(sx || 1) * Math.abs(s);
+        sy = Math.sign(sy || 1) * Math.abs(s);
+      }
+      f.sx = sx;
+      f.sy = sy;
+      M = Mat.multiply(B, Mat.multiply(Mat.translation(pl.x, pl.y), Mat.multiply(Mat.scaling(sx, sy), Mat.multiply(Mat.translation(-pl.x, -pl.y), inv))));
+      this.hud = { anchorWorld: cur, lines: [`${fmt(sx * 100)}% × ${fmt(sy * 100)}%`] };
+    }
+    f.live = M;
+    for (const s of f.snapshots) {
+      const local = Mat.multiply(Mat.invert(s.matrix), Mat.multiply(M, s.matrix));
+      commitOutline(ctx, s.id, finishPoints(transformVertices(s.points, s.indices, local), s));
+    }
     ctx.requestRender();
   }
 }
+
+/** Box-local (centred, unrotated) → world. */
+function boxMatrix(box: FreeTransformBox): Mat.Mat2D {
+  return Mat.multiply(Mat.translation(box.center.x, box.center.y), Mat.rotation(box.angle));
+}
+
+function gripWorld(box: FreeTransformBox, g: FtpGrip): Vec2 {
+  const u = GRIP_UNIT[g];
+  return Mat.apply(boxMatrix(box), { x: (u.x * box.w) / 2, y: (u.y * box.h) / 2 });
+}
+
+/** The box after a free-transform drag: `M` moved it, and a scale / rotate reshaped it. */
+function transformBox(box: FreeTransformBox, M: Mat.Mat2D, mode: string, sx: number, sy: number, theta: number): FreeTransformBox {
+  const center = Mat.apply(M, box.center);
+  const anchor = Mat.apply(M, box.anchor);
+  if (mode === 'rotate') return { ...box, center, anchor, angle: box.angle + theta };
+  if (mode === 'move') return { ...box, center, anchor };
+  return { ...box, center, anchor, w: Math.max(1e-6, box.w * Math.abs(sx)), h: Math.max(1e-6, box.h * Math.abs(sy)) };
+}
+
+const fmt = (v: number): string => (Math.round(v * 10) / 10).toString();
 
 // ── Roto Brush ─────────────────────────────────────────────────────
 /**
@@ -2323,6 +3366,10 @@ export function createBuiltinTools(): Tool[] {
     new MaskRectangleTool(),
     new MaskEllipseTool(),
     new MaskPenTool(),
+    new AddVertexTool(),
+    new DeleteVertexTool(),
+    new ConvertVertexTool(),
+    new MaskFeatherTool(),
     new PolygonTool(),
     new StarTool(),
     new LineTool(),

@@ -26,11 +26,22 @@ const PANEL_ORDER_SETTINGS_KEY = 'layout.panelOrder';
  * EditorLayout sizes the collapsed pane with this; `setRegionSize` treats any
  * drag past it as the user pulling the sidebar open again.
  */
-export const COLLAPSED_SIDEBAR_SIZE = 36;
+export const COLLAPSED_SIDEBAR_SIZE = 56;
 const LAYOUT_PERSIST_KEY = 'motion-editor.layout.v1';
 
+/**
+ * Bumped when the DEFAULT panel sets change enough that a persisted tab order
+ * would hide the change from everyone who has run the app before.
+ *
+ * 3: Effects, Presets and Plugins moved to permanent right-inspector tabs.
+ * 4: Layers hosts Compositions and is permanent on the left sidebar; Project renamed to Assets.
+ */
+export const LAYOUT_SCHEMA_VERSION = 4;
+
 // ── Persistence helpers ───────────────────────────────────────────
-interface PersistedLayout {
+export interface PersistedLayout {
+  /** Absent on every layout written before the schema was versioned (= 1). */
+  version?: number;
   regions: Partial<Record<RegionId, Partial<RegionState>>>;
   panelOrder?: Partial<Record<RegionId, ReadonlyArray<string>>>;
   activePanelByRegion?: Partial<Record<RegionId, string>>;
@@ -41,11 +52,42 @@ interface PersistedLayout {
   rightInspectorSplit?: boolean;
 }
 
+/**
+ * Bring a persisted layout up to LAYOUT_SCHEMA_VERSION.
+ *
+ * Keeps what the user SHAPED — region sizes, collapsed states, which side
+ * each dock sits on, splits — and drops what the defaults now decide: the tab
+ * order and the active tab per region. Pure, so the migration is tested on
+ * literal old payloads rather than through module-load side effects.
+ */
+export function migratePersistedLayout(saved: PersistedLayout): { layout: PersistedLayout; migrated: boolean } {
+  if ((saved.version ?? 1) >= LAYOUT_SCHEMA_VERSION) return { layout: saved, migrated: false };
+  const { panelOrder: _dropOrder, activePanelByRegion: _dropActive, ...kept } = saved;
+  return { layout: { ...kept, version: LAYOUT_SCHEMA_VERSION }, migrated: true };
+}
+
+/** Set when this session's persisted layout was migrated; read once by `consumeLayoutMigration`. */
+let _layoutMigrated = false;
+
+/**
+ * True exactly once per session, when the persisted layout predated the
+ * current schema. `App` uses it to re-apply the ACTIVE builtin workspace's
+ * panel lists (see `reconcileActiveWorkspace`), which the migration dropped
+ * along with the old order.
+ */
+export function consumeLayoutMigration(): boolean {
+  const was = _layoutMigrated;
+  _layoutMigrated = false;
+  return was;
+}
+
 function loadPersistedLayout(): PersistedLayout | null {
   try {
     const raw = localStorage.getItem(LAYOUT_PERSIST_KEY);
     if (!raw) return null;
-    return JSON.parse(raw) as PersistedLayout;
+    const { layout, migrated } = migratePersistedLayout(JSON.parse(raw) as PersistedLayout);
+    _layoutMigrated = migrated;
+    return layout;
   } catch {
     return null;
   }
@@ -63,6 +105,7 @@ function saveLayout(
 ): void {
   try {
     const data: PersistedLayout = {
+      version: LAYOUT_SCHEMA_VERSION,
       regions,
       panelOrder,
       activePanelByRegion,
@@ -136,6 +179,12 @@ export interface PanelRegistration {
   closable?: boolean;
   /** Whether panel is pinned in place. */
   pinned?: boolean;
+  /**
+   * Opened from a menu, not docked by default (`PanelDef.onDemand`). The store
+   * needs it for Reset Layout, which re-docks every registered panel at home
+   * and would otherwise put all the on-demand panels back on the rails.
+   */
+  onDemand?: boolean;
 }
 
 export type LayoutMap = Record<RegionId, RegionState>;
@@ -247,8 +296,10 @@ export interface LayoutStore {
 const DEFAULT_REGIONS: LayoutMap = {
   leftSidebar:           { collapsed: false, size: 280, minSize: 220, maxSize: 640 },
   leftSidebar_bottom:    { collapsed: false, size: 280, minSize: 220, maxSize: 640 },
-  rightInspector:        { collapsed: false, size: 280, minSize: 240, maxSize: 640 },
-  rightInspector_bottom: { collapsed: false, size: 280, minSize: 240, maxSize: 640 },
+  // 320, not 280: the labelled rail takes 56px of the region, and Properties
+  // draws paired X / Y fields that need the room.
+  rightInspector:        { collapsed: false, size: 320, minSize: 240, maxSize: 640 },
+  rightInspector_bottom: { collapsed: false, size: 320, minSize: 240, maxSize: 640 },
   centerWorkspace:       { collapsed: false, size: 0,   minSize: 0,   maxSize: 0   },
   bottomTimeline:        { collapsed: false, size: 240, minSize: 100, maxSize: 600 },
 };
@@ -651,6 +702,9 @@ export const useLayoutStore = create<LayoutStore & LayoutActions>()(
         for (const p of Object.values(s.panels)) {
           const home = p.homeRegion ?? (p.region.startsWith('leftSidebar') ? 'leftSidebar' : p.region.startsWith('rightInspector') ? 'rightInspector' : p.region);
           p.region = home;
+          // "Reset" means the fresh-session layout, and a fresh session does not
+          // dock on-demand panels — they come back from the menu or the "+".
+          if (p.onDemand) continue;
           if (!s.panelOrder[home]) s.panelOrder[home] = [];
           if (!s.panelOrder[home].includes(p.id)) {
             s.panelOrder[home].push(p.id);

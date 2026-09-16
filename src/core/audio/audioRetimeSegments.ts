@@ -10,6 +10,12 @@
  *
  * Ancestor precomp remaps fold outermost → innermost before the node's own
  * remap / stretch / reverse — matching `buildSnapshot` / `compToKeyframeTime`.
+ *
+ * Both retime modes resolve through `retimedChainTime`, so a Speed % curve is
+ * heard exactly as it is seen. The bar's own offset (`inSec − startSec`) is
+ * applied to the retimed value the way the renderer's clip map applies it:
+ * reading the buffer at the raw remap value played the wrong stretch of sound
+ * for any bar that was trimmed or not placed at comp 0.
  */
 
 import type { SceneNode } from '@core/types';
@@ -17,6 +23,8 @@ import { defaultAnimation } from '@motion/animation';
 import { readNodeLayerTime, remapTime, DEFAULT_LAYER_TIME } from '@core/scene/layerTime';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { isPrecomp } from '@core/scene/precomp';
+import { getTimelineController } from '@core/timeline/TimelineController';
+import { hasRetime, pickRetimeBar, retimeClipOf, retimedChainTime, type RetimeClip } from '@core/animation/retime';
 import type { AudioClipTiming } from './audioScene';
 
 export interface AudioRateSegment {
@@ -36,10 +44,18 @@ const RATE_EPS = 0.02;
 const MIN_SEG = 1 / 120;
 
 function hasTimeRemap(nodeId: string): boolean {
-  return (
-    defaultAnimation.isAnimated(nodeId, 'timeRemap')
-    || defaultAnimation.isAnimated(nodeId, 'precompTime')
-  );
+  return hasRetime(defaultAnimation, nodeId);
+}
+
+/** The retime clip of an ancestor precomp at chain time `t`, from its own bar. */
+function ancestorClip(id: string, t: number): RetimeClip | null {
+  try {
+    const c = getTimelineController();
+    const fps = c.fpsForNode(id) || 30;
+    return retimeClipOf(pickRetimeBar(c.getLayersForNode(id), Math.round(t * fps)), fps);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -71,10 +87,7 @@ export function foldAncestorRemapTime(
   let time = compT;
   for (const id of ancestorIdsOuterFirst) {
     if (!hasTimeRemap(id)) continue;
-    time =
-      defaultAnimation.sample(id, 'timeRemap', time)
-      ?? defaultAnimation.sample(id, 'precompTime', time)
-      ?? time;
+    time = retimedChainTime(defaultAnimation, id, time, ancestorClip(id, time)) ?? time;
   }
   return time;
 }
@@ -82,12 +95,15 @@ export function foldAncestorRemapTime(
 /**
  * Source time the picture would show at `compT` for this node's own remap /
  * stretch / reverse / freeze, after folding ancestor precomp remaps.
- * Clip bars are applied by the caller via timing.
+ *
+ * Without `clip`, bars are applied by the caller via timing (the identity
+ * path). With it, the retimed value is carried through the bar's offset here,
+ * because only a retimed value can leave the bar's range.
  */
 export function videoSourceTimeAt(
   node: SceneNode,
   compT: number,
-  opts?: { ancestorIds?: readonly string[] },
+  opts?: { ancestorIds?: readonly string[]; clip?: RetimeClip },
 ): number {
   const cfg = readNodeLayerTime(node) ?? DEFAULT_LAYER_TIME;
   if (cfg.freeze) return cfg.freezeTime;
@@ -95,10 +111,8 @@ export function videoSourceTimeAt(
     compT,
     precompAncestorIdsOuterFirst(node, opts?.ancestorIds),
   );
-  const sampled =
-    defaultAnimation.sample(node.id, 'timeRemap', afterAncestors)
-    ?? defaultAnimation.sample(node.id, 'precompTime', afterAncestors);
-  const base = sampled !== undefined ? sampled : afterAncestors;
+  const retimed = retimedChainTime(defaultAnimation, node.id, afterAncestors, opts?.clip ?? null);
+  const base = (retimed !== undefined ? retimed : afterAncestors) + (opts?.clip?.offsetSec ?? 0);
   const span = defaultAnimation.timeSpan(node.id) ?? { start: 0, end: Math.max(base, 1) };
   return remapTime(base, { ...cfg, freeze: false }, span);
 }
@@ -128,13 +142,15 @@ export function buildAudioRetimeSegments(
   const barLen = Math.max(0, timing.outSec - timing.inSec);
   if (barLen <= 0) return [];
 
+  // This bar's clip map, in the renderer's terms: source = chain + offset.
+  const clip: RetimeClip = { offsetSec: timing.inSec - timing.startSec, inSec: timing.startSec };
   const t0 = timing.startSec;
   const tEnd = timing.startSec + barLen;
   const samples: Array<{ t: number; s: number }> = [];
   for (let t = t0; t < tEnd - 1e-9; t += step) {
-    samples.push({ t, s: videoSourceTimeAt(node, t, { ancestorIds: ancestors }) });
+    samples.push({ t, s: videoSourceTimeAt(node, t, { ancestorIds: ancestors, clip }) });
   }
-  samples.push({ t: tEnd, s: videoSourceTimeAt(node, tEnd, { ancestorIds: ancestors }) });
+  samples.push({ t: tEnd, s: videoSourceTimeAt(node, tEnd, { ancestorIds: ancestors, clip }) });
 
   const raw: AudioRateSegment[] = [];
   for (let i = 0; i < samples.length - 1; i++) {

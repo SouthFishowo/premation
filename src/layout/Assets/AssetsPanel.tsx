@@ -117,8 +117,8 @@ const FOLDER_ROW_H = 26;
 const CARD_MIN_W = 104;
 const GRID_GAP = 8;
 const GRID_PAD = 16;
-/** Name line + meta line + card padding, under the 16:9 well. */
-const CARD_CHROME_H = 40;
+/** Name line + meta line + card padding + border + vertical gaps. */
+const CARD_CHROME_H = 54;
 /** How old an `importedAt` may be and still count as "just imported". Wide
  *  enough for a slow batch (thumbnails, probes) to land after the first file
  *  is stamped; narrow enough that a bundle restored with last week's stamps
@@ -135,11 +135,13 @@ const SORT_LABEL: Record<AssetSortKey, string> = {
   used: 'Times used',
 };
 
-/** One rendered line. `depth` drives only the indent. */
+/** One rendered line. `depth` drives the hierarchy indent and guide line. */
 type AssetRow =
-  | { kind: 'folder'; key: string; depth: number; folder: AssetFolder }
+  | { kind: 'folder'; key: string; depth: number; folder: AssetFolder; count: number }
+  | { kind: 'empty-folder'; key: string; depth: number; folder: AssetFolder }
+  | { kind: 'section'; key: string; depth: number; title: string }
   | { kind: 'asset'; key: string; depth: number; asset: ImportedAsset }
-  | { kind: 'cards'; key: string; depth: number; assets: ImportedAsset[] };
+  | { kind: 'cards'; key: string; depth: number; folderId: string | null; assets: ImportedAsset[] };
 
 /** Measured box size, for the virtual list's height and the grid's columns. */
 function useHostSize(): [React.RefObject<HTMLDivElement>, { width: number; height: number }] {
@@ -810,33 +812,55 @@ export function AssetsPanel(): JSX.Element {
   // Grid geometry from the measured host. Columns first, then the card
   // height that a 16:9 well at that width implies.
   const cols = view === 'grid' ? Math.max(2, Math.floor((hostSize.width - GRID_PAD + GRID_GAP) / (CARD_MIN_W + GRID_GAP))) : 1;
-  const cardW = view === 'grid' ? (hostSize.width - GRID_PAD - (cols - 1) * GRID_GAP) / cols : 0;
+  const cardW = view === 'grid' && hostSize.width > 0 ? (hostSize.width - GRID_PAD - (cols - 1) * GRID_GAP) / cols : 120;
   const cardRowH = Math.round((cardW * 9) / 16 + CARD_CHROME_H);
 
   const rows = useMemo<AssetRow[]>(() => {
     const out: AssetRow[] = [];
-    const pushAssets = (list: ImportedAsset[], depth: number): void => {
+    const pushAssets = (list: ImportedAsset[], depth: number, folderId?: string | null): void => {
       if (view === 'grid') {
         for (let i = 0; i < list.length; i += cols) {
           const chunk = list.slice(i, i + cols);
-          out.push({ kind: 'cards', key: `cards:${depth}:${chunk[0]!.id}`, depth, assets: chunk });
+          out.push({
+            kind: 'cards',
+            key: `cards:${depth}:${folderId ?? 'root'}:${chunk[0]!.id}`,
+            depth,
+            folderId: folderId ?? null,
+            assets: chunk,
+          });
         }
       } else {
         for (const a of list) out.push({ kind: 'asset', key: a.id, depth, asset: a });
       }
     };
     if (flat) {
-      pushAssets(visibleAssets, 0);
+      pushAssets(visibleAssets, 0, null);
       return out;
     }
     const build = (parentId: string | null, depth: number): void => {
       for (const f of childFolders(parentId)) {
-        out.push({ kind: 'folder', key: f.id, depth, folder: f });
+        const folderAssets = visibleAssets.filter((a) => (a.folderId ?? null) === f.id);
+        out.push({ kind: 'folder', key: f.id, depth, folder: f, count: folderAssets.length });
         // Closed folders contribute nothing — that is what makes this a tree
         // rather than an indented flat list.
-        if (expandedFolders.has(f.id)) build(f.id, depth + 1);
+        if (expandedFolders.has(f.id)) {
+          build(f.id, depth + 1);
+          if (view === 'grid' && folderAssets.length === 0) {
+            out.push({ kind: 'empty-folder', key: `empty:${f.id}`, depth: depth + 1, folder: f });
+          } else {
+            pushAssets(folderAssets, depth + 1, f.id);
+          }
+        }
       }
-      pushAssets(visibleAssets.filter((a) => (a.folderId ?? null) === parentId), depth);
+      if (parentId === null) {
+        const rootAssets = visibleAssets.filter((a) => (a.folderId ?? null) === null);
+        if (rootAssets.length > 0) {
+          if (view === 'grid' && folders.length > 0) {
+            out.push({ kind: 'section', key: 'section:root-media', depth: 0, title: `Media (${rootAssets.length})` });
+          }
+          pushAssets(rootAssets, 0, null);
+        }
+      }
     };
     build(null, 0);
     return out;
@@ -924,21 +948,158 @@ export function AssetsPanel(): JSX.Element {
     </button>
   );
 
-  const renderFolderRow = (row: Extract<AssetRow, { kind: 'folder' }>): JSX.Element => (
+  const renderFolderRow = (row: Extract<AssetRow, { kind: 'folder' }>): JSX.Element => {
+    const isGrid = view === 'grid';
+    const isExpanded = expandedFolders.has(row.folder.id);
+    const isDropTarget = dropFolderId === row.folder.id;
+    const isCurrent = currentFolderId === row.folder.id;
+
+    if (isGrid) {
+      return (
+        <div
+          role="treeitem"
+          aria-expanded={isExpanded}
+          className={`${styles.assetGridFolder}${isDropTarget ? ` ${styles.dropActive}` : ''}${isCurrent ? ` ${styles.assetGridFolderActive}` : ''}`}
+          style={{ marginLeft: 8 + row.depth * 12, marginRight: 8 }}
+          title={row.folder.name}
+          onClick={() => {
+            if (renamingId === row.folder.id) return;
+            setCurrentFolderId(row.folder.id);
+            toggleFolder(row.folder.id);
+            setSelectedAssetIds(new Set());
+            setSelectionAnchor(null);
+          }}
+          onContextMenu={(e) => openFolderMenu(row.folder, e)}
+          onDragOver={(e) => { e.preventDefault(); setDropFolderId(row.folder.id); }}
+          onDragLeave={() => setDropFolderId((cur) => (cur === row.folder.id ? null : cur))}
+          onDrop={(e) => {
+            e.preventDefault();
+            const assetId = e.dataTransfer.getData('text/asset-id');
+            if (assetId) moveAssetToFolder(assetId, row.folder.id);
+            setDropFolderId(null);
+          }}
+        >
+          <Icon
+            name={isExpanded ? 'chevron-down' : 'chevron-right'}
+            size="sm"
+            className={styles.assetTwisty}
+          />
+          <Icon
+            name={isExpanded ? 'folder-open' : 'folder'}
+            size="md"
+            className={styles.assetGlyphFolder}
+            style={{ color: FOLDER_COLOR }}
+          />
+          {renamingId === row.folder.id ? (
+            <input
+              ref={(el) => {
+                if (el) {
+                  el.focus();
+                  el.select();
+                }
+              }}
+              defaultValue={row.folder.name}
+              className={styles.assetRename}
+              onClick={(e) => e.stopPropagation()}
+              onBlur={(e) => {
+                const val = e.target.value.trim();
+                if (val) renameFolder(row.folder.id, val);
+                setRenamingId(null);
+              }}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === 'Enter') {
+                  const val = (e.target as HTMLInputElement).value.trim();
+                  if (val) renameFolder(row.folder.id, val);
+                  setRenamingId(null);
+                }
+                if (e.key === 'Escape') setRenamingId(null);
+              }}
+            />
+          ) : (
+            <span className={styles.assetRowName}>{row.folder.name}</span>
+          )}
+          <span className={styles.assetGridFolderBadge}>
+            {row.count > 0 ? `${row.count} ${row.count === 1 ? 'item' : 'items'}` : 'Empty'}
+          </span>
+        </div>
+      );
+    }
+
+    return (
+      <div
+        role="treeitem"
+        aria-expanded={isExpanded}
+        className={`${styles.assetRow}${isDropTarget ? ` ${styles.dropActive}` : ''}${isCurrent ? ` ${styles.assetRowActive}` : ''}`}
+        style={{ paddingLeft: 8 + row.depth * 16 }}
+        title={row.folder.name}
+        onClick={() => {
+          if (renamingId === row.folder.id) return;
+          setCurrentFolderId(row.folder.id);
+          toggleFolder(row.folder.id);
+          setSelectedAssetIds(new Set());
+          setSelectionAnchor(null);
+        }}
+        onContextMenu={(e) => openFolderMenu(row.folder, e)}
+        onDragOver={(e) => { e.preventDefault(); setDropFolderId(row.folder.id); }}
+        onDragLeave={() => setDropFolderId((cur) => (cur === row.folder.id ? null : cur))}
+        onDrop={(e) => {
+          e.preventDefault();
+          const assetId = e.dataTransfer.getData('text/asset-id');
+          if (assetId) moveAssetToFolder(assetId, row.folder.id);
+          setDropFolderId(null);
+        }}
+      >
+        <Icon
+          name={isExpanded ? 'chevron-down' : 'chevron-right'}
+          size="sm"
+          className={styles.assetTwisty}
+        />
+        <Icon
+          name={isExpanded ? 'folder-open' : 'folder'}
+          size="md"
+          className={styles.assetGlyphFolder}
+          style={{ color: FOLDER_COLOR }}
+        />
+        {renamingId === row.folder.id ? (
+          <input
+            ref={(el) => {
+              if (el) {
+                el.focus();
+                el.select();
+              }
+            }}
+            defaultValue={row.folder.name}
+            className={styles.assetRename}
+            onClick={(e) => e.stopPropagation()}
+            onBlur={(e) => {
+              const val = e.target.value.trim();
+              if (val) renameFolder(row.folder.id, val);
+              setRenamingId(null);
+            }}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === 'Enter') {
+                const val = (e.target as HTMLInputElement).value.trim();
+                if (val) renameFolder(row.folder.id, val);
+                setRenamingId(null);
+              }
+              if (e.key === 'Escape') setRenamingId(null);
+            }}
+          />
+        ) : (
+          <span className={styles.assetRowName}>{row.folder.name}</span>
+        )}
+        <span className={styles.assetRowType}>Folder</span>
+        <span className={styles.assetRowSize} />
+      </div>
+    );
+  };
+
+  const renderEmptyFolderRow = (row: Extract<AssetRow, { kind: 'empty-folder' }>): JSX.Element => (
     <div
-      role="treeitem"
-      aria-expanded={expandedFolders.has(row.folder.id)}
-      className={`${styles.assetRow}${dropFolderId === row.folder.id ? ` ${styles.dropActive}` : ''}${currentFolderId === row.folder.id ? ` ${styles.assetRowActive}` : ''}`}
-      style={{ paddingLeft: 8 + row.depth * 16 }}
-      title={row.folder.name}
-      onClick={() => {
-        if (renamingId === row.folder.id) return;
-        setCurrentFolderId(row.folder.id);
-        toggleFolder(row.folder.id);
-        setSelectedAssetIds(new Set());
-        setSelectionAnchor(null);
-      }}
-      onContextMenu={(e) => openFolderMenu(row.folder, e)}
+      className={`${styles.assetGridEmptyFolder}${dropFolderId === row.folder.id ? ` ${styles.dropActive}` : ''}`}
+      style={{ marginLeft: 8 + (row.depth - 1) * 12, marginRight: 8 }}
       onDragOver={(e) => { e.preventDefault(); setDropFolderId(row.folder.id); }}
       onDragLeave={() => setDropFolderId((cur) => (cur === row.folder.id ? null : cur))}
       onDrop={(e) => {
@@ -948,48 +1109,15 @@ export function AssetsPanel(): JSX.Element {
         setDropFolderId(null);
       }}
     >
-      <Icon
-        name={expandedFolders.has(row.folder.id) ? 'chevron-down' : 'chevron-right'}
-        size="sm"
-        className={styles.assetTwisty}
-      />
-      <Icon
-        name={expandedFolders.has(row.folder.id) ? 'folder-open' : 'folder'}
-        size="md"
-        className={styles.assetGlyphFolder}
-        style={{ color: FOLDER_COLOR }}
-      />
-      {renamingId === row.folder.id ? (
-        <input
-          ref={(el) => {
-            if (el) {
-              el.focus();
-              el.select();
-            }
-          }}
-          defaultValue={row.folder.name}
-          className={styles.assetRename}
-          onClick={(e) => e.stopPropagation()}
-          onBlur={(e) => {
-            const val = e.target.value.trim();
-            if (val) renameFolder(row.folder.id, val);
-            setRenamingId(null);
-          }}
-          onKeyDown={(e) => {
-            e.stopPropagation();
-            if (e.key === 'Enter') {
-              const val = (e.target as HTMLInputElement).value.trim();
-              if (val) renameFolder(row.folder.id, val);
-              setRenamingId(null);
-            }
-            if (e.key === 'Escape') setRenamingId(null);
-          }}
-        />
-      ) : (
-        <span className={styles.assetRowName}>{row.folder.name}</span>
-      )}
-      <span className={styles.assetRowType}>Folder</span>
-      <span className={styles.assetRowSize} />
+      <Icon name="folder-open" size="sm" />
+      <span>Folder is empty · Drop files here</span>
+    </div>
+  );
+
+  const renderSectionHeaderRow = (row: Extract<AssetRow, { kind: 'section' }>): JSX.Element => (
+    <div className={styles.assetGridSectionHeader}>
+      <span>{row.title}</span>
+      <span className={styles.assetGridSectionHeaderLine} aria-hidden />
     </div>
   );
 
@@ -1038,41 +1166,46 @@ export function AssetsPanel(): JSX.Element {
     );
   };
 
-  const renderCardsRow = (row: Extract<AssetRow, { kind: 'cards' }>): JSX.Element => (
-    // The column count is a measured layout value, not a design token — the
-    // one inline style the grid rules allow (see `.assetGridRow`).
-    <div className={styles.assetGridRow} style={{ '--asset-grid-cols': cols, paddingLeft: 8 + row.depth * 16 } as React.CSSProperties} role="row">
-      {row.assets.map((asset) => {
-        const visual = getAssetVisualInfo(asset);
-        const label = labelColorOf(asset);
-        const selected = selectedAssetIds.has(asset.id);
-        return (
-          <div
-            key={asset.id}
-            role="treeitem"
-            aria-selected={selected}
-            className={`${styles.assetCard}${selected ? ` ${styles.assetCardSelected}` : ''}`}
-            title={asset.tags?.length ? `${asset.name}\nTags: ${asset.tags.join(', ')}` : asset.name}
-            data-focused={focusedAssetId === asset.id || undefined}
-            onClick={(e) => selectAsset(asset.id, e, orderedAssetIds)}
-            onDoubleClick={() => openFootagePreview(asset)}
-            onContextMenu={(e) => openAssetMenu(asset, e)}
-            {...dragHandlers(asset)}
-          >
-            {label && <span className={styles.assetCardStripe} style={{ background: label }} aria-hidden />}
-            <AssetThumb asset={asset} variant="card" scrub />
-            <span className={styles.assetCardName}>{asset.name}</span>
-            <span className={styles.assetCardMeta}>
-              <span>{visual.label}</span>
-              <span>·</span>
-              <span>{formatBytes(asset.size)}</span>
-              {usedCount(asset.id) > 0 && <span title={`Used by ${usedCount(asset.id)} layer${usedCount(asset.id) === 1 ? '' : 's'}`}>· ×{usedCount(asset.id)}</span>}
-            </span>
-          </div>
-        );
-      })}
-    </div>
-  );
+  const renderCardsRow = (row: Extract<AssetRow, { kind: 'cards' }>): JSX.Element => {
+    const inFolder = row.depth > 0 || row.folderId !== null;
+    return (
+      <div
+        className={`${styles.assetGridRow}${inFolder ? ` ${styles.assetGridRowFolder}` : ''}`}
+        style={{ '--asset-grid-cols': cols } as React.CSSProperties}
+        role="row"
+      >
+        {row.assets.map((asset) => {
+          const visual = getAssetVisualInfo(asset);
+          const label = labelColorOf(asset);
+          const selected = selectedAssetIds.has(asset.id);
+          return (
+            <div
+              key={asset.id}
+              role="treeitem"
+              aria-selected={selected}
+              className={`${styles.assetCard}${selected ? ` ${styles.assetCardSelected}` : ''}`}
+              title={asset.tags?.length ? `${asset.name}\nTags: ${asset.tags.join(', ')}` : asset.name}
+              data-focused={focusedAssetId === asset.id || undefined}
+              onClick={(e) => selectAsset(asset.id, e, orderedAssetIds)}
+              onDoubleClick={() => openFootagePreview(asset)}
+              onContextMenu={(e) => openAssetMenu(asset, e)}
+              {...dragHandlers(asset)}
+            >
+              {label && <span className={styles.assetCardStripe} style={{ background: label }} aria-hidden />}
+              <AssetThumb asset={asset} variant="card" scrub />
+              <span className={styles.assetCardName}>{asset.name}</span>
+              <span className={styles.assetCardMeta}>
+                <span>{visual.label}</span>
+                <span>·</span>
+                <span>{formatBytes(asset.size)}</span>
+                {usedCount(asset.id) > 0 && <span title={`Used by ${usedCount(asset.id)} layer${usedCount(asset.id) === 1 ? '' : 's'}`}>· ×{usedCount(asset.id)}</span>}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
 
   const browseAvailable = canBrowseMedia();
 
@@ -1101,11 +1234,11 @@ export function AssetsPanel(): JSX.Element {
             role="tab"
             aria-selected={tab === 'bin'}
             className={tab === 'bin' ? styles.libTabActive : styles.libTab}
-            title="Project — the files this project has imported. Saved with the project."
+            title="Assets — the files this project has imported. Saved with the project."
             onClick={() => setTab('bin')}
           >
             <Icon name="media" size="sm" />
-            <span>Project</span>
+            <span>Assets</span>
           </button>
           <button
             type="button"
@@ -1368,13 +1501,30 @@ export function AssetsPanel(): JSX.Element {
               <VirtualList
                 items={rows}
                 itemHeight={LIST_ROW_H}
-                getItemHeight={(row) => (row.kind === 'cards' ? cardRowH : row.kind === 'folder' ? FOLDER_ROW_H : LIST_ROW_H)}
+                getItemHeight={(row) => {
+                  if (row.kind === 'cards') return cardRowH;
+                  if (row.kind === 'folder') return view === 'grid' ? 34 : FOLDER_ROW_H;
+                  if (row.kind === 'empty-folder') return 38;
+                  if (row.kind === 'section') return 28;
+                  return LIST_ROW_H;
+                }}
                 height={hostSize.height > 0 ? hostSize.height : '100%'}
                 scrollToIndex={scrollToIndex}
                 itemKey={(row) => row.key}
-                renderItem={(row) =>
-                  row.kind === 'folder' ? renderFolderRow(row) : row.kind === 'asset' ? renderAssetRow(row) : renderCardsRow(row)
-                }
+                renderItem={(row) => {
+                  switch (row.kind) {
+                    case 'folder':
+                      return renderFolderRow(row);
+                    case 'empty-folder':
+                      return renderEmptyFolderRow(row);
+                    case 'section':
+                      return renderSectionHeaderRow(row);
+                    case 'asset':
+                      return renderAssetRow(row);
+                    case 'cards':
+                      return renderCardsRow(row);
+                  }
+                }}
               />
             )}
           </div>

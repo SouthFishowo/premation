@@ -14,6 +14,7 @@ import type { RenderView } from '@core/rendering/RenderBackend';
 import { useSelectionStore } from '@stores/selectionStore';
 import { useCompositionStore } from '@stores/compositionStore';
 import { createSceneGraphPort, createSelectionPort, createCommandPort } from './ports';
+import { setRenderFlusher } from '@core/perf/framePump';
 
 /** Map the app's tool-bar tools onto engine tool ids. */
 const TOOL_MAP: Record<UITool, string> = {
@@ -39,6 +40,10 @@ const TOOL_MAP: Record<UITool, string> = {
   'mask-rect': 'mask-rect',
   'mask-ellipse': 'mask-ellipse',
   'mask-pen': 'mask-pen',
+  'add-vertex': 'add-vertex',
+  'delete-vertex': 'delete-vertex',
+  'convert-vertex': 'convert-vertex',
+  'mask-feather': 'mask-feather',
   // Like puppet-pin and bone, the HOST owns this gesture: `useWorkspace`'s paint
   // branch captures the pointer and returns before the engine sees it. The
   // mapping only decides what happens when paint has no valid target, and there
@@ -71,6 +76,10 @@ export class WorkspaceController {
    */
   private renderCbs = new Set<() => void>();
   private rafId: number | null = null;
+  /** A redraw has been requested and not yet run. */
+  private dirty = false;
+  /** rAF timestamp of the last render — one render per animation frame. */
+  private lastRenderFrameTs = -1;
 
   /** AE-style auto-fit: when on, the comp is re-framed to fill the viewport on
    *  every viewport resize (panel collapse/expand) and comp-size change. A manual
@@ -93,6 +102,10 @@ export class WorkspaceController {
       camera: { minZoom: 0.05, maxZoom: 32 },
     });
     this.ws.initialize();
+
+    // The playback pump flushes the viewport inside its own frame — see
+    // `core/perf/framePump.ts` and `flushRender` below.
+    setRenderFlusher((frameTs) => { this.flushRender(frameTs); });
 
     // Any camera change the app didn't drive via fitComposition is a user
     // zoom/pan → stop auto-fitting so their framing is preserved.
@@ -195,12 +208,44 @@ export class WorkspaceController {
   }
 
   private scheduleRender(): void {
-    if (this.rafId !== null || this.renderCbs.size === 0) return;
-    this.rafId = requestAnimationFrame(() => {
+    if (this.renderCbs.size === 0) return;
+    this.dirty = true;
+    if (this.rafId !== null) return;
+    this.rafId = requestAnimationFrame((ts) => {
       this.rafId = null;
-      // Copy first: a subscriber may unsubscribe (or subscribe) during the tick.
-      for (const cb of [...this.renderCbs]) cb();
+      this.runRender(ts);
     });
+  }
+
+  private runRender(frameTs?: number): void {
+    if (!this.dirty) return;
+    // Cleared BEFORE the callbacks: a subscriber that requests another redraw
+    // from inside the tick schedules the next frame, exactly as it always did.
+    this.dirty = false;
+    if (frameTs !== undefined) this.lastRenderFrameTs = frameTs;
+    // Copy first: a subscriber may unsubscribe (or subscribe) during the tick.
+    for (const cb of [...this.renderCbs]) cb();
+  }
+
+  /**
+   * Run a pending redraw NOW, inside the caller's animation frame, and cancel
+   * its queued rAF. Returns whether it rendered.
+   *
+   * For the playback pump: it advances the clock inside a rAF callback, and a
+   * redraw requested from there would otherwise land one vsync later. With
+   * `frameTs` (the caller's rAF timestamp) it refuses to render twice in one
+   * frame — if this frame already rendered, the queued rAF draws the new time
+   * in the next one, which is what would have happened anyway.
+   */
+  flushRender(frameTs?: number): boolean {
+    if (!this.dirty || this.renderCbs.size === 0) return false;
+    if (frameTs !== undefined && frameTs === this.lastRenderFrameTs) return false;
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+    this.runRender(frameTs);
+    return true;
   }
 
   /** Force an immediate redraw request (e.g. after an external scene change). */

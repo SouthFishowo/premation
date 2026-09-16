@@ -8,7 +8,8 @@ import { RenderPass, type RenderPassContext } from '../RenderPass';
 import { beginViewportPass, beginSizedPass, emitSolid, emitTextured, emitSilhouette, emitMaskedTextured, emitLutTextured, emitMatteCombine, emitBlendCombine, modelFromRect, mvpFor, writeAttachment, emitLayerTexture, screenMvp, targetSampleUv, mvp3dFor, emitSolid3D, emitTextured3D, emitLutTextured3D, emitMaskedTextured3D, emitMesh3D, emitShadowCaster, emitSsao, emitSsaoBlur } from './passUtils';
 import { addTransformedBox, boxIsEmpty, emptyBox, shadowCameraFor, shadowMapSizeOf, type ShadowCamera, type WorldBox } from './shadowMap';
 import { ssaoBufferSize, ssaoCameraFor, ssaoFarFor, ssaoIntensityOf, ssaoRadiusOf, SSAO_SAMPLES } from './ssao';
-import { BLUR_MATERIAL, BOKEH_MATERIAL, COC_BLUR_MATERIAL, DOF_GATHER_MATERIAL, GLASS_MATERIAL, GRADIENT_RAMP_MATERIAL, FRACTAL_NOISE_MATERIAL, DISPLACEMENT_MAP_MATERIAL, COMPOUND_BLUR_MATERIAL, APPLY_COLOR_LUT_MATERIAL, SET_MATTE_MATERIAL, MOTION_TILE_MATERIAL, FILL_MATERIAL, STROKE_MATERIAL, SHARPEN_MATERIAL, NOISE_MATERIAL, BEAM_MATERIAL, LIGHT_SWEEP_MATERIAL, LENS_FLARE_MATERIAL, LIGHT_RAYS_MATERIAL, BEND_MATERIAL, BEVEL_ALPHA_MATERIAL, BEVEL_EDGES_MATERIAL, SPOTLIGHT_MATERIAL, SPHERE_MATERIAL, CYLINDER_MATERIAL, ARITHMETIC_MATERIAL, VIGNETTE_MATERIAL, BLACK_AND_WHITE_MATERIAL, TRITONE_MATERIAL, PHOTO_FILTER_MATERIAL, THRESHOLD_MATERIAL, VIBRANCE_MATERIAL, MIRROR_MATERIAL, OFFSET_MATERIAL, BULGE_MATERIAL, TWIRL_MATERIAL, SPHERIZE_MATERIAL, KALEIDOSCOPE_MATERIAL, RIPPLE_MATERIAL, CHROMATIC_ABERRATION_MATERIAL, MAGNIFY_MATERIAL, MOSAIC_MATERIAL, FIND_EDGES_MATERIAL, EMBOSS_MATERIAL, COLOR_EMBOSS_MATERIAL, HALFTONE_MATERIAL, RADIAL_BLUR_MATERIAL, CORNER_PIN_MATERIAL, TRANSFORM_FX_MATERIAL, KEYLIGHT_MATERIAL, LINEAR_COLOR_KEY_MATERIAL, LUMA_KEY_MATERIAL, COLOR_KEY_MATERIAL, COLOR_RANGE_MATERIAL, EXTRACT_MATERIAL, SPILL_SUPPRESSOR_MATERIAL, WAVE_WARP_MATERIAL, ALPHA_MORPH_MATERIAL, ALPHA_BOX_MATERIAL, DIRECTIONAL_BLUR_MATERIAL, LINEAR_WIPE_MATERIAL, SHIFT_CHANNELS_MATERIAL, ALPHA_LEVELS_MATERIAL, SOLID_COMPOSITE_MATERIAL, CHANNEL_COMBINER_MATERIAL, REMOVE_COLOR_MATTING_MATERIAL, CHANGE_COLOR_MATERIAL, CHANGE_TO_COLOR_MATERIAL, LEAVE_COLOR_MATERIAL, TONER_MATERIAL, VENETIAN_BLINDS_MATERIAL, RADIAL_WIPE_MATERIAL, IRIS_WIPE_MATERIAL, LINE_SWEEP_MATERIAL, CHANNEL_BOX_MATERIAL, MINMAX_MATERIAL, UNSHARP_MASK_MATERIAL, SHADOW_HIGHLIGHT_MATERIAL, CHECKERBOARD_MATERIAL, GRID_MATERIAL, FOUR_COLOR_GRADIENT_MATERIAL, CIRCLE_MATERIAL, ELLIPSE_MATERIAL, RADIAL_SHADOW_PROJECT_FX_MATERIAL, RADIAL_SHADOW_FX_MATERIAL, PLASTIC_FX_MATERIAL, GLASS_FX_MATERIAL, VECTOR_BLUR_FX_MATERIAL, FX_HISTOGRAM_FX_MATERIAL, FX_AUTO_TABLE_FX_MATERIAL, FX_AUTO_APPLY_FX_MATERIAL, DEEP_GLOW_ACC_FX_MATERIAL, DEEP_GLOW_BLUR_FX_MATERIAL, DEEP_GLOW_COMPOSITE_FX_MATERIAL } from '../../shaders/Material';
+import { BLUR_MATERIAL, BOKEH_MATERIAL, COC_BLUR_MATERIAL, DOF_GATHER_MATERIAL, GLASS_MATERIAL, GRADIENT_RAMP_MATERIAL, FRACTAL_NOISE_MATERIAL, DISPLACEMENT_MAP_MATERIAL, COMPOUND_BLUR_MATERIAL, APPLY_COLOR_LUT_MATERIAL, SET_MATTE_MATERIAL, MOTION_TILE_MATERIAL, FILL_MATERIAL, STROKE_MATERIAL, SHARPEN_MATERIAL, NOISE_MATERIAL, BEAM_MATERIAL, LIGHT_SWEEP_MATERIAL, LENS_FLARE_MATERIAL, LIGHT_RAYS_MATERIAL, BEND_MATERIAL, BEVEL_ALPHA_MATERIAL, BEVEL_EDGES_MATERIAL, SPOTLIGHT_MATERIAL, SPHERE_MATERIAL, CYLINDER_MATERIAL, ARITHMETIC_MATERIAL, VIGNETTE_MATERIAL, BLACK_AND_WHITE_MATERIAL, TRITONE_MATERIAL, PHOTO_FILTER_MATERIAL, THRESHOLD_MATERIAL, VIBRANCE_MATERIAL, MIRROR_MATERIAL, OFFSET_MATERIAL, BULGE_MATERIAL, TWIRL_MATERIAL, SPHERIZE_MATERIAL, KALEIDOSCOPE_MATERIAL, RIPPLE_MATERIAL, CHROMATIC_ABERRATION_MATERIAL, MAGNIFY_MATERIAL, MOSAIC_MATERIAL, FIND_EDGES_MATERIAL, EMBOSS_MATERIAL, COLOR_EMBOSS_MATERIAL, HALFTONE_MATERIAL, RADIAL_BLUR_MATERIAL, CORNER_PIN_MATERIAL, TRANSFORM_FX_MATERIAL, KEYLIGHT_MATERIAL, LINEAR_COLOR_KEY_MATERIAL, LUMA_KEY_MATERIAL, COLOR_KEY_MATERIAL, COLOR_RANGE_MATERIAL, EXTRACT_MATERIAL, SPILL_SUPPRESSOR_MATERIAL, WAVE_WARP_MATERIAL, ALPHA_MORPH_MATERIAL, ALPHA_BOX_MATERIAL, DIRECTIONAL_BLUR_MATERIAL, LINEAR_WIPE_MATERIAL, SHIFT_CHANNELS_MATERIAL, ALPHA_LEVELS_MATERIAL, SOLID_COMPOSITE_MATERIAL, CHANNEL_COMBINER_MATERIAL, REMOVE_COLOR_MATTING_MATERIAL, CHANGE_COLOR_MATERIAL, CHANGE_TO_COLOR_MATERIAL, LEAVE_COLOR_MATERIAL, TONER_MATERIAL, VENETIAN_BLINDS_MATERIAL, RADIAL_WIPE_MATERIAL, IRIS_WIPE_MATERIAL, LINE_SWEEP_MATERIAL, CHANNEL_BOX_MATERIAL, MINMAX_MATERIAL, UNSHARP_MASK_MATERIAL, SHADOW_HIGHLIGHT_MATERIAL, CHECKERBOARD_MATERIAL, GRID_MATERIAL, FOUR_COLOR_GRADIENT_MATERIAL, CIRCLE_MATERIAL, ELLIPSE_MATERIAL, RADIAL_SHADOW_PROJECT_FX_MATERIAL, RADIAL_SHADOW_FX_MATERIAL, PLASTIC_FX_MATERIAL, GLASS_FX_MATERIAL, VECTOR_BLUR_FX_MATERIAL, FX_HISTOGRAM_FX_MATERIAL, FX_AUTO_TABLE_FX_MATERIAL, FX_AUTO_APPLY_FX_MATERIAL, DEEP_GLOW_ACC_FX_MATERIAL, DEEP_GLOW_BLUR_FX_MATERIAL, DEEP_GLOW_COMPOSITE_FX_MATERIAL, EFFECT_OPACITY_FX_MATERIAL } from '../../shaders/Material';
+import { GENERATOR_TARGET, renderGeneratorField } from './generatorField';
 import { roundElevenSinglePass } from './roundElevenFx';
 import { roundTwelveSinglePass, roundTwelveFieldPass } from './roundTwelveFx';
 import { roundFifteenSinglePass } from './roundFifteenFx';
@@ -301,7 +302,13 @@ const IDENTITY_MODEL: readonly number[] = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0
  * effect is not a new kind of pass.
  */
 const pluginMaterials = new Map<string, MaterialDescriptor>();
-function pluginMaterial(shader: string, readsMap: boolean, readsOrigin: boolean): MaterialDescriptor {
+function pluginMaterial(
+  shader: string,
+  readsMap: boolean,
+  readsOrigin: boolean,
+  /** How many EXTRA layer inputs (bindings 5/6/7) beyond the first. */
+  extraLayers = 0,
+): MaterialDescriptor {
   let m = pluginMaterials.get(shader);
   if (!m) {
     m = {
@@ -342,12 +349,43 @@ function pluginMaterial(shader: string, readsMap: boolean, readsOrigin: boolean)
         ...(readsOrigin
           ? [{ binding: 4, type: 'texture' as const, stages: ['fragment' as const] }]
           : []),
+        /*
+          Bindings 5/6/7: an effect's second through fourth layer inputs.
+
+          Numbered from 5 because 4 is `origin` whether or not this effect has
+          one — the same argument that fixed `origin` at 4 in the first place.
+          Declared only when the shader asks, for the same reason again: a
+          declared binding with nothing bound is an invalid pipeline, which is
+          a dead viewport rather than a missing input.
+        */
+        ...PLUGIN_EXTRA_LAYER_BINDINGS.slice(0, extraLayers).map((binding) => ({
+          binding, type: 'texture' as const, stages: ['fragment' as const],
+        })),
+      ],
+      /*
+        GLSL sampler names, in bind-group ENTRY order.
+
+        WebGL2 has no binding numbers for samplers: the backend points a uniform
+        at a texture unit by NAME, counting texture entries in the order this
+        pass pushes them — input, binding 3, binding 4, then 5/6/7. The names
+        are the ones the app's GLSL generator declares, which is why they are
+        fixed strings rather than the author's own: this package has never heard
+        of a plugin's vocabulary and must not start.
+      */
+      glslSamplers: [
+        'src',
+        ...(readsMap ? ['pluginLayer0'] : []),
+        ...(readsOrigin ? ['pluginOrigin'] : []),
+        ...['pluginLayer1', 'pluginLayer2', 'pluginLayer3'].slice(0, extraLayers),
       ],
     };
     pluginMaterials.set(shader, m);
   }
   return m;
 }
+
+/** Bindings for an effect's layer inputs past the first. See `pluginMaterial`. */
+export const PLUGIN_EXTRA_LAYER_BINDINGS = [5, 6, 7] as const;
 
 const BLUR_TAIL = 2.5;
 
@@ -467,7 +505,7 @@ interface ListState {
 export class CompositionPass extends RenderPass {
   readonly name = 'composition';
   override get writes() {
-    return [EffectPass.activeColorTarget, LAYER_TARGET, BLUR_TARGET1, BLUR_TARGET2, BLUR_TARGET3, MATTE_TARGET, DOF_TARGET, FX_HIST_TARGET, FX_LUT_TARGET, ...PRECOMP_TARGETS];
+    return [EffectPass.activeColorTarget, LAYER_TARGET, BLUR_TARGET1, BLUR_TARGET2, BLUR_TARGET3, MATTE_TARGET, DOF_TARGET, FX_HIST_TARGET, FX_LUT_TARGET, GENERATOR_TARGET, ...PRECOMP_TARGETS];
   }
   override readonly after = ['background'];
 
@@ -594,7 +632,43 @@ export class CompositionPass extends RenderPass {
     let curTex = inputTex;
     let curName = pool[0];
 
+    /*
+      Compositing Options ▸ Effect Opacity (`RenderableEffect.effectOpacity` —
+      not `opacity`, which some entries use for their own parameters).
+
+      The entry's INPUT is remembered before its branch runs and blended back
+      under its output once the branch is done. Nothing is copied to do that:
+      every branch below draws only into `free` targets, so the input target is
+      untouched until the blend reads it, and the blend lands in whichever pool
+      target is neither — a pool always has three.
+
+      Landed at the top of the next iteration and after the loop rather than at
+      the bottom of this one, because the branches below leave by `continue`.
+      An entry that drew nothing (skipped as a no-op, or short of targets) left
+      `curName` where it was, and there is nothing to blend.
+    */
+    let blendBack: { tex: TextureHandle; name: string; amount: number } | null = null;
+    const landBlendBack = (): void => {
+      const b = blendBack;
+      blendBack = null;
+      if (!b || b.name === curName) return;
+      const dest = pool.find((n) => n !== b.name && n !== curName);
+      if (!dest) return;
+      const mixCmds = new CommandBuffer();
+      mixCmds.add({
+        batchKey: 'fx-effect-opacity', material: EFFECT_OPACITY_FX_MATERIAL, blend: 'normal',
+        uniforms: packFxBlock(mvp, targetUv, [[b.amount, 0, 0, 0]], fxBox),
+        texture: curTex, sampler: clampSampler(), maskTexture: b.tex,
+      });
+      const encMix = beginViewportPass(ctx, 'fx-effect-opacity', writeAttachment(ctx, dest, Color.transparent()));
+      services.quad.execute(encMix, mixCmds);
+      encMix.end();
+      const mixed = texOf(dest);
+      if (mixed) { curTex = mixed; curName = dest; }
+    };
+
     for (const effect of effects) {
+      landBlendBack();
       // Skip no-op spatial passes — a zero-radius blur/glow still cost a full
       // viewport ping-pong, and stacks of five-plus effects amplify that.
       if (
@@ -621,6 +695,9 @@ export class CompositionPass extends RenderPass {
       const f1 = free[1];
       // Need two scratch targets to blur; without them skip the spatial pass.
       if (!f0 || !f1) continue;
+      if (effect.effectOpacity !== undefined && effect.effectOpacity < 1 && effect.type !== 'plugin') {
+        blendBack = { tex: curTex, name: curName, amount: Math.max(0, effect.effectOpacity) };
+      }
 
       /*
         The scale this draw runs at. 1 for everything except a plugin pass that
@@ -2166,9 +2243,27 @@ export class CompositionPass extends RenderPass {
           wrong picture. Self-sampling is the honest degradation.
         */
         const originTex = effect.readsOrigin ? (texOf(PLUGIN_ORIGIN) ?? curTex) : null;
+        /*
+          The second through fourth layer inputs, resolved exactly as the first
+          is and with the same fallback: an id that resolves to nothing
+          self-samples rather than leaving a declared binding empty.
+
+          Sliced to what the pass can bind, so a scene built against a newer
+          schema than this renderer cannot produce a bind group with entries
+          the layout does not declare — which is an invalid pipeline and a dead
+          viewport, the failure this whole area keeps guarding against.
+        */
+        const extraIds = (effect.extraLayerIds ?? []).slice(0, PLUGIN_EXTRA_LAYER_BINDINGS.length);
+        const extraTextures = extraIds.map((id) =>
+          (canUseMap ? this.displacementMapTexture(ctx, byId, id || undefined, selfId) : null) ?? curTex);
         cmds.add({
           batchKey: `plugin:${effect.shader}`,
-          material: pluginMaterial(effect.shader, effect.readsMap === true, effect.readsOrigin === true),
+          material: pluginMaterial(
+            effect.shader,
+            effect.readsMap === true,
+            effect.readsOrigin === true,
+            extraIds.length,
+          ),
           blend: 'normal',
           /*
             The host pass block, written per draw.
@@ -2192,6 +2287,27 @@ export class CompositionPass extends RenderPass {
             Math.max(1, Math.floor(viewport.pixelSize.height * pluginPassScale)),
             pluginPassScale,
             effect.passIndex ?? 0,
+            /*
+              The host-filled inputs, straight through.
+
+              The app computed them — only it knows the layer's own time and the
+              composition's rate — and this writes them beside the texel size,
+              which only this side knows. One writer for one block: two would
+              have to agree about where `texelSize` ends, and the moment they
+              disagree a kernel reads the frame rate as a seed.
+            */
+            effect.hostInputs,
+            /*
+              Where the layer is in this target — `layerRect` in the block.
+
+              The same `fxBox` the built-in box-relative effects read (the 3D
+              route's inset box, or the renderable measured against the viewport
+              on the 2D route). Without it `uv` was the kernel's only coordinate
+              and it spans the whole TARGET, so no plugin could find its own
+              layer: an `expand` border had nowhere to be drawn relative to, and
+              a shader layer kind painted the entire viewport.
+            */
+            fxBox,
           ),
           texture: curTex, sampler: clampSampler(),
           // Keyed off `readsMap`, the SAME predicate the layout uses — never
@@ -2202,6 +2318,9 @@ export class CompositionPass extends RenderPass {
           // Same rule as `maskTexture`: keyed off what the SHADER declared, so
           // a declared binding is never left unfilled.
           ...(originTex ? { originTexture: originTex } : {}),
+          // And once more for 5/6/7. The array's LENGTH is what the material
+          // declared, so it is built from the same `extraIds` the layout was.
+          ...(extraTextures.length > 0 ? { pluginLayerTextures: extraTextures } : {}),
         });
       }
       if (cmds.length === 0) continue;
@@ -2283,6 +2402,7 @@ export class CompositionPass extends RenderPass {
       const outTex = texOf(dest);
       if (outTex) { curTex = outTex; curName = dest; }
     }
+    landBlendBack();
 
     return { tex: curTex, name: curName };
   }
@@ -3740,6 +3860,30 @@ export class CompositionPass extends RenderPass {
     if (r0.precomp) {
       if (!Rect.intersects(visible, r0.bounds) || r0.opacity <= 0) return;
       const prepared = this.prepareIsolatedPrecomp(ctx, r0, st, st.depth, true);
+      if (!prepared) return;
+      r = prepared;
+    }
+
+    /*
+      Plugin generator: draw its instances into an offscreen and continue as a
+      plain textured renderable.
+
+      Beside the precomp branch, after it, and in the same shape — because it is
+      the same idea. Once the field is a texture, every branch below composites
+      it as one unit with no case of its own: mattes, advanced blend, glass,
+      effect chains, motion blur, the direct draw.
+
+      NOT culled on `bounds` the way the precomp above is. A generator's bounds
+      come from its instances, and a simulation whose particles have all left
+      the visible rect this frame would be culled, skip its draw, and leave the
+      PREVIOUS frame's field in the target for whatever samples it next.
+      `opacity <= 0` is still worth skipping: that is the layer being invisible,
+      which no later frame can misread.
+    */
+    if (r0.generator) {
+      if (r0.opacity <= 0) return;
+      st.flushMain();
+      const prepared = renderGeneratorField(ctx, r, (key, texture) => this.precompTex.set(key, texture));
       if (!prepared) return;
       r = prepared;
     }

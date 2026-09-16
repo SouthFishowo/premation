@@ -34,6 +34,7 @@
 
 [data-theme="dark"],
 :root:not([data-theme]) {
+  color-scheme: dark;
   /* ── Surface contract ─────────────────────────────────────────── */
   --surface-0:        var(--color-slate-900);   /* #171718 */
   --surface-1:        var(--color-slate-850);   /* #212123 */

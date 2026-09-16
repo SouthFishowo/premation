@@ -179,3 +179,192 @@ describe('the Pen draws a layer, not a mask', () => {
     expect(commands[0]!.maskTargetId).toBeUndefined();
   });
 });
+
+/**
+ * Closing, and the AE modifiers while drawing.
+ *
+ * The Pen could not close a SHAPE at all — clicking the first vertex closed
+ * only in mask mode, and every path was created open — and the mask pen's
+ * close radius was 10 WORLD px, which is a pinhole zoomed out and a trap
+ * zoomed in. `zoom` below is world px per screen px.
+ */
+function makePenCtx(zoom = 1, selection: string[] = []) {
+  const created: Array<{ points: Array<{ x: number; y: number; inX: number; inY: number; outX: number; outY: number }>; closed?: boolean; maskTargetId?: string }> = [];
+  const ctx = {
+    camera: { screenDistanceToWorld: (px: number) => px * zoom },
+    requestRender: () => {},
+    selectionIds: () => selection,
+    execute: (cmd: { type: string; payload: CreateNodePayload }) => {
+      if (cmd.type === WorkspaceCommandType.CreateNode) {
+        created.push({
+          points: cmd.payload.points as never,
+          closed: cmd.payload.closed,
+          maskTargetId: cmd.payload.maskTargetId,
+        });
+      }
+    },
+  } as unknown as ToolContext;
+  return { ctx, created };
+}
+
+const at = (x: number, y: number, mods: Partial<typeof NO_MODIFIERS> = {}): ToolPointerEvent => ({
+  screen: { x, y }, world: { x, y }, modifiers: { ...NO_MODIFIERS, ...mods }, pointer: {} as ToolPointerEvent['pointer'],
+});
+
+const pull = (x: number, y: number, mods: Partial<typeof NO_MODIFIERS> = {}): ToolDragEvent => ({
+  ...drag(0, 0, x, y),
+  modifiers: { ...NO_MODIFIERS, ...mods },
+});
+
+const place = (t: PenTool, ctx: ToolContext, x: number, y: number, mods: Partial<typeof NO_MODIFIERS> = {}): void => {
+  t.onPointerDown(at(x, y, mods), ctx);
+  t.onPointerUp(at(x, y, mods), ctx);
+};
+
+const triangle = (t: PenTool, ctx: ToolContext): void => {
+  place(t, ctx, 0, 0);
+  place(t, ctx, 100, 0);
+  place(t, ctx, 50, 80);
+};
+
+describe('Pen closing', () => {
+  it('clicking the first vertex closes a Pen SHAPE, and says so', () => {
+    const { ctx, created } = makePenCtx();
+    const t = new PenTool();
+    triangle(t, ctx);
+    place(t, ctx, 4, 3); // 5 screen px from the first vertex
+    expect(created).toHaveLength(1);
+    expect(created[0]!.closed).toBe(true);
+    expect(created[0]!.points).toHaveLength(3);
+  });
+
+  it('Mask Pen closes the same way', () => {
+    const { ctx, created } = makePenCtx(1, ['layer_a']);
+    const t = new MaskPenTool();
+    triangle(t, ctx);
+    place(t, ctx, 2, 2);
+    expect(created).toHaveLength(1);
+    expect(created[0]!.maskTargetId).toBe('layer_a');
+  });
+
+  it('the close radius is SCREEN px: zoomed in, a nearby click adds a vertex', () => {
+    // 2× zoom → 9 screen px is 4.5 world px. The old 10 world px closed here.
+    const { ctx, created } = makePenCtx(0.5);
+    const t = new MaskPenTool();
+    triangle(t, ctx);
+    place(t, ctx, 6, 0);
+    expect(created).toHaveLength(0);
+    expect(t.pendingPoints).toHaveLength(4);
+  });
+
+  it('…and zoomed out, a click that looks close on screen closes', () => {
+    const { ctx, created } = makePenCtx(4);
+    const t = new PenTool();
+    triangle(t, ctx);
+    place(t, ctx, 30, 0); // 7.5 screen px
+    expect(created[0]!.closed).toBe(true);
+  });
+
+  it('a drag on the closing click shapes the first vertex\'s handles', () => {
+    const { ctx, created } = makePenCtx();
+    const t = new PenTool();
+    triangle(t, ctx);
+    t.onPointerDown(at(0, 0), ctx);
+    t.onDrag(pull(0, -30), ctx);
+    expect(created).toHaveLength(0); // closes on release, not press
+    t.onPointerUp(at(0, -30), ctx);
+    expect(created[0]!.closed).toBe(true);
+    const first = created[0]!.points[0]!;
+    expect(first.outY - first.y).toBeCloseTo(-30);
+    expect(first.inY - first.y).toBeCloseTo(30);
+  });
+
+  it('double-clicking the LAST vertex closes; double-clicking empty space finishes open', () => {
+    const closeRun = makePenCtx();
+    const a = new PenTool();
+    triangle(a, closeRun.ctx);
+    place(a, closeRun.ctx, 50, 80);
+    place(a, closeRun.ctx, 50, 80);
+    a.onDoubleClick(at(50, 80), closeRun.ctx);
+    expect(closeRun.created[0]).toMatchObject({ closed: true });
+    expect(closeRun.created[0]!.points).toHaveLength(3);
+
+    const openRun = makePenCtx();
+    const b = new PenTool();
+    place(b, openRun.ctx, 0, 0);
+    place(b, openRun.ctx, 100, 0);
+    place(b, openRun.ctx, 300, 300);
+    place(b, openRun.ctx, 300, 300);
+    b.onDoubleClick(at(300, 300), openRun.ctx);
+    expect(openRun.created[0]!.closed).toBeFalsy();
+    expect(openRun.created[0]!.points).toHaveLength(3);
+  });
+
+  it('Enter still finishes an OPEN path', () => {
+    const { ctx, created } = makePenCtx();
+    const t = new PenTool();
+    triangle(t, ctx);
+    t.onKeyDown({ key: 'Enter' } as ToolKeyEvent, ctx);
+    expect(created[0]!.closed).toBeFalsy();
+  });
+});
+
+describe('Pen modifiers while drawing', () => {
+  it('Shift-click constrains the new segment to 15° steps, keeping its length', () => {
+    const { ctx } = makePenCtx();
+    const t = new PenTool();
+    place(t, ctx, 0, 0);
+    place(t, ctx, 100, 10, { shift: true }); // 5.7° → 0°
+    const p = t.pendingPoints[1]!;
+    expect(p.y).toBeCloseTo(0);
+    expect(p.x).toBeCloseTo(Math.hypot(100, 10));
+  });
+
+  it('Shift-drag constrains the handle to 15° steps', () => {
+    const { ctx } = makePenCtx();
+    const t = new PenTool();
+    t.onPointerDown(at(0, 0), ctx);
+    t.onDrag(pull(50, 48, { shift: true }), ctx); // 43.8° → 45°
+    const p = t.pendingPoints[0]!;
+    expect(p.outX).toBeCloseTo(p.outY);
+  });
+
+  it('Alt-drag moves only the outgoing handle', () => {
+    const { ctx } = makePenCtx();
+    const t = new PenTool();
+    place(t, ctx, 0, 0);
+    t.onPointerDown(at(100, 0), ctx);
+    t.onDrag(pull(100, 50, { alt: true }), ctx);
+    const p = t.pendingPoints[1]!;
+    expect(p).toMatchObject({ outX: 100, outY: 50, inX: 100, inY: 0 });
+  });
+
+  it('a plain drag still pulls symmetric handles', () => {
+    const { ctx } = makePenCtx();
+    const t = new PenTool();
+    t.onPointerDown(at(100, 0), ctx);
+    t.onDrag(pull(100, 50), ctx);
+    expect(t.pendingPoints[0]).toMatchObject({ outX: 100, outY: 50, inX: 100, inY: -50 });
+  });
+
+  it('Backspace takes back the last vertex and claims the key', () => {
+    const { ctx, created } = makePenCtx();
+    const t = new PenTool();
+    triangle(t, ctx);
+    expect(t.onKeyDown({ key: 'Backspace' } as ToolKeyEvent, ctx)).toBe(true);
+    expect(t.pendingPoints).toHaveLength(2);
+    expect(t.onKeyDown({ key: 'Delete' } as ToolKeyEvent, ctx)).toBe(true);
+    expect(t.pendingPoints).toHaveLength(1);
+    expect(created).toHaveLength(0);
+  });
+
+  it('Curvature Pen: Backspace takes back the last point too', () => {
+    const { ctx } = makePenCtx();
+    const t = new CurvatureTool();
+    t.onClick(at(0, 0), ctx);
+    t.onClick(at(50, 0), ctx);
+    expect(t.onKeyDown({ key: 'Backspace' } as ToolKeyEvent, ctx)).toBe(true);
+    // Preview includes no mouse, so one committed point remains.
+    expect(t.pendingPoints).toHaveLength(1);
+  });
+});

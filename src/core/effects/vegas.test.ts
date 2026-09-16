@@ -22,6 +22,10 @@ import {
   pointAtArc,
   walkArc,
   vegasSegments,
+  vegasRuns,
+  vegasSequentialRuns,
+  vegasOpacityAt,
+  VEGAS_BUNCH_GAP,
   type ContourPoint,
 } from './vegas';
 
@@ -412,5 +416,131 @@ describe('vegasSegments — placing the lights', () => {
   it('survives a degenerate contour rather than dividing by zero', () => {
     expect(vegasSegments([{ x: 5, y: 5 }, { x: 5, y: 5 }], 3, 50, 0)).toEqual([]);
     expect(vegasSegments([], 3, 50, 0)).toEqual([]);
+  });
+});
+
+/**
+ * An OPEN mask path. The same three sides of the square with the fourth edge
+ * missing: (0,0) → (10,0) → (10,10) → (0,10). Its length is 30, not 40 — the
+ * chord from (0,10) back to (0,0) is not part of it, and lights must never run
+ * along it.
+ */
+describe('an open path is not walked as a loop', () => {
+  const U: ContourPoint[] = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
+  /** True if any run steps along the missing closing edge, x = 0 between y 0 and 10. */
+  const onChord = (runs: ContourPoint[][]): boolean =>
+    runs.some((r) => r.some((p) => Math.abs(p.x) < 1e-9 && p.y > 1e-9 && p.y < 10 - 1e-9));
+
+  it('measures 30 — no closing edge', () => {
+    const t = arcTable(U, false);
+    expect(t.total).toBe(30);
+    expect(arcTable(U).total).toBe(40); // POSITIVE CONTROL: closed still closes
+  });
+
+  it('clamps arc positions to the ends instead of wrapping', () => {
+    const t = arcTable(U, false);
+    expect(pointAtArc(U, t, 30)).toEqual({ x: 0, y: 10 });
+    expect(pointAtArc(U, t, 35)).toEqual({ x: 0, y: 10 });
+    expect(pointAtArc(U, t, -5)).toEqual({ x: 0, y: 0 });
+  });
+
+  it('one full-length light covers exactly the path', () => {
+    const full = vegasSegments(U, 1, 100, 0, false);
+    expect(full).toHaveLength(1);
+    expect(runLength(full[0]!)).toBeCloseTo(30, 6);
+    expect(onChord(full)).toBe(false);
+    // POSITIVE CONTROL: the closed reading of the same points lights 40 — the
+    // three sides PLUS the chord back to the start.
+    expect(runLength(vegasSegments(U, 1, 100, 0)[0]!)).toBeCloseTo(40, 6);
+  });
+
+  /**
+   * A light that runs off the end re-enters at the start as a SECOND run.
+   * 1 segment, 50% of 30 = 15 lit, rotated to start at arc 22.5 (270°). Arc 20
+   * is the corner (10,10), so arc 22.5 → 30 is (7.5,10) → (0,10), and the
+   * remaining 7.5 is (0,0) → (7.5,0).
+   */
+  it('splits a light crossing the end instead of bridging the ends', () => {
+    const runs = vegasSegments(U, 1, 50, 270, false);
+    expect(runs).toHaveLength(2);
+    expect(runs[0]!).toEqual([{ x: 7.5, y: 10 }, { x: 0, y: 10 }]);
+    expect(runs[1]!).toEqual([{ x: 0, y: 0 }, { x: 7.5, y: 0 }]);
+    expect(onChord(runs)).toBe(false);
+  });
+
+  /**
+   * The same split, with the part of the LIGHT each run is: 7.5 of 15 px
+   * before the end, so the boundary is u = 0.5 — what the opacity profile reads.
+   */
+  it('labels the two halves of a split light u 0–½ and ½–1', () => {
+    const runs = vegasRuns(U, 1, 50, 270, false);
+    expect(runs.map((r) => [r.u0, r.u1])).toEqual([[0, 0.5], [0.5, 1]]);
+  });
+});
+
+describe('Vegas — the AE controls (2026-09-15)', () => {
+  const SQ: ContourPoint[] = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
+  const starts = (runs: ReadonlyArray<{ points: ContourPoint[] }>): number[][] => runs.map((r) => [r.points[0]!.x, r.points[0]!.y]);
+
+  it('Even with no phase is exactly the lights Vegas always drew — stored documents are unchanged', () => {
+    for (const [n, len, rot] of [[4, 50, 0], [3, 40, 33], [7, 90, -120]] as const) {
+      expect(vegasRuns(SQ, n, len, rot).map((r) => r.points)).toEqual(vegasSegments(SQ, n, len, rot));
+    }
+  });
+
+  /**
+   * Bunched: 4 lights at 25 % of a 10 px slot are 2.5 px long with a gap of
+   * min(7.5, 2.5 × VEGAS_BUNCH_GAP) — 1.25 at ½ — so they start at arc 0,
+   * 3.75, 7.5, 11.25 and travel as a group along the top edge and round the
+   * corner.
+   */
+  it('Bunched packs the lights into a travelling group', () => {
+    expect(VEGAS_BUNCH_GAP).toBe(0.5);
+    expect(starts(vegasRuns(SQ, 4, 25, 0, true, true))).toEqual([[0, 0], [3.75, 0], [7.5, 0], [10, 1.25]]);
+  });
+
+  it('Bunched and Even meet at Length 100 %', () => {
+    expect(vegasRuns(SQ, 4, 100, 0, true, true)).toEqual(vegasRuns(SQ, 4, 100, 0, true, false));
+  });
+
+  it('a phase in arc px slides the whole set', () => {
+    // 5 px of phase on 4 × 50 %: starts at 5, 15, 25, 35.
+    expect(starts(vegasRuns(SQ, 4, 50, 0, true, false, 5))).toEqual([[5, 0], [10, 5], [5, 10], [0, 5]]);
+  });
+
+  /**
+   * Stroke Sequentially over two 10 px open lines, one light at 100 %: the
+   * light is the whole 20 px sequence — the first line as u 0–½, the second as
+   * ½–1 — and nothing is drawn across the 5 px gap between them.
+   */
+  it('Stroke Sequentially runs one light through the masks in order without bridging them', () => {
+    const A = { points: [{ x: 0, y: 0 }, { x: 10, y: 0 }], closed: false };
+    const B = { points: [{ x: 0, y: 5 }, { x: 10, y: 5 }], closed: false };
+    const runs = vegasSequentialRuns([A, B], 1, 100, 0);
+    expect(runs.map((r) => [r.u0, r.u1])).toEqual([[0, 0.5], [0.5, 1]]);
+    expect(runs[0]!.points).toEqual([{ x: 0, y: 0 }, { x: 10, y: 0 }]);
+    expect(runs[1]!.points).toEqual([{ x: 0, y: 5 }, { x: 10, y: 5 }]);
+    expect(runs.some((r) => r.points.some((p) => p.y > 1e-9 && p.y < 5 - 1e-9))).toBe(false);
+  });
+
+  it('Stroke Sequentially wraps a light off the last mask onto the first', () => {
+    // One 25 % light (5 of 20 px) rotated to arc 17.5: 2.5 on B's end, 2.5 on A's start.
+    const A = { points: [{ x: 0, y: 0 }, { x: 10, y: 0 }], closed: false };
+    const B = { points: [{ x: 0, y: 5 }, { x: 10, y: 5 }], closed: false };
+    const runs = vegasSequentialRuns([A, B], 1, 25, 315);
+    expect(runs.map((r) => r.points)).toEqual([
+      [{ x: 7.5, y: 5 }, { x: 10, y: 5 }],
+      [{ x: 0, y: 0 }, { x: 2.5, y: 0 }],
+    ]);
+  });
+
+  it('the opacity profile runs Start → Mid-point → End', () => {
+    // 100 → 0 at 50 % → 100.
+    expect(vegasOpacityAt(0, 100, 0, 100, 50)).toBe(1);
+    expect(vegasOpacityAt(0.25, 100, 0, 100, 50)).toBeCloseTo(0.5, 9);
+    expect(vegasOpacityAt(0.5, 100, 0, 100, 50)).toBeCloseTo(0, 9);
+    expect(vegasOpacityAt(1, 100, 0, 100, 50)).toBeCloseTo(1, 9);
+    // Mid-point at 20 %: u = .1 is halfway down the first leg.
+    expect(vegasOpacityAt(0.1, 100, 0, 0, 20)).toBeCloseTo(0.5, 9);
   });
 });

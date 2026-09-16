@@ -24,6 +24,7 @@ import { IconButton } from '@components/IconButton';
 import { Icon, type IconName } from '@components/Icon';
 import { ToolOptionsBar } from './ToolOptionsBar';
 import { ToolFlyout, type ToolFlyoutItem } from './ToolFlyout';
+import { PluginToolsFlyout } from './PluginToolsFlyout';
 import { toolShortcut, toolLabelWithShortcut } from './toolShortcuts';
 import { useElementWidth } from './useElementWidth';
 import { collapseFor } from './toolbarCollapse';
@@ -74,6 +75,10 @@ import { openCompositionSettings } from '@layout/Composition/CompositionSettings
 import { openCustomizeDialog } from '@layout/Settings/CustomizeDialog';
 import { buildWorkspaceItems } from '@layout/Workspace/workspaceMenuItems';
 import { ProjectStatus } from '@layout/ProjectStatus/ProjectStatus';
+import { getUiPlatform, hasDesktopChrome } from '@core/config/uiPlatform';
+import { MacWindowControls } from '@layout/TitleBar/MacWindowControls';
+import { EditorChromeActions } from '@layout/TitleBar/EditorChromeActions';
+import { UpdateButton } from '@layout/TitleBar/UpdateButton';
 
 /**
  * A toolbar tool. NO `shortcut` field, deliberately.
@@ -111,6 +116,12 @@ const PEN_TOOLS: ToolDef[] = [
   { id: 'paint',    icon: 'brush',      label: 'Paint Tool (paints onto the selected layer)' },
   { id: 'eraser',   icon: 'eraser',     label: 'Eraser Tool (erases paint on the selected layer)' },
   { id: 'curvature',icon: 'curvature',  label: 'Curvature Pen' },
+  // AE's Pen flyout. The Pen does all three on its own (over a segment it
+  // adds, over a vertex it converts); these do one thing wherever they land.
+  { id: 'add-vertex',     icon: 'plus',   label: 'Add Vertex Tool' },
+  { id: 'delete-vertex',  icon: 'minus',  label: 'Delete Vertex Tool' },
+  { id: 'convert-vertex', icon: 'ease',   label: 'Convert Vertex Tool' },
+  { id: 'mask-feather',   icon: 'blur',   label: 'Mask Feather Tool (variable feather points)' },
 ];
 
 /**
@@ -250,7 +261,21 @@ function buildAnimateItems(
   ];
 }
 
-const isElectron = typeof window !== 'undefined' && (!!window.motionEditor || !!window.electronAPI);
+/**
+ * How much of the macOS unified toolbar is NOT tools: the traffic-light inset,
+ * the project in the centre and the actions on the right. Taken off the bar's
+ * width before the collapse thresholds, which were tuned for a row of tools
+ * alone — the Windows / Linux row.
+ */
+const MAC_CHROME_RESERVE = 520;
+
+/**
+ * Undo / Redo chords as the real keyboard spells them. Deliberately not the
+ * chrome platform: a Mac-looking preview on Windows still answers to Ctrl.
+ */
+const MAC_KEYBOARD = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
+const UNDO_CHORD = MAC_KEYBOARD ? '⌘Z' : 'Ctrl+Z';
+const REDO_CHORD = MAC_KEYBOARD ? '⇧⌘Z' : 'Ctrl+Shift+Z';
 
 /**
  * The composition chip in the web build's centre cluster: name, size, fps.
@@ -397,9 +422,17 @@ export function TopNav(): JSX.Element {
     if (isMaskActive) setLastMaskTool(activeTool);
   }, [activeTool, isPointerActive, isPenActive, isShapeActive, isMaskActive]);
 
+  // Which chrome this row belongs to: the web build's own bar, the tool row
+  // under the Windows / Linux title bar, or the macOS unified toolbar.
+  const desktop = hasDesktopChrome();
+  const mac = desktop && getUiPlatform() === 'mac';
+
   // The bar's OWN width drives the collapse — see the module note.
   const barWidth = useElementWidth(barRef);
-  const { hidePuppet, hideMask, hideSnap, hideAnimate, hideUndoRedo, hideSceneControls } = collapseFor(barWidth);
+  const collapse = collapseFor(mac ? barWidth - MAC_CHROME_RESERVE : barWidth);
+  const { hidePuppet, hideMask, hideSnap, hideAnimate, hideSceneControls } = collapse;
+  // On a Mac Undo / Redo belong to the Edit menu (⌘Z): no buttons, no overflow rows.
+  const hideUndoRedo = mac || collapse.hideUndoRedo;
 
   const overflowItems: DropdownItem[] = [];
 
@@ -503,7 +536,7 @@ export function TopNav(): JSX.Element {
     });
   }
 
-  if (hideUndoRedo) {
+  if (collapse.hideUndoRedo && !mac) {
     pushSeparator();
     overflowItems.push({
       type: 'item',
@@ -541,9 +574,17 @@ export function TopNav(): JSX.Element {
 
   return (
     <div className={styles.root} ref={containerRef}>
-      <div className={styles.toolRow} role="toolbar" aria-label="Tools" ref={barRef}>
+      <div
+        className={mac ? `${styles.toolRow} ${styles.macUnified}` : styles.toolRow}
+        role="toolbar"
+        aria-label="Tools"
+        data-platform={desktop ? getUiPlatform() : 'web'}
+        ref={barRef}
+      >
         <div className={styles.inner}>
           <div className={styles.left}>
+            {/* macOS: this row is the title bar, so it holds the traffic lights. */}
+            {mac && <MacWindowControls />}
             {/*
               Only where there IS a dashboard. `/` redirects to /dashboard in the
               server edition and to /editor in the local one — so in the local
@@ -562,9 +603,10 @@ export function TopNav(): JSX.Element {
               </IconButton>
             )}
 
-            {/* The File menu */}
-            {!isElectron && <AppMenuButton />}
-            <span className={styles.toolDivider} aria-hidden />
+            {/* The File menu — the title bar's on Windows / Linux, the system
+                menu bar's on a Mac. Only the web build draws it here. */}
+            {!desktop && <AppMenuButton />}
+            {!mac && <span className={styles.toolDivider} aria-hidden />}
 
             {/* Cluster 1: Edit & Drawing Tools */}
             <div className={styles.toolGroup}>
@@ -599,6 +641,9 @@ export function TopNav(): JSX.Element {
                 items={flyoutItems(SHAPE_TOOLS, setTool)}
                 data-tour="shape-tool"
               />
+              {/* Tools plugins contribute — one flyout for all of them, and
+                  nothing at all when none are installed. */}
+              <PluginToolsFlyout />
             </div>
 
             {/* Cluster 2: Mask & Puppet Tools (conditionally rendered) */}
@@ -797,7 +842,7 @@ export function TopNav(): JSX.Element {
                     type="button"
                     className={styles.tool}
                     aria-label="Undo"
-                    title="Undo  (Ctrl+Z)"
+                    title={`Undo  (${UNDO_CHORD})`}
                     disabled={!canUndo}
                     onClick={() => performUndo()}
                   >
@@ -807,7 +852,7 @@ export function TopNav(): JSX.Element {
                     type="button"
                     className={styles.tool}
                     aria-label="Redo"
-                    title="Redo  (Ctrl+Shift+Z)"
+                    title={`Redo  (${REDO_CHORD})`}
                     disabled={!canRedo}
                     onClick={() => performRedo()}
                   >
@@ -818,10 +863,12 @@ export function TopNav(): JSX.Element {
             )}
           </div>
 
-          {/* Centre: project / comp / workspace. Electron carries these in the
-              title bar; the web build has nowhere else to put them. */}
+          {/* Centre: project / comp / workspace. On Windows / Linux the title
+              bar carries these; the macOS toolbar and the web build have
+              nowhere else to put them. */}
           <div className={styles.center}>
-            {!isElectron && (
+            {mac && <ProjectStatus />}
+            {!desktop && (
               <>
                 <ProjectStatus compact />
                 <CompChip />
@@ -847,8 +894,16 @@ export function TopNav(): JSX.Element {
           </div>
 
           <div className={styles.right}>
-            <span className={styles.toolHint}>{activeTool}</span>
-            {!isElectron && (
+            {!mac && <span className={styles.toolHint}>{activeTool}</span>}
+            {/* macOS: the actions the Windows / Linux title bar holds, in the
+                same order. No gear — Settings… is in the app menu (⌘,). */}
+            {mac && (
+              <>
+                <UpdateButton />
+                <EditorChromeActions showCustomize={false} />
+              </>
+            )}
+            {!desktop && (
               <>
                 <span className={styles.toolDivider} aria-hidden />
                 <div className={styles.toolGroup}>

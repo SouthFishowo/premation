@@ -60,17 +60,24 @@
   border: none;
   color: var(--color-text-secondary);
   font: inherit;
+  /* Sentence case at the row size, medium weight. A column of UPPERCASE
+     semibold headers read as a wall of labels shouting over the values; the
+     open or hovered header is lifted to primary instead. */
   font-size: var(--font-size-sm);
-  font-weight: var(--font-weight-semibold);
+  font-weight: var(--font-weight-medium);
   text-align: left;
   cursor: pointer;
-  text-transform: uppercase;
-  letter-spacing: var(--letter-spacing-uppercase);
-  transition: background-color var(--motion-duration-fast) var(--motion-ease-standard);
+  transition:
+    background-color var(--motion-duration-fast) var(--motion-ease-standard),
+    color var(--motion-duration-fast) var(--motion-ease-standard);
 }
 
 .trigger:hover:not(:disabled) {
   background: var(--color-hover);
+  color: var(--color-text-primary);
+}
+
+.trigger[aria-expanded='true'] {
   color: var(--color-text-primary);
 }
 
@@ -111,11 +118,13 @@
 
 .panel {
   /* Aligned to the trigger's 12px gutter so labels inside a section line up
-     with the section's own name rather than sitting a couple of pixels off. */
-  padding: var(--space-4) var(--space-5) var(--space-5);
+     with the section's own name rather than sitting a couple of pixels off.
+     One step tighter vertically than it was: with every applicable section in
+     one list, the space between sections is what the eye scrolls past. */
+  padding: var(--space-3) var(--space-5) var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: var(--space-3);
   background: transparent;
 }
 

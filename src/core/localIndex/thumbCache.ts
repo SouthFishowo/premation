@@ -12,7 +12,22 @@
  * without an image — the same graceful shape as every other bridge consumer.
  */
 
+/**
+ * Object URLs by content hash, in recency order (a Map iterates insertion
+ * order; a hit re-inserts).
+ *
+ * BOUNDED, and every eviction revokes. This was an unbounded memo: every hash a
+ * card ever asked for kept its decoded PNG bytes alive for the session, and
+ * since a re-captured project gets a NEW hash, a long editing session grew it
+ * by one thumbnail per capture per project, none of them ever released. The
+ * cap is far above what one start screen shows, so a card on screen is never
+ * the one evicted — and an <img> that has already loaded keeps its pixels when
+ * its URL is revoked anyway.
+ */
+const MAX_THUMB_URLS = 256;
 const urlByHash = new Map<string, string>();
+/** Reads in flight, so two cards asking for one hash mint ONE URL, not two. */
+const pendingByHash = new Map<string, Promise<string | null>>();
 
 export function thumbCacheAvailable(): boolean {
   const bridge = typeof window !== 'undefined' ? window.motionEditor : undefined;
@@ -39,24 +54,54 @@ export async function storeThumb(blob: Blob): Promise<string | null> {
   }
 }
 
-/** Object URL for a stored thumbnail, memoized per hash for the session —
+function remember(hash: string, url: string): void {
+  urlByHash.set(hash, url);
+  while (urlByHash.size > MAX_THUMB_URLS) {
+    const oldest = urlByHash.keys().next();
+    if (oldest.done) break;
+    const stale = urlByHash.get(oldest.value)!;
+    urlByHash.delete(oldest.value);
+    URL.revokeObjectURL(stale);
+  }
+}
+
+/** Object URL for a stored thumbnail, memoized per hash (bounded, see above) —
  *  cards re-render often and the bytes never change under a given hash. */
 export async function thumbUrl(hash: string): Promise<string | null> {
   const hit = urlByHash.get(hash);
-  if (hit) return hit;
+  if (hit) {
+    // Refresh recency.
+    urlByHash.delete(hash);
+    urlByHash.set(hash, hit);
+    return hit;
+  }
+  const inFlight = pendingByHash.get(hash);
+  if (inFlight) return inFlight;
   const bridge = typeof window !== 'undefined' ? window.motionEditor : undefined;
   if (!bridge?.thumbs?.read) return null;
-  try {
-    const bytes = await bridge.thumbs.read(hash);
-    if (!bytes || bytes.byteLength === 0) return null;
-    // Copy into a fresh ArrayBuffer-backed view: the IPC value types as
-    // ArrayBufferLike and BlobPart refuses the SharedArrayBuffer half of it.
-    const copy = new Uint8Array(bytes.byteLength);
-    copy.set(bytes);
-    const url = URL.createObjectURL(new Blob([copy], { type: 'image/png' }));
-    urlByHash.set(hash, url);
-    return url;
-  } catch {
-    return null;
-  }
+  const read = (async (): Promise<string | null> => {
+    try {
+      const bytes = await bridge.thumbs!.read!(hash);
+      if (!bytes || bytes.byteLength === 0) return null;
+      // Copy into a fresh ArrayBuffer-backed view: the IPC value types as
+      // ArrayBufferLike and BlobPart refuses the SharedArrayBuffer half of it.
+      const copy = new Uint8Array(bytes.byteLength);
+      copy.set(bytes);
+      const url = URL.createObjectURL(new Blob([copy], { type: 'image/png' }));
+      remember(hash, url);
+      return url;
+    } catch {
+      return null;
+    } finally {
+      pendingByHash.delete(hash);
+    }
+  })();
+  pendingByHash.set(hash, read);
+  return read;
+}
+
+/** Revoke every cached thumbnail URL (leaving the start screen, tests). */
+export function releaseThumbUrls(): void {
+  for (const url of urlByHash.values()) URL.revokeObjectURL(url);
+  urlByHash.clear();
 }

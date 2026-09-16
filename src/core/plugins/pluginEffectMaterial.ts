@@ -39,7 +39,15 @@
  */
 
 import type { EffectContribution } from './effectSchema';
-import { composeEffectShader, layerParamNames, namespacedEffect } from './effectSchema';
+import {
+  composeEffectGlsl,
+  composeEffectShader,
+  glslSamplerNames,
+  layerParamNames,
+  namespacedEffect,
+  LAYER_BINDINGS,
+  MAX_LAYER_PARAMS_PER_EFFECT,
+} from './effectSchema';
 
 /*
  * The compile bounds are NOT here. They live in `pluginEffects.ts`, beside
@@ -54,6 +62,17 @@ export interface PluginShaderSource {
   name: string;
   wgsl: string;
   glsl: { vertex: string; fragment: string };
+  /**
+   * How many generated lines sit above the author's own source in `glsl`.
+   *
+   * Carried so a driver's compile log can be re-pointed at the author's line
+   * numbers. Without it a report says "line 34" against a 12-line kernel, which
+   * sends the author looking for code that is not theirs and reads as the error
+   * message lying.
+   */
+  glslPreambleLines?: number;
+  /** False when `glsl` is the generated passthrough rather than the author's. */
+  glslIsAuthored?: boolean;
 }
 
 /** Mirrors the renderer's effect `MaterialDescriptor` layout. */
@@ -77,6 +96,20 @@ export const PLUGIN_EFFECT_MATERIAL_LAYOUT_WITH_MAP = [
   ...PLUGIN_EFFECT_MATERIAL_LAYOUT,
   { binding: 3, type: 'texture', stages: ['fragment'] },
 ] as const;
+
+/**
+ * The texture bindings for an effect's layer parameters, in declaration order.
+ *
+ * Derived from `LAYER_BINDINGS`, which is also what the shader generator emits
+ * from — the two agreeing by construction rather than by both being written
+ * carefully. 3, then 5/6/7: 4 belongs to `origin` whether or not any effect on
+ * the machine uses it.
+ */
+export function layerBindingEntries(count: number): PluginEffectLayout {
+  return LAYER_BINDINGS
+    .slice(0, Math.min(count, MAX_LAYER_PARAMS_PER_EFFECT))
+    .map((binding) => ({ binding, type: 'texture', stages: ['fragment'] as const }));
+}
 
 /**
  * The `origin` texture — the pass-0 input — at binding 4.
@@ -144,10 +177,29 @@ export function pluginShaderSource(
   effect: EffectContribution,
   passIndex = 0,
 ): PluginShaderSource {
+  /*
+    The author's GLSL when there is one, the passthrough when there is not.
+
+    The passthrough did not go away and must not: an effect that ships only
+    WGSL still has to produce a valid program on the WebGL2 tier, because
+    `ShaderSource` has no optional variant and a pipeline built from a missing
+    one fails to create — a black layer instead of "this effect does nothing
+    here". What changed is that passthrough is now the FALLBACK rather than the
+    only answer, and every surface that reports the gap can now say whose gap
+    it is: the platform used to have no way to run a plugin's GLSL, and an
+    author who has one now simply ships it.
+  */
+  const pass = effect.passes?.[passIndex];
+  const authored = pass ? !!pass.glsl : !!effect.glsl?.trim();
+  const glsl = authored ? composeEffectGlsl(effect, passIndex) : null;
   return {
     name: passShaderName(pluginId, effect, passIndex),
     wgsl: composeEffectShader(effect, passIndex).wgsl,
-    glsl: { vertex: PASSTHROUGH_GLSL.vertex, fragment: PASSTHROUGH_GLSL.fragment },
+    glsl: glsl
+      ? { vertex: glsl.vertex, fragment: glsl.fragment }
+      : { vertex: PASSTHROUGH_GLSL.vertex, fragment: PASSTHROUGH_GLSL.fragment },
+    ...(glsl ? { glslPreambleLines: glsl.preambleLines } : {}),
+    glslIsAuthored: authored,
   };
 }
 
@@ -184,23 +236,26 @@ export function pluginEffectMaterial(
   shader: string;
   topology: 'triangle-list';
   layout: PluginEffectLayout;
+  /** GLSL sampler names in bind-group ENTRY order — see `glslSamplerNames`. */
+  glslSamplers: string[];
 } {
   // Same predicate the shader generator uses. Deriving both from
   // `layerParamNames` is what keeps the declared bindings and the bound
   // resources in step; two independent conditions here would be a pipeline that
   // is invalid only for the effects that use the newer feature.
-  const readsSecondTexture = layerParamNames(effect.params).length > 0;
+  const layerCount = layerParamNames(effect.params).length;
   const pass = effect.passes?.[passIndex];
   const readsOrigin = pass ? pass.reads === 'origin' || pass.reads === 'both' : false;
-
-  const base: PluginEffectLayout = readsSecondTexture
-    ? PLUGIN_EFFECT_MATERIAL_LAYOUT_WITH_MAP
-    : PLUGIN_EFFECT_MATERIAL_LAYOUT;
 
   return {
     shader: passShaderName(pluginId, effect, passIndex),
     topology: 'triangle-list',
-    layout: readsOrigin ? [...base, ORIGIN_BINDING] : base,
+    layout: [
+      ...PLUGIN_EFFECT_MATERIAL_LAYOUT,
+      ...layerBindingEntries(layerCount),
+      ...(readsOrigin ? [ORIGIN_BINDING] : []),
+    ],
+    glslSamplers: glslSamplerNames(layerCount, readsOrigin),
   };
 }
 

@@ -5,10 +5,12 @@
   min-width: 32px;
   height: var(--control-height-xs);
   padding: 0 4px;
-  background: transparent;
-  border: 1px solid transparent;
+  /* Host-tunable resting look (the inspector row draws fields as wells). The
+     state rules below set their colours directly, so they still win. */
+  background: var(--value-field-bg, transparent);
+  border: 1px solid var(--value-field-border, transparent);
   border-radius: var(--radius-control);
-  color: var(--color-primary);
+  color: var(--value-field-color, var(--color-primary));
   cursor: ew-resize;
   user-select: none;
   transition: var(--motion-hover-transition);
@@ -52,6 +54,25 @@
   display: flex;
   align-items: center;
   width: 100%;
+}
+
+/* The axis tag ("X", "W") inside the field's left edge. `pointer-events: none`
+   is what makes a press-drag on it a scrub: the press lands on the field. */
+.prefix {
+  flex: none;
+  margin-right: var(--space-1);
+  color: var(--color-text-tertiary);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-micro);
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  pointer-events: none;
+  user-select: none;
+}
+
+.field:hover:not(.disabled) .prefix,
+.dragging .prefix {
+  color: var(--color-text-secondary);
 }
 
 .unit {

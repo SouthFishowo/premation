@@ -27,11 +27,15 @@
 
 import { ICON_NAMES } from '@components/Icon/iconNames';
 import { parseLayerKinds, type LayerKindContribution } from './layerKindSchema';
-import { parseEffects, type EffectContribution } from './effectSchema';
+import { parseEffects, THREAD_SAFETY, type EffectContribution, type ThreadSafety } from './effectSchema';
 import { parseExporters, type ExporterContribution } from './exporterSchema';
 import { parseImporters, type ImporterContribution } from './importerSchema';
 import { parsePresets, type PresetContribution } from './presetSchema';
 import { parseNet, type NetContribution } from './netSchema';
+import { parseInspectorPanels, type PluginInspectorPanelContribution } from './uiParams';
+import { parsePluginTools, type PluginToolContribution } from './uiTools';
+import { parsePluginShortcuts, type PluginShortcutContribution } from './uiShortcuts';
+import { parsePluginExpressions, type PluginExpressionContribution } from './uiExpressions';
 import { RUNTIME_TIERS, DEFAULT_RUNTIME_TIER, type RuntimeTier } from './runtimeTier';
 
 /**
@@ -54,6 +58,16 @@ import { RUNTIME_TIERS, DEFAULT_RUNTIME_TIER, type RuntimeTier } from './runtime
  *     grammar because they are one idea in two directions, and splitting them
  *     across 6 and 7 would make an author bump a version for the half they did
  *     not use.
+ *
+ * 7 — `contributes.inspector`, `contributes.tools`, `contributes.shortcuts` and
+ *     `contributes.expressions`: the plugin's own user interface. A grammar bump
+ *     only — the four keys are new, and what a plugin may CALL to drive them is
+ *     a capability (`ui.inspector`, `ui.canvas`, `ui.tools`, `ui.expressions`),
+ *     which is the axis an author actually needs to ask about.
+ *
+ *     The four landed together on purpose. They are one feature seen from four
+ *     sides, and a plugin that contributes a tool with no way to draw, or
+ *     parameters with no way to act on them, is half of something.
  *
  *     `contributes.exporters`. A plugin can write a file format the editor does
  *     not know: the host renders and hands over frames, the plugin returns
@@ -85,7 +99,7 @@ export const HOST_API_VERSION = 5;
  * changed — reading a document with keys whose meaning is unknown is how a
  * validator silently accepts something it does not understand.
  */
-export const MANIFEST_VERSION = 6;
+export const MANIFEST_VERSION = 7;
 
 /** Everything a plugin may ask for. Nothing outside this list is grantable. */
 export const PERMISSIONS = {
@@ -270,6 +284,17 @@ export interface PluginCommandContribution {
   icon?: string;
   /** When true the host only enables it with a non-empty selection. */
   needsSelection?: boolean;
+  /**
+   * A heading to group this command under in the Plugins menu.
+   *
+   * Presentation only, and flat — one level, like a layer prop's `group`, and
+   * for the same reason: a plugin that could nest menus could bury a command
+   * three levels down where nobody finds it. What this is actually for is the
+   * plugin with fourteen commands, which without it turns the Plugins menu into
+   * a scroll (the group is already at its 14-entry ceiling — see
+   * `menuSubmenus.test.ts`).
+   */
+  submenu?: string;
 }
 
 /**
@@ -356,6 +381,22 @@ export interface PluginContributes {
    * network access to nowhere is a mistake rather than a configuration.
    */
   net: NetContribution | null;
+  /**
+   * User interface, all four of them requiring `apiVersion: 7`.
+   *
+   * They arrived together because they are one idea seen from four sides — a
+   * plugin that can be USED rather than only invoked — and splitting them
+   * across four grammar versions would make an author bump a number for the
+   * three they did not write.
+   */
+  /** Parameter sections on layers the plugin does not own — see `uiParams.ts`. */
+  inspector: PluginInspectorPanelContribution[];
+  /** Toolbar tools whose pointer events reach the plugin — see `uiTools.ts`. */
+  tools: PluginToolContribution[];
+  /** Chords for the plugin's own commands, granted only if free — `uiShortcuts.ts`. */
+  shortcuts: PluginShortcutContribution[];
+  /** Functions callable from expressions — see `uiExpressions.ts`. */
+  expressions: PluginExpressionContribution[];
 }
 
 /**
@@ -382,6 +423,14 @@ export type ActivationEvent =
   // implies it (see `activatesOnLayerKind`); the spelling exists so an
   // author can be explicit, and so the set is readable from the manifest.
   | `onLayerKind:${string}`
+  /*
+    Fired when the user picks one of this plugin's tools.
+
+    Declaring a tool implies it, the same way declaring a layer kind implies
+    `onLayerKind` — a tool whose worker is not running is a cursor that swallows
+    every click and answers none of them, which is worse than no tool at all.
+  */
+  | `onTool:${string}`
   /*
     Fired when a render leaves the queue — finished, failed, or skipped.
 
@@ -469,6 +518,57 @@ export interface PluginManifest {
   contributes: PluginContributes;
   /** Always non-empty after parsing; `['onStartup']` when unspecified. */
   activationEvents: ActivationEvent[];
+  /**
+   * A COMPILED module this package ships. Absent for every plugin that has one
+   * of those only in its future, which is almost all of them.
+   *
+   * Nothing about this field grants anything. It declares that a binary exists
+   * and where; whether it is allowed to run is decided by a signature and a
+   * separate consent step (`native/nativeTrust.ts`), and it runs in a process
+   * of its own either way. Deliberately NOT `runtime: "native"` — that is the
+   * renderer-realm tier, a different thing with a different failure mode, and
+   * conflating them would make one consent answer the other's question.
+   */
+  native?: PluginNative;
+}
+
+/**
+ * The `native` block: which binary, for which machine, against which ABI.
+ *
+ * Shaped after OFX's bundle layout (`Win64/`, `MacOS/`, `Linux-x86-64/`) rather
+ * than after a single path with placeholders in it. A vendor ships the three
+ * platforms they build for and names each one; a host looks up one key. A
+ * template like `bin/{platform}/x.node` reads as more general and is worse at
+ * the only job it has — it cannot express "this build is arm64-only", which is
+ * most of the interesting cases.
+ */
+export interface PluginNative {
+  /**
+   * The MAJOR ABI this addon was built against.
+   *
+   * Declared here as well as returned by the binary, and the two are checked
+   * against each other. The manifest's copy is what lets the app say "this
+   * plugin needs a newer Premation" WITHOUT loading a stranger's code to find
+   * out — which is the whole reason the check exists.
+   */
+  abi: number;
+  /** `platform-arch` (`win32-x64`) → package-relative path to the binary. */
+  platforms: Record<string, string>;
+  /**
+   * Package-relative path → SHA-256 hex of the binary's bytes.
+   *
+   * Written by `scripts/pack-plugin.mjs --native`. Advisory here — the main
+   * process hashes the file it is about to load and consent is pinned to THAT
+   * — but it is what makes a mismatch nameable: "the binary is not the one this
+   * package was built with" rather than "the hash changed".
+   */
+  hashes?: Record<string, string>;
+  /** How the host may schedule calls. Default `instance`, as for CPU kernels. */
+  threadSafety?: ThreadSafety;
+  /** Hard per-call ceiling in ms. The host clamps it; see `NATIVE_CALL_TIMEOUT_MS`. */
+  timeoutMs?: number;
+  /** Idle ms before the process is stopped. The host clamps it too. */
+  idleTimeoutMs?: number;
 }
 
 const ID_RE = /^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$/;
@@ -499,6 +599,24 @@ function isSafePath(p: unknown): p is string {
   );
 }
 
+/**
+ * What the INSTALLER knows and the manifest cannot claim for itself.
+ *
+ * Exactly one field so far, and the shape exists to keep it that way: a trust
+ * decision belongs to whoever chose to install the package, never to the
+ * package. `limits: "extended"` is a request that only a caller passing
+ * `trusted: true` can grant — a local folder, developer mode, or a publisher
+ * the user has trusted.
+ *
+ * Defaults to untrusted, which is what the REGISTRY's own validation must use:
+ * it runs on a server, for a package nobody has chosen to trust yet, and a
+ * default of "trusted" there would publish a plugin against ceilings no
+ * installing machine would honour.
+ */
+export interface ManifestParseOptions {
+  trusted?: boolean;
+}
+
 export interface ManifestResult {
   manifest: PluginManifest | null;
   /** Empty exactly when `manifest` is non-null. */
@@ -507,7 +625,10 @@ export interface ManifestResult {
 
 /** An empty, fully-normalised contribution block. */
 function emptyContributes(): PluginContributes {
-  return { commands: [], panels: [], layerKinds: [], effects: [], exporters: [], importers: [], presets: [], net: null };
+  return {
+    commands: [], panels: [], layerKinds: [], effects: [], exporters: [], importers: [], presets: [],
+    net: null, inspector: [], tools: [], shortcuts: [], expressions: [],
+  };
 }
 
 /**
@@ -573,6 +694,7 @@ function parseContributes(
   name: string,
   apiVersion: number,
   errors: string[],
+  options: ManifestParseOptions,
 ): PluginContributes {
   const out = emptyContributes();
 
@@ -658,7 +780,7 @@ function parseContributes(
 
   if (c.layerKinds !== undefined) {
     if (apiVersion >= 3) {
-      out.layerKinds = parseLayerKinds(c.layerKinds, errors, ICONS);
+      out.layerKinds = parseLayerKinds(c.layerKinds, errors, ICONS, { apiVersion });
     } else if (!Array.isArray(c.layerKinds)) {
       errors.push('"contributes.layerKinds" must be an array.');
     } else if (c.layerKinds.length > 0) {
@@ -675,7 +797,13 @@ function parseContributes(
 
   if (c.effects !== undefined) {
     if (apiVersion >= 4) {
-      out.effects = parseEffects(c.effects, errors);
+      out.effects = parseEffects(c.effects, errors, {
+        trusted: options.trusted === true,
+        // `effects` itself has been API 4 since it shipped; the fields INSIDE an
+        // effect have their own versions (see `EFFECT_FIELD_SINCE`), because an
+        // older host ignores an unknown key rather than refusing it.
+        apiVersion,
+      });
     } else if (!Array.isArray(c.effects)) {
       errors.push('"contributes.effects" must be an array.');
     } else if (c.effects.length > 0) {
@@ -687,6 +815,32 @@ function parseContributes(
       // for.
       errors.push('"contributes.effects" requires "apiVersion": 4.');
     }
+  }
+
+  /*
+    A `"shader"` kind's shader must be one of THIS plugin's effects.
+
+    Checked here rather than in either validator, because it is the one rule
+    that spans both contribution lists and neither list can see the other. The
+    kind is DROPPED rather than accepted with a dangling name: a shader kind
+    that names nothing draws nothing, and an author who ships one finds out from
+    a user staring at an empty layer.
+
+    Only reachable when both lists parsed, so an effect that was itself refused
+    takes its kind with it — which is right: the kind could not have drawn with
+    a shader the host rejected either.
+  */
+  if (out.layerKinds.length > 0) {
+    const effectIds = new Set(out.effects.map((e) => e.id));
+    out.layerKinds = out.layerKinds.filter((kind) => {
+      if (kind.shader === undefined) return true;
+      if (effectIds.has(kind.shader)) return true;
+      errors.push(
+        `"contributes.layerKinds" kind "${kind.id}" draws with shader "${kind.shader}", `
+        + `which this plugin does not declare in "contributes.effects"${effectIds.size > 0 ? ` (it declares: ${[...effectIds].join(', ')})` : ''}.`,
+      );
+      return false;
+    });
   }
 
   // `null` is ABSENT, not a malformed block. That is not leniency for authors'
@@ -738,11 +892,19 @@ function parseContributes(
           errors.push(`"${at}.icon" is not an icon this editor has. Omit it to use the plugin glyph.`);
           return;
         }
+        if (
+          e.submenu !== undefined &&
+          (typeof e.submenu !== 'string' || !e.submenu.trim() || e.submenu.length > 40)
+        ) {
+          errors.push(`"${at}.submenu", when present, is 1–40 characters.`);
+          return;
+        }
         out.commands.push({
           id,
           label,
           ...(typeof e.icon === 'string' ? { icon: e.icon } : {}),
           ...(e.needsSelection === true ? { needsSelection: true } : {}),
+          ...(typeof e.submenu === 'string' && e.submenu.trim() ? { submenu: e.submenu.trim() } : {}),
         });
       });
     }
@@ -823,6 +985,58 @@ function parseContributes(
     }
   }
 
+  /*
+    The UI block, parsed LAST because three of the four name a command.
+
+    A button, a shortcut and (soon) anything else that acts has to point at
+    something in `contributes.commands`, and checking that here — rather than at
+    the moment the user presses it — is the difference between an install error
+    with a line number and a control that silently does nothing.
+  */
+  const commandIds = new Set(out.commands.map((cmd) => cmd.id));
+
+  if (c.inspector !== undefined) {
+    if (apiVersion >= 7) {
+      out.inspector = parseInspectorPanels(c.inspector, 'contributes.inspector', out.commands, ICONS, errors);
+    } else if (!Array.isArray(c.inspector)) {
+      errors.push('"contributes.inspector" must be an array.');
+    } else if (c.inspector.length > 0) {
+      // Same back-compat rule every other gated key follows: an empty block
+      // declares nothing and stays valid on an older grammar.
+      errors.push('"contributes.inspector" requires "apiVersion": 7.');
+    }
+  }
+
+  if (c.tools !== undefined) {
+    if (apiVersion >= 7) {
+      out.tools = parsePluginTools(c.tools, 'contributes.tools', ICONS, errors);
+    } else if (!Array.isArray(c.tools)) {
+      errors.push('"contributes.tools" must be an array.');
+    } else if (c.tools.length > 0) {
+      errors.push('"contributes.tools" requires "apiVersion": 7.');
+    }
+  }
+
+  if (c.shortcuts !== undefined) {
+    if (apiVersion >= 7) {
+      out.shortcuts = parsePluginShortcuts(c.shortcuts, 'contributes.shortcuts', commandIds, errors);
+    } else if (!Array.isArray(c.shortcuts)) {
+      errors.push('"contributes.shortcuts" must be an array.');
+    } else if (c.shortcuts.length > 0) {
+      errors.push('"contributes.shortcuts" requires "apiVersion": 7.');
+    }
+  }
+
+  if (c.expressions !== undefined) {
+    if (apiVersion >= 7) {
+      out.expressions = parsePluginExpressions(c.expressions, 'contributes.expressions', errors);
+    } else if (!Array.isArray(c.expressions)) {
+      errors.push('"contributes.expressions" must be an array.');
+    } else if (c.expressions.length > 0) {
+      errors.push('"contributes.expressions" requires "apiVersion": 7.');
+    }
+  }
+
   return out;
 }
 
@@ -882,6 +1096,15 @@ function parseActivationEvents(
       if (!out.includes(ev as ActivationEvent)) out.push(ev as ActivationEvent);
       continue;
     }
+    const tool = /^onTool:(.*)$/.exec(ev);
+    if (tool) {
+      if (!contributes.tools.some((t) => t.id === tool[1]!)) {
+        errors.push(`"activationEvents" refers to tool "${tool[1]}", which is not in "contributes.tools".`);
+        continue;
+      }
+      if (!out.includes(ev as ActivationEvent)) out.push(ev as ActivationEvent);
+      continue;
+    }
     const layerKind = /^onLayerKind:(.*)$/.exec(ev);
     if (layerKind) {
       if (!layerKindIds.has(layerKind[1]!)) {
@@ -894,7 +1117,7 @@ function parseActivationEvents(
       continue;
     }
     errors.push(
-      `Unknown activation event "${ev}". Valid: onStartup, onCommand:<id>, onPanel:<id>, onLayerKind:<id>.`,
+      `Unknown activation event "${ev}". Valid: onStartup, onCommand:<id>, onPanel:<id>, onLayerKind:<id>, onTool:<id>.`,
     );
   }
 
@@ -902,7 +1125,7 @@ function parseActivationEvents(
 }
 
 /** Validate raw parsed JSON as a manifest. Never throws. */
-export function parseManifest(raw: unknown): ManifestResult {
+export function parseManifest(raw: unknown, options: ManifestParseOptions = {}): ManifestResult {
   const errors: string[] = [];
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return { manifest: null, errors: ['plugin.json is not a JSON object.'] };
@@ -967,7 +1190,9 @@ export function parseManifest(raw: unknown): ManifestResult {
 
   if (!isSafePath(r.main)) errors.push('"main" must be a package-relative path to the entry module.');
 
-  const contributes = parseContributes(r.contributes, r.panel, name, apiVersion, errors);
+  const native = parseNative(r.native, errors);
+
+  const contributes = parseContributes(r.contributes, r.panel, name, apiVersion, errors, options);
   const activationEvents = parseActivationEvents(r.activationEvents, contributes, errors);
 
   const permsRaw = r.permissions;
@@ -1043,8 +1268,117 @@ export function parseManifest(raw: unknown): ManifestResult {
       ...(optional.length > 0 ? { optional } : {}),
       contributes,
       activationEvents,
+      // Omitted when absent rather than stored as an empty block. "This package
+      // ships no compiled code" has to be the shape of the field being MISSING,
+      // so that no consumer can read a present-but-empty `native` as a tier it
+      // should ask the user about.
+      ...(native ? { native } : {}),
     },
     errors: [],
+  };
+}
+
+/** The same private helper every sibling schema module keeps. */
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/**
+ * The `native` block.
+ *
+ * Refuses rather than repairs, at every step, which is not the house style for
+ * optional manifest fields and is the right style for this one: everything here
+ * decides which FILE a compiled module is loaded from, and a validator that
+ * quietly drops a malformed platform key turns "my arm64 build did not load"
+ * into a silent fallback onto the x64 one.
+ *
+ * What it does NOT check: whether the paths exist (the package reader knows
+ * that, and a manifest is parsed by the registry too, where the files are not
+ * present) and whether the platform key is one this build has heard of (a
+ * package built for a platform the app grows support for next year must stay
+ * readable today — see `nativePlatforms.ts`).
+ */
+function parseNative(raw: unknown, errors: string[]): PluginNative | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!isPlainObject(raw)) {
+    errors.push('"native" must be an object with an "abi" number and a "platforms" map.');
+    return undefined;
+  }
+
+  const abi = typeof raw.abi === 'number' ? raw.abi : NaN;
+  if (!Number.isInteger(abi) || abi < 1) {
+    errors.push('"native.abi" must be the whole MAJOR ABI number the module was built against.');
+  }
+
+  if (!isPlainObject(raw.platforms)) {
+    errors.push(
+      '"native.platforms" must map a platform-arch key ("win32-x64") to a package-relative path.',
+    );
+    return undefined;
+  }
+
+  const platforms: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw.platforms)) {
+    // `platform-arch`, both lowercase, and nothing else. The key is looked up
+    // by string equality against `process.platform`-`process.arch`, so a key
+    // that is merely close is a binary that is never found and never reported.
+    if (!/^[a-z0-9]+-[a-z0-9]+$/.test(key)) {
+      errors.push(`"native.platforms" key "${key}" must be "<platform>-<arch>", e.g. "win32-x64".`);
+      continue;
+    }
+    if (!isSafePath(value)) {
+      errors.push(`"native.platforms.${key}" must be a package-relative path to the module.`);
+      continue;
+    }
+    platforms[key] = value as string;
+  }
+  if (Object.keys(platforms).length === 0) {
+    errors.push('"native.platforms" names no usable binary.');
+  }
+
+  const hashes: Record<string, string> = {};
+  if (raw.hashes !== undefined) {
+    if (!isPlainObject(raw.hashes)) {
+      errors.push('"native.hashes" must map a package-relative path to a sha256 hex string.');
+    } else {
+      for (const [key, value] of Object.entries(raw.hashes)) {
+        if (typeof value !== 'string' || !/^[0-9a-f]{64}$/i.test(value)) {
+          // Not fatal, and deliberately so: the hash that decides anything is
+          // the one the main process measures. A malformed one here is an
+          // author's packaging mistake, not a reason the plugin cannot load.
+          continue;
+        }
+        hashes[key] = value.toLowerCase();
+      }
+    }
+  }
+
+  let threadSafety: ThreadSafety | undefined;
+  if (raw.threadSafety !== undefined) {
+    if (!(THREAD_SAFETY as readonly unknown[]).includes(raw.threadSafety)) {
+      errors.push(`"native.threadSafety" must be one of ${THREAD_SAFETY.join(', ')}.`);
+    } else {
+      threadSafety = raw.threadSafety as ThreadSafety;
+    }
+  }
+
+  const ms = (value: unknown, field: string): number | undefined => {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      errors.push(`"native.${field}" must be a positive number of milliseconds.`);
+      return undefined;
+    }
+    return value;
+  };
+  const timeoutMs = ms(raw.timeoutMs, 'timeoutMs');
+  const idleTimeoutMs = ms(raw.idleTimeoutMs, 'idleTimeoutMs');
+
+  return {
+    abi,
+    platforms,
+    ...(Object.keys(hashes).length > 0 ? { hashes } : {}),
+    ...(threadSafety ? { threadSafety } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
   };
 }
 
@@ -1088,9 +1422,13 @@ function parseCapabilityList(raw: unknown, field: string, errors: string[]): str
  */
 export function describeContributions(contributes: PluginContributes): string {
   const parts: string[] = [];
-  const { commands, panels, layerKinds } = contributes;
+  const { commands, panels, layerKinds, tools } = contributes;
   if (commands.length > 0) parts.push(`${commands.length} command${commands.length === 1 ? '' : 's'}`);
   if (panels.length > 0) parts.push(`${panels.length} panel${panels.length === 1 ? '' : 's'}`);
+  // Listed beside panels because a tool is the most VISIBLE thing a plugin can
+  // add: it takes a slot on the toolbar and, while active, every click in the
+  // viewport. Someone deciding whether to install should see that up front.
+  if (tools.length > 0) parts.push(`${tools.length} tool${tools.length === 1 ? '' : 's'}`);
   // Listed because it is the contribution that changes a DOCUMENT. A user
   // deciding whether to uninstall should be able to see that this one leaves
   // something behind in their projects.
@@ -1122,4 +1460,16 @@ export function activatesOnStartup(manifest: PluginManifest): boolean {
 export function activatesOnLayerKind(manifest: PluginManifest, kindId: string): boolean {
   return manifest.contributes.layerKinds.some((k) => k.id === kindId)
     || manifest.activationEvents.includes(`onLayerKind:${kindId}` as ActivationEvent);
+}
+
+/**
+ * Does `manifest` want to wake when the user picks one of its tools?
+ *
+ * Implicit, like `activatesOnLayerKind` and for a sharper version of the same
+ * reason: a tool whose plugin is not running takes every click in the viewport
+ * and answers none of them, so there is no coherent way to opt out.
+ */
+export function activatesOnTool(manifest: PluginManifest, toolId: string): boolean {
+  return manifest.contributes.tools.some((t) => t.id === toolId)
+    || manifest.activationEvents.includes(`onTool:${toolId}` as ActivationEvent);
 }

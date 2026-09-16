@@ -20,12 +20,22 @@ import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { defaultAnimation, pointsToLottieBezier } from '@motion/animation';
 import { shapeOutline } from '@core/scene/pathOps';
 import { readNodePolystar } from '@core/scene/polystar';
+import { readNodeStrokes, type PaintOpOptions, type Stroke } from '@core/paint/stroke';
+import { readNodeFill, type FillPaint } from '@core/paint/fill';
+import {
+  dashParamAt,
+  strokeColorChannelPaths,
+  strokeGradientGeometryFor,
+  strokeTrackPath,
+} from '@core/rendering/strokeTracks';
+import { paintBlendToLottie } from '@core/rendering/raster/paintBlend';
+import { paintRenderOrder } from '@core/rendering/raster/vectorDraw';
 import { captureDocument } from '@core/api/cloudDocument';
 import { getTimelineController } from '@core/timeline/TimelineController';
 import { flattenScene, readNodeKind } from '@core/scene/sceneDerive';
 import { compRootOf } from '@core/scene/parenting';
 import type { SceneNode } from '@core/types';
-import { renderOffline, renderStillFrame, exportView, exportComp, resolveRange, type OfflineRenderParams } from './offlineRenderer';
+import { renderOffline, renderStillFrame, exportView, exportComp, resolveRange, EXPORT_YIELD_BUDGET_MS, type OfflineRenderParams } from './offlineRenderer';
 import { FramePipeline, CanvasPool, defaultConcurrency } from './framePipeline';
 import { useMotionBlurStore } from '@stores/motionBlurStore';
 import { type ZipEntry } from './zip';
@@ -539,7 +549,7 @@ export async function renderVideo(
   const runEncode = async (): Promise<VideoSinkResult> => {
     try {
       await renderOffline(
-        offlineParams(opts),
+        { ...offlineParams(opts), yieldBudgetMs: EXPORT_YIELD_BUDGET_MS },
         async (canvas, frame, count, backend) => {
           // The backend rides along as the sink's optional float-linear frame
           // source (the HDR sink stages from it instead of 8-bit sRGB bytes).
@@ -695,7 +705,7 @@ export async function createResumableVideoRender(
           await renderOffline(
             // The loop's own range does the skipping: nothing before the resume
             // point is rendered, let alone re-staged.
-            { ...params, startFrame: start + fromOffset, endFrame: end },
+            { ...params, startFrame: start + fromOffset, endFrame: end, yieldBudgetMs: EXPORT_YIELD_BUDGET_MS },
             async (canvas, frame, _count, backend) => {
               // `frame` is 0-based within THIS run; the sink needs the offset
               // within the whole export range, or a resume would restage over
@@ -863,13 +873,236 @@ async function exportSequence(opts: ExportOptions, ext: 'png' | 'jpg'): Promise<
   download(blob, `${opts.baseName ?? defaultBaseName()}-${ext}-sequence.zip`);
 }
 
-/** "#ff8800" → Lottie's normalized [r, g, b] triple. */
+/** "#ff8800" (also #rgb / #rgba / #rrggbbaa) → Lottie's normalized [r, g, b] triple. */
 function hexToLottieRgb(hex: unknown): [number, number, number] {
   const s = typeof hex === 'string' ? hex.trim().replace('#', '') : '';
-  const full = s.length === 3 ? s.split('').map((c) => c + c).join('') : s;
+  const short = s.length === 3 || s.length === 4 ? s.slice(0, 3).split('').map((c) => c + c).join('') : s;
+  const full = short.length === 8 ? short.slice(0, 6) : short;
   if (!/^[0-9a-f]{6}$/i.test(full)) return [1, 1, 1];
   const n = parseInt(full, 16);
   return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+}
+
+/** The alpha a #rgba / #rrggbbaa colour carries, 0..1 (1 when it has none). */
+function hexAlpha(hex: unknown): number {
+  const s = typeof hex === 'string' ? hex.trim().replace('#', '') : '';
+  if (/^[0-9a-f]{8}$/i.test(s)) return parseInt(s.slice(6, 8), 16) / 255;
+  if (/^[0-9a-f]{4}$/i.test(s)) return parseInt(s[3]! + s[3]!, 16) / 255;
+  return 1;
+}
+
+const LOTTIE_LINE_CAP: Record<Stroke['cap'], number> = { butt: 1, round: 2, square: 3 };
+const LOTTIE_LINE_JOIN: Record<Stroke['join'], number> = { miter: 1, round: 2, bevel: 3 };
+
+/** The drawable's local box (centre + size) — gradient endpoints are placed in it. */
+interface LottieBox { cx: number; cy: number; w: number; h: number }
+
+/** One engine track as a Lottie scalar property (static when it has < 2 keys),
+ *  with values multiplied by `mul` (e.g. 100 for a 0..1 track Lottie keeps in %). */
+function lottieScalarProp(nodeId: string, prop: string, fr: number, fallback: number, mul = 1): unknown {
+  const tr = defaultAnimation.tracksFor(nodeId).find((t) => t.prop === prop);
+  if (!tr || tr.keyframes.length < 2) {
+    const v = tr?.keyframes[0]?.value;
+    return { a: 0, k: (typeof v === 'number' && Number.isFinite(v) ? v : fallback) * mul };
+  }
+  return { a: 1, k: tr.keyframes.map((k) => ({ t: Math.round(k.t * fr), s: [k.value * mul], ...lottieEase(k) })) };
+}
+
+/**
+ * Stroke colour (`c`) and opacity (`o`, 0–100) for the stroke at stack `index`.
+ * The renderer folds its colour channels (0..1) into the colour and the alpha
+ * channel into its alpha, which multiplies the stroke's opacity — and that
+ * opacity is itself a track (`strokeOpacity` / `stroke.<i>.opacity`) since
+ * 2026-09-15. Either animating exports as animated `o`.
+ *
+ * `colorTracks` false (a gradient stroke) exports opacity alone; a gradient has
+ * no `c`, so its colour channels have nothing to drive.
+ */
+function lottieStrokeColorOpacity(
+  nodeId: string,
+  stroke: Stroke,
+  index: number,
+  colorTracks: boolean,
+  fr: number,
+): { c: unknown; o: unknown } {
+  const [rP, gP, bP, aP] = strokeColorChannelPaths(index) as [string, string, string, string];
+  const opP = strokeTrackPath(index, 'opacity');
+  const wanted = colorTracks ? [rP, gP, bP, aP, opP] : [opP];
+  const tracks = defaultAnimation.tracksFor(nodeId).filter((t) => wanted.includes(t.prop) && t.keyframes.length > 0);
+  // The renderer applies the colour channels only when red is present.
+  const hasColor = tracks.some((t) => t.prop === rP);
+  const hasOpacity = tracks.some((t) => t.prop === opP);
+  if (!hasColor && !hasOpacity) {
+    return {
+      c: { a: 0, k: [...hexToLottieRgb(stroke.color), 1] },
+      o: { a: 0, k: stroke.opacity * hexAlpha(stroke.color) * 100 },
+    };
+  }
+  const live = tracks.filter((t) => hasColor || t.prop === opP);
+  const times = [...new Set(live.flatMap((t) => t.keyframes.map((k) => k.t)))].sort((a, b) => a - b);
+  const at = (prop: string, t: number, dflt: number): number => {
+    const v = defaultAnimation.sample(nodeId, prop, t);
+    return typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : dflt;
+  };
+  const easeAt = (t: number) => live.map((tr) => tr.keyframes.find((k) => k.t === t)).find((k) => k !== undefined) ?? {};
+  const rgbAt = (t: number): number[] => (hasColor
+    ? [at(rP, t, 0), at(gP, t, 0), at(bP, t, 0), 1]
+    : [...hexToLottieRgb(stroke.color), 1]);
+  const opAt = (t: number): number =>
+    (hasOpacity ? at(opP, t, stroke.opacity) : stroke.opacity)
+    * (hasColor ? at(aP, t, 1) : hexAlpha(stroke.color)) * 100;
+  const rgbAnimated = hasColor && live.some((t) => (t.prop === rP || t.prop === gP || t.prop === bP) && t.keyframes.length >= 2);
+  const alphaAnimated = live.some((t) => (t.prop === aP || t.prop === opP) && t.keyframes.length >= 2);
+  const t0 = times[0] ?? 0;
+  return {
+    c: rgbAnimated
+      ? { a: 1, k: times.map((t) => ({ t: Math.round(t * fr), s: rgbAt(t), ...lottieEase(easeAt(t)) })) }
+      : { a: 0, k: rgbAt(t0) },
+    o: alphaAnimated
+      ? { a: 1, k: times.map((t) => ({ t: Math.round(t * fr), s: [opAt(t)], ...lottieEase(easeAt(t)) })) }
+      : { a: 0, k: opAt(t0) },
+  };
+}
+
+/** A gradient stroke paint's `gs` fields (`g`, `t`, `s`, `e`), or null for solid. */
+function lottieGradientFields(paint: FillPaint, box: LottieBox): Record<string, unknown> | null {
+  if (paint.type === 'solid' || paint.stops.length === 0) return null;
+  const stops = [...paint.stops].sort((a, b) => a.offset - b.offset);
+  const k: number[] = [];
+  for (const s of stops) k.push(s.offset, ...hexToLottieRgb(s.color));
+  for (const o of paint.opacityStops ?? []) k.push(o.offset, o.opacity);
+  let s: [number, number];
+  let e: [number, number];
+  if (paint.type === 'linear') {
+    // The importer reads a linear gradient's direction back off s→e, so any
+    // span along the angle round-trips; reaching the box edges also matches
+    // how the renderer spans the ramp.
+    const rad = (paint.angle * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const half = (Math.abs(box.w * cos) + Math.abs(box.h * sin)) / 2;
+    s = [box.cx - half * cos, box.cy - half * sin];
+    e = [box.cx + half * cos, box.cy + half * sin];
+  } else {
+    // Engine radial: centre relative to the box, radius a fraction of its half-diagonal.
+    const sx = box.cx + (paint.cx - 0.5) * box.w;
+    const sy = box.cy + (paint.cy - 0.5) * box.h;
+    s = [sx, sy];
+    e = [sx + paint.radius * (Math.hypot(box.w, box.h) / 2), sy];
+  }
+  return { g: { p: stops.length, k: { a: 0, k } }, t: paint.type === 'radial' ? 2 : 1, s: { a: 0, k: s }, e: { a: 0, k: e } };
+}
+
+/**
+ * Two engine tracks (an X and a Y) as one Lottie 2-D point property, mapped
+ * through `map`. Static when neither track has two keys; otherwise keyed at the
+ * union of both tracks' times, each axis SAMPLED there, so a point whose X and Y
+ * were keyed at different times still plays back as the frame showed it.
+ */
+function lottiePointProp(
+  nodeId: string,
+  xProp: string,
+  yProp: string,
+  fr: number,
+  fallback: readonly [number, number],
+  map: (x: number, y: number) => [number, number],
+): unknown {
+  const tracks = defaultAnimation.tracksFor(nodeId).filter((t) => (t.prop === xProp || t.prop === yProp) && t.keyframes.length > 0);
+  const sample = (prop: string, t: number, dflt: number): number => {
+    const v = defaultAnimation.sample(nodeId, prop, t);
+    return typeof v === 'number' && Number.isFinite(v) ? v : dflt;
+  };
+  if (!tracks.some((t) => t.keyframes.length >= 2)) {
+    const x = tracks.find((t) => t.prop === xProp)?.keyframes[0]?.value ?? fallback[0];
+    const y = tracks.find((t) => t.prop === yProp)?.keyframes[0]?.value ?? fallback[1];
+    return { a: 0, k: map(x, y) };
+  }
+  const times = [...new Set(tracks.flatMap((t) => t.keyframes.map((k) => k.t)))].sort((a, b) => a - b);
+  const easeAt = (t: number) => tracks.map((tr) => tr.keyframes.find((k) => k.t === t)).find((k) => k !== undefined) ?? {};
+  return {
+    a: 1,
+    k: times.map((t) => ({
+      t: Math.round(t * fr),
+      s: map(sample(xProp, t, fallback[0]), sample(yProp, t, fallback[1])),
+      ...lottieEase(easeAt(t)),
+    })),
+  };
+}
+
+/**
+ * One engine stroke — the one at stack `index` — as a Lottie `st` (or `gs` for
+ * gradient paint): colour, opacity, width, cap, join, miter limit, dashes and
+ * blend mode, with every animated channel exported as keyframes on the tracks
+ * `resolveStrokeTracks` folds for THAT index (width, colour, opacity, miter
+ * limit as `ml2`, each dash/gap value, dash offset, gradient Start/End `s`/`e`
+ * and radial highlight `h`/`a`).
+ *
+ * Not representable in Lottie, so not exported: Taper and Wave (no standard
+ * bodymovin field), inside/outside alignment (AE has no stroke alignment), and
+ * Composite as a FIELD — it is exported structurally instead, by the order the
+ * paint items are written in (see `lottieShapesFor`).
+ */
+function lottieStrokeItem(nodeId: string, stroke: Stroke, index: number, fr: number, box: LottieBox): Record<string, unknown> {
+  const color = stroke.paint?.type === 'solid' ? stroke.paint.color : stroke.color;
+  const grad = stroke.paint ? lottieGradientFields(stroke.paint, box) : null;
+  const { c, o } = lottieStrokeColorOpacity(nodeId, { ...stroke, color }, index, !grad, fr);
+  let d: unknown[] | undefined;
+  if (stroke.dash.some((v) => v > 0)) {
+    // An odd pattern repeats doubled (Canvas2D and SVG both); spell that out
+    // rather than rely on every player agreeing. A doubled entry follows the
+    // SAME track as the stored entry it repeats.
+    const n = stroke.dash.length;
+    const pattern = n % 2 === 1 ? [...stroke.dash, ...stroke.dash] : stroke.dash;
+    d = pattern.map((v, i) => {
+      const pair = Math.floor(i / 2) + 1;
+      const isDash = i % 2 === 0;
+      const slot = dashParamAt(i % n);
+      return {
+        n: isDash ? 'd' : 'g',
+        nm: `${isDash ? 'dash' : 'gap'}${pair > 1 ? pair : ''}`,
+        v: slot ? lottieScalarProp(nodeId, strokeTrackPath(index, slot), fr, v) : { a: 0, k: v },
+      };
+    });
+    d.push({
+      n: 'o',
+      nm: 'offset',
+      v: lottieScalarProp(nodeId, strokeTrackPath(index, 'dashOffset'), fr, stroke.dashOffset ?? 0),
+    });
+  }
+  const ml = stroke.miterLimit ?? 4;
+  // AE's free gradient points, when the stroke has them (or keys them): they
+  // replace the angle/centre reading `lottieGradientFields` derived.
+  const g = grad && stroke.paint && stroke.paint.type !== 'solid' ? stroke.paint : null;
+  const pts = g ? stroke.gradient ?? strokeGradientGeometryFor(g, box.w, box.h) : null;
+  const pointTracked = !!g && ['gradientStartX', 'gradientStartY', 'gradientEndX', 'gradientEndY', 'highlightLength', 'highlightAngle']
+    .some((p) => defaultAnimation.isAnimated(nodeId, strokeTrackPath(index, p as 'gradientStartX')));
+  const toBox = (x: number, y: number): [number, number] => [box.cx + (x - 0.5) * box.w, box.cy + (y - 0.5) * box.h];
+  const points = g && pts && (stroke.gradient || pointTracked)
+    ? {
+        s: lottiePointProp(nodeId, strokeTrackPath(index, 'gradientStartX'), strokeTrackPath(index, 'gradientStartY'), fr, [pts.startX, pts.startY], toBox),
+        e: lottiePointProp(nodeId, strokeTrackPath(index, 'gradientEndX'), strokeTrackPath(index, 'gradientEndY'), fr, [pts.endX, pts.endY], toBox),
+        ...(g.type === 'radial'
+          ? {
+              h: lottieScalarProp(nodeId, strokeTrackPath(index, 'highlightLength'), fr, pts.highlightLength ?? 0, 100),
+              a: lottieScalarProp(nodeId, strokeTrackPath(index, 'highlightAngle'), fr, pts.highlightAngle ?? 0),
+            }
+          : {}),
+      }
+    : {};
+  const bm = paintBlendToLottie(stroke.blendMode);
+  return {
+    ty: grad ? 'gs' : 'st',
+    ...(grad ? { ...grad, ...points } : { c }),
+    o,
+    w: lottieScalarProp(nodeId, strokeTrackPath(index, 'width'), fr, stroke.width),
+    lc: LOTTIE_LINE_CAP[stroke.cap] ?? 1,
+    lj: LOTTIE_LINE_JOIN[stroke.join] ?? 1,
+    ml,
+    ml2: lottieScalarProp(nodeId, strokeTrackPath(index, 'miterLimit'), fr, ml),
+    ...(d ? { d } : {}),
+    ...(bm ? { bm } : {}),
+    nm: `Stroke ${index + 1}`,
+  };
 }
 
 /**
@@ -884,7 +1117,7 @@ function hexToLottieRgb(hex: unknown): [number, number, number] {
  * data, images need embedded assets) — the caller counts those and tells the
  * user rather than silently shipping a hole.
  */
-function lottieShapesFor(node: SceneNode): unknown[] {
+export function lottieShapesFor(node: SceneNode, fr = 30): unknown[] {
   // Hard type-guard: only true vector shape layers export Lottie geometry.
   // Without this, a text/image/video node that happens to carry a default
   // `shapeType:'rect'` Transform with width/height would fall through to the
@@ -903,16 +1136,25 @@ function lottieShapesFor(node: SceneNode): unknown[] {
 
   const shapeType = typeof p.shapeType === 'string' ? p.shapeType : 'rect';
   const fill = (style?.props as Record<string, unknown> | undefined)?.fill;
-  const stroke = (style?.props as Record<string, unknown> | undefined)?.stroke;
-  const strokeWidth = (style?.props as Record<string, unknown> | undefined)?.strokeWidth;
   const hasFill = typeof fill === 'string' && fill !== '' && fill !== 'none' && fill !== 'transparent';
-  const hasStroke = typeof stroke === 'string' && stroke !== '' && stroke !== 'none' && typeof strokeWidth === 'number' && strokeWidth > 0;
+  // The strokes the RENDERER draws — the fx stroke stack Fill & Stroke edits.
+  // This read the legacy `Style.stroke/strokeWidth` pair, which nothing renders,
+  // so every stroke set in the inspector exported as no stroke at all.
+  // Each with its STORED stack index: a stroke's tracks are keyed by that index
+  // (`strokeTracks.ts`), so a disabled stroke 2 must not shift stroke 3 onto
+  // stroke 2's keyframes.
+  const strokes = readNodeStrokes(node)
+    .map((stroke, index) => ({ stroke, index }))
+    .filter((e) => e.stroke.enabled && e.stroke.width > 0);
+  const hasStroke = strokes.length > 0;
 
   const geomComp = node.components.find((c) => c.type === 'Geometry');
   let geometry: unknown;
+  let box: LottieBox = { cx: 0, cy: 0, w, h };
 
   const polystar = readNodePolystar(node);
   if (polystar) {
+    box = { cx: 0, cy: 0, w: polystar.outerRadius * 2, h: polystar.outerRadius * 2 };
     // A PARAMETRIC polystar exports as Lottie's native 'sr' shape rather than
     // a re-derived outline — players then render the same roundness math this
     // renderer uses (both follow AE's segment-proportional tangents). Static
@@ -936,6 +1178,10 @@ function lottieShapesFor(node: SceneNode): unknown[] {
     const pts = geomComp.props.points as Array<{ x: number; y: number; inX?: number; inY?: number; outX?: number; outY?: number }>;
     const closed = geomComp.props.open !== true;
     const lottieBez = pointsToLottieBezier(pts, closed);
+    const xs = pts.map((q) => q.x);
+    const ys = pts.map((q) => q.y);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    box = { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, w: x1 - x0, h: y1 - y0 };
     geometry = {
       ty: 'sh',
       d: 1,
@@ -948,6 +1194,7 @@ function lottieShapesFor(node: SceneNode): unknown[] {
   } else if (shapeType === 'polygon' || shapeType === 'star') {
     const width = w > 0 ? w : 100;
     const height = h > 0 ? h : 100;
+    box = { cx: 0, cy: 0, w: width, h: height };
     const outline = shapeOutline(shapeType as 'polygon' | 'star', width, height, 32);
     if (outline && outline.length >= 3) {
       const lottieBez = pointsToLottieBezier(outline, true);
@@ -965,25 +1212,33 @@ function lottieShapesFor(node: SceneNode): unknown[] {
   }
 
   const groupItems: unknown[] = [geometry];
-  if (hasFill || !hasStroke) {
-    groupItems.push({
-      ty: 'fl',
-      c: { a: 0, k: [...hexToLottieRgb(hasFill ? fill : '#ffffff'), 1] },
-      o: { a: 0, k: hasFill ? 100 : 0 },
-      r: 1,
-      nm: 'Fill',
-    });
-  }
-  if (hasStroke) {
-    groupItems.push({
-      ty: 'st',
-      c: { a: 0, k: [...hexToLottieRgb(stroke), 1] },
-      o: { a: 0, k: 100 },
-      w: { a: 0, k: strokeWidth },
-      lc: 2,
-      lj: 2,
-      nm: 'Stroke',
-    });
+  // Lottie draws a group's FIRST paint item on top, so the paints go out
+  // FRONT → BACK in the order the renderer composites them (`paintRenderOrder`,
+  // which resolves each paint's Composite). With every paint at its default
+  // that is today's order: strokes first, top one leading, then the fill — which
+  // also leaves the primary (bottom) stroke last among the strokes, the one an
+  // importer that keeps a single stroke picks up. A fill set Composite Above is
+  // written ahead of the strokes it covers, which is how Lottie says so.
+  const fillOp = (readNodeFill(node) ?? undefined) as (FillPaint & PaintOpOptions) | undefined;
+  const fillBm = paintBlendToLottie(fillOp?.blendMode);
+  const fillItem = hasFill || !hasStroke
+    ? {
+        ty: 'fl',
+        c: { a: 0, k: [...hexToLottieRgb(hasFill ? fill : '#ffffff'), 1] },
+        o: { a: 0, k: hasFill ? 100 : 0 },
+        r: 1,
+        ...(fillBm ? { bm: fillBm } : {}),
+        nm: 'Fill',
+      }
+    : null;
+  const order = paintRenderOrder(fillItem ? [fillOp] : [], strokes.map((e) => e.stroke)).reverse();
+  for (const op of order) {
+    if (op.kind === 'fill') {
+      groupItems.push(fillItem);
+    } else {
+      const entry = strokes.find((e) => e.stroke === op.stroke)!;
+      groupItems.push(lottieStrokeItem(node.id, entry.stroke, entry.index, fr, box));
+    }
   }
   groupItems.push({
     ty: 'tr',
@@ -1102,7 +1357,7 @@ function exportLottie(opts: ExportOptions): void {
           a: { a: 0, k: [0, 0, 0] },
           s,
         },
-        shapes: lottieShapesFor(node),
+        shapes: lottieShapesFor(node, fr),
       };
     });
 

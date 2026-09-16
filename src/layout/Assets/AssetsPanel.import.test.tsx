@@ -229,15 +229,15 @@ describe('the tabs explain themselves', () => {
     delete win.motionEditor;
   });
 
-  it('says Project and Media Browser, not Bin and Browse', () => {
+  it('says Assets and Media Browser, not Bin and Browse', () => {
     renderPanel();
-    expect(screen.getByRole('tab', { name: /Project/ })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /Assets/ })).toBeInTheDocument();
     expect(screen.getByRole('tab', { name: /Media Browser/ })).toBeInTheDocument();
     expect(screen.queryByRole('tab', { name: /^Bin$/ })).toBeNull();
     expect(screen.queryByRole('tab', { name: /^Browse$/ })).toBeNull();
   });
 
-  it('the empty Project tab says where imports go, with Import as its action', () => {
+  it('the empty Assets tab says where imports go, with Import as its action', () => {
     renderPanel();
     expect(screen.getByText(/Imports go to this list/)).toBeInTheDocument();
     // One Import affordance in the header, one in the empty state — no dock duplicates.
@@ -311,4 +311,44 @@ describe('Folder creation and single affordance', () => {
     expect(sub?.parentId).toBe(parent.id);
   });
 });
+
+describe('Grid view folder layout and empty drop target', () => {
+  it('renders grid folder with Empty badge and shows empty drop target when expanded', async () => {
+    useAssetsViewStore.getState().setView('grid');
+    useAssetStore.getState().createFolder('B-Roll', null);
+    renderPanel();
+
+    expect(await tree().findByText('B-Roll')).toBeInTheDocument();
+    expect(screen.getByText('Empty')).toBeInTheDocument();
+
+    // Click to expand folder
+    const folderRow = await tree().findByText('B-Roll');
+    fireEvent.click(folderRow);
+
+    // Shows empty drop target
+    expect(await tree().findByText(/Folder is empty · Drop files here/)).toBeInTheDocument();
+  });
+
+  it('renders item count badge and cards inside folder when folder has assets', async () => {
+    useAssetsViewStore.getState().setView('grid');
+    const folder = useAssetStore.getState().createFolder('Footage', null);
+    await useAssetStore.getState().addAssetsBatch([
+      { file: png('nested.png'), folderId: folder.id },
+      { file: png('root_file.png'), folderId: null },
+    ]);
+    renderPanel();
+
+    expect(await tree().findByText('Footage')).toBeInTheDocument();
+    expect(screen.getByText('1 item')).toBeInTheDocument();
+
+    // Both root and folder cards are distinct and findable
+    expect(await tree().findByText('root_file.png')).toBeInTheDocument();
+    expect(screen.getByText(/Media \(1\)/)).toBeInTheDocument();
+
+    // Click folder to expand
+    fireEvent.click(await tree().findByText('Footage'));
+    expect(await tree().findByText('nested.png')).toBeInTheDocument();
+  });
+});
+
 

@@ -16,13 +16,23 @@ import type { ProjectFile } from '@core/types';
 import { bumpScene } from './sceneStore';
 import { getCommandSystem } from '@core/commands/CommandSystem';
 import type { IUndoableCommand, CommandContext } from '@core/commands/Command';
+import {
+  captureSharedState,
+  cloneStateForRestore,
+  internState,
+  noteRestoredState,
+  statesEqual,
+} from '@core/commands/snapshotSharing';
 
-/** Deep-clone the current editable state into a snapshot. */
+/**
+ * Snapshot the current editable state.
+ *
+ * Structurally shared with every earlier snapshot (see `snapshotSharing.ts`):
+ * a complete, immutable value whose unchanged nodes and tracks are the SAME
+ * objects the previous entry holds, rather than a full deep clone per entry.
+ */
 function captureState(): { scene: ProjectFile; anim: AnimSnapshot } {
-  return {
-    scene: structuredClone(sceneProjectIO.capture()),
-    anim: defaultAnimation.snapshot(),
-  };
+  return captureSharedState();
 }
 
 export class StoreSnapshotCommand implements IUndoableCommand {
@@ -44,34 +54,30 @@ export class StoreSnapshotCommand implements IUndoableCommand {
     named = false,
   ) {
     this.label = label;
-    this.before = before;
-    this.after = after;
+    // Callers outside this store (the AI transaction, the dynamics bake) still
+    // build full copies; interning re-expresses them with shared nodes so a long
+    // session of those entries does not hold a document per step. Same content.
+    this.before = internState(before);
+    this.after = before === after ? this.before : internState(after);
     this.named = named;
   }
 
   execute(_ctx: CommandContext): void {
-    sceneProjectIO.restore(structuredClone(this.after.scene));
-    defaultAnimation.restore(this.after.anim);
-    bumpScene();
+    this.apply(this.after);
   }
 
   undo(_ctx: CommandContext): void {
-    sceneProjectIO.restore(structuredClone(this.before.scene));
-    defaultAnimation.restore(this.before.anim);
-    bumpScene();
+    this.apply(this.before);
   }
-}
 
-function statesEqual(
-  a: { scene: ProjectFile; anim: AnimSnapshot } | null,
-  b: { scene: ProjectFile; anim: AnimSnapshot } | null,
-): boolean {
-  if (a === b) return true;
-  if (!a || !b) return false;
-  try {
-    return JSON.stringify(a) === JSON.stringify(b);
-  } catch {
-    return false;
+  private apply(state: { scene: ProjectFile; anim: AnimSnapshot }): void {
+    // A private copy: the stores keep what they are given, and these objects
+    // are shared with neighbouring entries.
+    const copy = cloneStateForRestore(state);
+    sceneProjectIO.restore(copy.scene);
+    defaultAnimation.restore(copy.anim);
+    noteRestoredState(state.scene, state.anim);
+    bumpScene();
   }
 }
 
@@ -107,6 +113,8 @@ export interface HistoryStore {
 
 let seq = 0;
 let lastState: { scene: ProjectFile; anim: AnimSnapshot } | null = null;
+/** True while `record` pushes its own entry (see the baseline sync). */
+let pushingOwnSnapshot = false;
 
 let recordTimer: ReturnType<typeof setTimeout> | undefined;
 /** What the pending debounced entry is editing (see `schedule`). */
@@ -139,14 +147,21 @@ export const useHistoryStore = create<HistoryStore>((set, get) => ({
       }
     }
 
-    getCommandSystem().getHistory().push(
-      new StoreSnapshotCommand(
-        label ?? `Edit ${(seq += 1)}`,
-        lastState ?? currentState,
-        currentState,
-        named,
-      ),
-    );
+    // The push emits UndoStackChanged, whose baseline sync would capture the
+    // whole document again only for the line below to overwrite it.
+    pushingOwnSnapshot = true;
+    try {
+      getCommandSystem().getHistory().push(
+        new StoreSnapshotCommand(
+          label ?? `Edit ${(seq += 1)}`,
+          lastState ?? currentState,
+          currentState,
+          named,
+        ),
+      );
+    } finally {
+      pushingOwnSnapshot = false;
+    }
     lastState = currentState;
   },
 
@@ -279,6 +294,12 @@ import { isMediaDecodeRepaint } from '@core/rendering/mediaRepaint';
  */
 export function attachHistoryBaselineSync(): { dispose(): void } {
   return getEventBus().on('UndoStackChanged', () => {
+    // Two cases re-baseline anyway, right after this listener returns, so a
+    // capture here would be a full document walk thrown away:
+    //   • `record` pushing its own entry assigns `lastState` after the push;
+    //   • a restore in progress (`runRestoring`, and both `runAsOneHistoryEntry`
+    //     forms, which end in `runRestoring`) captures in its `finally`.
+    if (pushingOwnSnapshot || useHistoryStore.getState().restoring) return;
     lastState = captureState();
   });
 }

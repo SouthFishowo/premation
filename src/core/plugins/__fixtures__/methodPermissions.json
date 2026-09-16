@@ -49,6 +49,8 @@
     "scene.setSelection": "scene:read",
     "scene.setVisible": "scene:write",
     "timeline.getTime": "timeline",
-    "timeline.setTime": "timeline"
+    "timeline.setTime": "timeline",
+    "params.get": "scene:read",
+    "params.set": "scene:write"
   }
 }

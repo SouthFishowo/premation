@@ -201,9 +201,23 @@ function opacityStops(v: unknown, at: string): OpacityStop[] {
   });
 }
 
+/**
+ * Paint type spellings an author brings from CSS, mapped to ours.
+ *
+ * Only the NAME of the function is accepted as an alias — `{ type:
+ * 'linear-gradient', stops }` — never a CSS gradient string. Parsing CSS here
+ * would be a second, partial gradient grammar with its own idea of what an
+ * angle keyword or a colour hint means; see `normaliseFillWrite` for the
+ * refusal that says so.
+ */
+const PAINT_TYPE_ALIASES: Readonly<Record<string, string>> = {
+  'linear-gradient': 'linear',
+  'radial-gradient': 'radial',
+};
+
 function fillPaint(v: unknown, at: string): FillPaint {
   const o = obj(v, at);
-  const type = o.type;
+  const type = typeof o.type === 'string' ? (PAINT_TYPE_ALIASES[o.type] ?? o.type) : o.type;
   if (type === 'solid') {
     return { type: 'solid', color: color(o.color, `${at}.color`) };
   }
@@ -337,6 +351,56 @@ const STRUCTURED: Readonly<Record<string, StructuredProp>> = Object.freeze({
 
 /** The props that accept a structured value, for error messages and docs. */
 export const STRUCTURED_PROP_NAMES: readonly string[] = Object.freeze(Object.keys(STRUCTURED));
+
+/**
+ * `fill` is the name authors reach for; `fillPaint` is the one that takes paint.
+ *
+ * A plugin setting `fill` to a gradient object used to be refused ("does not
+ * take a structured value"), and setting it to a hex string wrote the string
+ * over the layer's fill RECORD with a raw `writeProp` — skipping the fill stack
+ * and the repaint, which is the "it saved but nothing happened" bug the header
+ * describes. So `fill` is routed: an object goes to `fillPaint` as-is, and a
+ * hex colour becomes a solid `fillPaint`.
+ *
+ * The hex route is skipped when the layer stores `fill` as a plain STRING (a
+ * text layer's colour), because there the raw write is the correct one and
+ * always worked.
+ *
+ * A CSS gradient STRING is refused with the object form spelled out rather than
+ * parsed. Returns null when the write is not a fill write at all.
+ */
+export function normaliseFillWrite(
+  prop: string,
+  value: unknown,
+  layerStoresFillAsString: boolean,
+): { ok: true; prop: string; value: unknown } | { ok: false; message: string } | null {
+  if (prop !== 'fill' && prop !== 'fillPaint') return null;
+  if (typeof value === 'string' && /gradient\s*\(/i.test(value)) {
+    return {
+      ok: false,
+      message:
+        `"${prop}" was given a CSS gradient string, which is not parsed. Pass a gradient object instead: `
+        + "{ type: 'linear', angle: 45, stops: [{ offset: 0, color: '#ff0055' }, { offset: 1, color: '#0055ff' }] } "
+        + "or { type: 'radial', cx: 0.5, cy: 0.5, radius: 0.5, stops: [...] }. "
+        + "'linear-gradient' and 'radial-gradient' are accepted as the type name.",
+    };
+  }
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    return { ok: true, prop: 'fillPaint', value };
+  }
+  if (prop === 'fill' && typeof value === 'string' && !layerStoresFillAsString
+    && /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(value)) {
+    return { ok: true, prop: 'fillPaint', value: { type: 'solid', color: value } };
+  }
+  if (prop === 'fillPaint') {
+    return {
+      ok: false,
+      message:
+        "\"fillPaint\" takes an object: { type: 'solid', color: '#rrggbb' }, or a 'linear' / 'radial' gradient with stops.",
+    };
+  }
+  return null;
+}
 
 /** Does this prop name take a structured value? */
 export function isStructuredProp(prop: string): boolean {

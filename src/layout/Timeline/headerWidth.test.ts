@@ -35,7 +35,7 @@ describe('track-header column model', () => {
   // Mirrors `TL_COLUMN_WIDTHS`. Named here rather than imported so a change to
   // the constant cannot silently satisfy its own test.
   const EXPECTED = {
-    preinfo: 72,
+    preinfo: 97,
     name: 190,
     switches: 256,
     mode: 70,
@@ -55,8 +55,8 @@ describe('track-header column model', () => {
     expect(cssVar('switches')).toBe(10 * 22 + 9 * 4);
   });
 
-  it('the A/V gutter is exactly its three 22px cells and two 3px gaps', () => {
-    expect(cssVar('preinfo')).toBe(3 * 22 + 2 * 3);
+  it('the A/V gutter is exactly its four 22px cells and three 3px gaps', () => {
+    expect(cssVar('preinfo')).toBe(4 * 22 + 3 * 3);
   });
 });
 
@@ -72,13 +72,13 @@ describe('TRACK_HEADER_MIN_WIDTH', () => {
 
 describe('headerWidthFor', () => {
   it('fits the mode columns in the default view', () => {
-    // padding 8 + (72 + 16 rule) + 4 + 190
+    // padding 8 + (97 + 16 rule) + 4 + 190
     //         + 4 + (70 + 16) + 4 + (58 + 16) + 4 + (120 + 16)
-    expect(headerWidthFor('modes')).toBe(598);
+    expect(headerWidthFor('modes')).toBe(623);
   });
 
   it('fits the switch column on its own', () => {
-    expect(headerWidthFor('switches')).toBe(8 + 88 + 4 + 190 + 4 + 256 + 16);
+    expect(headerWidthFor('switches')).toBe(8 + (97 + 16) + 4 + 190 + 4 + 256 + 16);
   });
 
   it('needs both blocks plus a gap when both are shown', () => {

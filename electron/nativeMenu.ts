@@ -127,7 +127,28 @@ export function nativeTemplateFromGroups(
 ): MenuItemConstructorOptions[] {
   const mac = opts.platform === 'darwin';
   const template: MenuItemConstructorOptions[] = [];
-  if (mac) template.push({ role: 'appMenu' });
+  // Spelled out rather than `role: 'appMenu'` so it can hold Settings… (⌘,) and
+  // Check for Updates…, which is where a Mac user looks for both — the macOS
+  // editor has no gear button. macOS ignores the label and shows the app name.
+  if (mac) {
+    template.push({
+      label: 'Premation',
+      submenu: [
+        { role: 'about' },
+        { label: 'Check for Updates…', click: opts.checkForUpdates },
+        { type: 'separator' },
+        { label: 'Settings…', accelerator: 'Cmd+,', click: opts.cmd('view.customize') },
+        { type: 'separator' },
+        { role: 'services' },
+        { type: 'separator' },
+        { role: 'hide' },
+        { role: 'hideOthers' },
+        { role: 'unhide' },
+        { type: 'separator' },
+        { role: 'quit' },
+      ],
+    });
+  }
 
   for (const g of groups) {
     const submenu = toOptions(g.items, opts);
@@ -148,7 +169,8 @@ export function nativeTemplateFromGroups(
       case 'help':
         // Not a command forwarded to the renderer: updating is the shell's
         // job, and the renderer is what gets replaced.
-        submenu.unshift({ label: 'Check for Updates…', click: opts.checkForUpdates }, { type: 'separator' });
+        // On a Mac it is in the app menu instead, where Mac apps keep it.
+        if (!mac) submenu.unshift({ label: 'Check for Updates…', click: opts.checkForUpdates }, { type: 'separator' });
         submenu.push({ type: 'separator' }, { label: `Version ${opts.version}`, enabled: false });
         break;
       default:

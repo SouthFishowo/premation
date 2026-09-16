@@ -75,10 +75,10 @@ const LINE_JOINS: { id: OffsetLineJoin; label: string }[] = [
   { id: 'bevel', label: 'Bevel' },
 ];
 
-/** AE's "Trim Multiple Shapes". `simultaneously` is AE's default and what a
- *  staggered reveal of several outlines wants; `individually` is what this
- *  renderer did before the switch existed. */
-const TRIM_MULTIPLE: { id: 'individually' | 'simultaneously'; label: string }[] = [
+/** AE's "Trim Multiple Shapes". `simultaneously` (AE's default) trims every
+ *  path by the same percentages at once; `individually` trims them one after
+ *  another, which is what a staggered reveal of several outlines wants. */
+const TRIM_MULTIPLE: { id: 'simultaneously' | 'individually'; label: string }[] = [
   { id: 'simultaneously', label: 'Simultaneously' },
   { id: 'individually', label: 'Individually' },
 ];
@@ -296,7 +296,7 @@ function PathOpCard({
             placement="left-start"
             trigger={
               <button type="button" className={styles.pick}>
-                <span>{op.trimMultiple === 'individually' ? 'Individually' : 'Simultaneously'}</span>
+                <span>{op.trimMultipleShapes === 'individually' ? 'Individually' : 'Simultaneously'}</span>
                 <Icon name="chevron-down" size="sm" />
               </button>
             }
@@ -304,8 +304,10 @@ function PathOpCard({
               type: 'item' as const,
               id: c.id,
               label: c.label,
-              icon: (op.trimMultiple ?? 'individually') === c.id ? 'check' : undefined,
-              onSelect: () => updatePathOp(nodeId, op.id, { trimMultiple: c.id }),
+              // Same fallback as the label above and `readPathOps`: absent is
+              // Simultaneously, so the checkmark and the trigger always agree.
+              icon: (op.trimMultipleShapes ?? 'simultaneously') === c.id ? 'check' : undefined,
+              onSelect: () => updatePathOp(nodeId, op.id, { trimMultipleShapes: c.id }),
             }))}
           />
         </div>

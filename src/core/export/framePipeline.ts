@@ -132,3 +132,80 @@ export class CanvasPool {
     this.free.push(c);
   }
 }
+
+/**
+ * An ORDERED bounded queue — the streaming encode's counterpart of
+ * `FramePipeline`.
+ *
+ * `FramePipeline` may finish jobs in any order because staged files are named
+ * by index. A stream has no names: ffmpeg's rawvideo input is just bytes, so
+ * frame N+1 written before frame N is encoded as the wrong picture with no
+ * error at all. So jobs here run ONE AT A TIME in push order, and the overlap
+ * the pipeline buys is between the producer and the writer — the render of
+ * frame N+1 runs while frame N crosses IPC and drains into ffmpeg's stdin.
+ *
+ * `push` resolves once the job is QUEUED, waiting first when `maxQueued` jobs
+ * are already outstanding: back-pressure, so a slow encoder slows the render
+ * instead of queueing frames (8 MB each at 1080p) without bound. The first
+ * failure is held and rethrown by the next `push` and by `drain`, and every job
+ * queued behind it is SKIPPED — writing frame N+1 after N failed would put a
+ * hole in the stream that nothing downstream can see.
+ */
+export class SequentialWriter {
+  private readonly limit: number;
+  private tail: Promise<void> = Promise.resolve();
+  private queued = 0;
+  private failure: unknown = null;
+  private closed = false;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(opts: { maxQueued?: number } = {}) {
+    this.limit = Math.max(1, opts.maxQueued ?? 2);
+  }
+
+  /** Jobs queued or running. */
+  get pending(): number {
+    return this.queued;
+  }
+
+  async push(job: () => Promise<void>): Promise<void> {
+    if (this.closed) throw new Error('SequentialWriter is closed.');
+    if (this.failure) throw this.failure;
+    while (this.queued >= this.limit) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+      if (this.failure) throw this.failure;
+    }
+    this.queued += 1;
+    this.tail = this.tail
+      .then(async () => {
+        if (this.failure) return;
+        try {
+          await job();
+        } catch (err) {
+          // First failure wins; wake everyone blocked in `push` so they see it
+          // instead of waiting on a queue that will now only skip.
+          if (!this.failure) {
+            this.failure = err;
+            for (const wake of this.waiters.splice(0)) wake();
+          }
+        }
+      })
+      .finally(() => {
+        this.queued -= 1;
+        this.waiters.shift()?.();
+      });
+  }
+
+  /** Wait for every queued job; rethrow the first failure. */
+  async drain(): Promise<void> {
+    while (this.queued > 0) await this.tail;
+    if (this.failure) throw this.failure;
+  }
+
+  /** Wait for queued jobs and refuse further pushes. Swallows failures — the
+   *  dispose path, where the stream is already being abandoned. */
+  async close(): Promise<void> {
+    this.closed = true;
+    while (this.queued > 0) await this.tail;
+  }
+}

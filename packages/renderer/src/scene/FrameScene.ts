@@ -68,7 +68,27 @@ export interface RenderableColorMatrix {
 /** One packed uniform slot. */
 export type FxVec4 = readonly [number, number, number, number];
 
-export type RenderableEffect = 
+/**
+ * What every chain entry may carry beside its own fields.
+ *
+ * `effectOpacity` is AE's Compositing Options ▸ Effect Opacity, 0..1 exclusive —
+ * the pass blends this entry's output back over its input (`fx-effect-opacity`).
+ * Absent = full strength. Only an effect that emits exactly ONE entry carries
+ * it (see `extractSpatialEffects`); a multi-pass plugin effect blends on the
+ * CPU bake instead.
+ *
+ * Deliberately NOT named `opacity`: this type is intersected with every entry
+ * kind, and some kinds already carry an `opacity` of their own (Light Rays' ray
+ * strength). With a shared key the pass read that parameter as Compositing
+ * opacity and blended the effect back over its input a second time.
+ */
+export interface RenderableEffectCompositing {
+  effectOpacity?: number;
+}
+
+export type RenderableEffect = RenderableEffectKind & RenderableEffectCompositing;
+
+type RenderableEffectKind =
   | {
       type: 'blur';
       radiusPx: number;
@@ -659,6 +679,58 @@ export type RenderableEffect =
        */
       mapLayerId?: string;
       /**
+       * Renderable ids supplying the effect's SECOND through FOURTH layer
+       * inputs, at bindings 5, 6 and 7.
+       *
+       * A separate list from `mapLayerId` rather than a four-element array that
+       * replaces it, because `mapLayerId` is what every plugin effect written
+       * before this emitted and what the existing resolution path reads. The
+       * first input keeps its name and its binding; only the ones that did not
+       * exist arrive under a new one.
+       *
+       * Positional: entry i is the (i+2)th declared `layer` parameter. An entry
+       * may be an empty string — a layer parameter the user has not pointed at
+       * anything yet — which self-samples exactly as an unset `mapLayerId`
+       * does, because the binding is declared by the SHADER and a declared
+       * binding with nothing bound is an invalid pipeline.
+       */
+      extraLayerIds?: readonly string[];
+      /**
+       * What the host fills in: the time, the sizes, the frame rate, a seed.
+       *
+       * Packed into the block by `packPluginEffect` rather than by the app,
+       * because the app cannot know the target a pass renders into and the two
+       * halves of that block must be written by one writer or they disagree
+       * about where `texelSize` ends. The app supplies the values it knows; the
+       * renderer supplies the ones only it knows.
+       *
+       * Optional so a scene built by a test — or by a path with no composition
+       * context — draws with zeros rather than failing to build.
+       */
+      hostInputs?: {
+        compWidth: number;
+        compHeight: number;
+        layerWidth: number;
+        layerHeight: number;
+        /** The LAYER's own time, which a retimed layer does not share with the comp. */
+        time: number;
+        compTime: number;
+        frame: number;
+        fps: number;
+        pixelScale: number;
+        downsample: number;
+        seed: number;
+      };
+      /**
+       * Per-side reach, in composition pixels, when the effect declared one.
+       *
+       * `spreadPx` remains the number `effectSpreadPx` maxes over — this is the
+       * finer answer for a directional effect, carried beside it rather than
+       * instead of it so nothing that reads the single number has to learn
+       * about four.
+       */
+      expandPx?: { left: number; top: number; right: number; bottom: number };
+      /**
        * Called around the draw so a device loss can be attributed to this
        * effect. Injected rather than imported: this package must not know that
        * plugins exist, and the app must not have to reach into the pass.
@@ -841,6 +913,54 @@ export interface Renderable {
      */
     flat?: { width: number; height: number };
   };
+  /**
+   * A plugin GENERATOR's instances for this frame.
+   *
+   * Present on a `kind: 'image'` renderable whose `textureKey` names a target
+   * the composition pass fills itself, by drawing these instances INSTANCED
+   * into a layer-sized offscreen — the same seam a precomp uses, and it buys
+   * the same thing: once the result is a texture, masks, mattes, blend modes,
+   * effects and motion blur all compose over it through the ordinary path.
+   *
+   * `instances` is the plugin's own buffer, nine (or eleven) floats each:
+   * x, y, z, size, rotation, r, g, b, a [, u, v]. Positions are in LAYER px
+   * around the centre of the `width` × `height` box, which is why that box
+   * travels with them.
+   *
+   * `revision` changes only when the DATA does, so the pass can skip the
+   * upload of an unchanged frame — the difference between 2 MB across the bus
+   * every frame and 2 MB when the simulation actually stepped.
+   */
+  generator?: {
+    instances: Float32Array;
+    count: number;
+    /** 9, or 11 when the instances carry u,v. */
+    stride: number;
+    primitive: 'point' | 'sprite' | 'quad' | 'mesh';
+    mesh?: { vertices: Float32Array; indices: Uint16Array | Uint32Array };
+    /** Texture provider key for the plugin's own sprite image, if it declared one. */
+    textureKey?: string;
+    /** One atlas cell in texture UV. `[1, 1]` = the whole texture. */
+    cellSize: readonly [number, number];
+    /** How the instances composite against EACH OTHER inside the field. The
+     *  layer's own blend mode is separate and applies to the result. */
+    blend: 'normal' | 'add';
+    revision: number;
+    /** The layer box the instance positions are relative to, in comp px. */
+    width: number;
+    height: number;
+    /**
+     * Focal length for the in-field perspective divide, in comp px, or absent
+     * for an orthographic field.
+     *
+     * Resolved by the snapshot adapter from the comp camera when the layer is
+     * 3D, exactly as the built-in particle field's own `perspective` is — the
+     * renderer has the camera's view and projection but not the lens the
+     * authored lens UI speaks in, so deriving it here would be reverse-
+     * engineering a number the adapter already holds.
+     */
+    perspective?: number;
+  };
   /** Dynamic CPU-skinned mesh geometry for puppet deformation. */
   deformedMesh?: {
     vertices: Float32Array;
@@ -1016,7 +1136,11 @@ export function depthEligible3D(r: Renderable): boolean {
   // See `enforceExtrusionPathAgreement`. Checked FIRST so the exemption cannot
   // be overtaken by a rule below it.
   if (r.depthExempt) return false;
-  if (r.matteSource || r.matte || r.adjustment || r.precomp) return false;
+  // `generator` for exactly the reason `precomp` is here: its content has to be
+  // rendered into an offscreen BEFORE the depth pass can sample it, and a pass
+  // cannot sample the target it is writing. Its instances still carry z, which
+  // parallaxes and sorts them within the field — see the generator pass.
+  if (r.matteSource || r.matte || r.adjustment || r.precomp || r.generator) return false;
   if (r.advancedBlend && r.advancedBlend > 0) return false;
   // Reads the accumulated backdrop's alpha, which the depth pass cannot supply.
   if (r.preserveTransparency) return false;

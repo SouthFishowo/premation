@@ -20,6 +20,7 @@ import type {
   PluginManifest,
   PluginPermission,
 } from './manifest';
+import type { PluginCanvasEvent } from './uiCanvas';
 
 /**
  * A command a plugin contributes to the palette / menus.
@@ -71,7 +72,20 @@ export type HostMessage =
   | {
       k: 'boot';
       manifest: PluginManifest;
+      /** The entry module's source. Used when `files` is absent. */
       code: string;
+      /**
+       * Every TEXT file in the package, so the worker can build a real module
+       * graph — one blob URL per file, relative specifiers rewritten to the URL
+       * each resolves to. Without it a plugin is exactly one file, because a
+       * blob URL has no directory to resolve `./util.js` against.
+       *
+       * Binaries are NOT here: a package may carry hundreds of megabytes of
+       * model weights, and `package.read` fetches the one that is wanted.
+       */
+      files?: Record<string, string>;
+      /** Package-relative path of the entry module, normalised. */
+      entry?: string;
       permissions: PluginPermission[];
       capabilities: string[];
     }
@@ -79,6 +93,29 @@ export type HostMessage =
   | { k: 'result'; id: number; ok: false; error: string }
   | { k: 'invoke'; commandId: string; selection: string[] }
   | { k: 'panelMessage'; panelId: string; data: unknown }
+  /**
+   * A pointer or key event that landed on this plugin's on-canvas drawing, or
+   * anywhere in the viewport while one of its tools is active.
+   *
+   * Told, not asked — like `invoke`. A gesture cannot wait for a reply: the
+   * host has already drawn the frame the user is looking at, and a plugin that
+   * wants the picture to change says so by posting a new draw list. Coordinates
+   * are in the LAYER's space (see `uiCanvas.ts`), so the plugin never learns
+   * the zoom, the pan or the size of the window.
+   */
+  | { k: 'canvas'; event: PluginCanvasEvent }
+  /**
+   * "An expression asked for `name(args)` and the cache had nothing."
+   *
+   * The reply is not a message — the plugin answers by CALLING
+   * `expressions.provide(name, args, value)`, which is an ordinary RPC. That
+   * asymmetry is deliberate: a plugin is equally entitled to provide a value
+   * nobody has asked for yet, which is the case that makes the whole mechanism
+   * feel synchronous, and one code path for both is one place to get it right.
+   */
+  | { k: 'expression'; name: string; args: number[] }
+  /** The user picked, or left, one of this plugin's tools. */
+  | { k: 'tool'; toolId: string; active: boolean }
   /**
    * A user AUTHORED one of this plugin's custom layers.
    *
@@ -120,6 +157,26 @@ export type HostMessage =
    * reason — a raw camera file is not small.
    */
   | { k: 'import'; id: number; importerId: string; fileName: string; bytes: ArrayBuffer }
+  /**
+   * Produce one frame of a `render: "generator"` layer kind.
+   *
+   * Request/response like `export` and `import`, and the busiest message in the
+   * protocol by frequency: one per generator layer per frame, ahead of the
+   * playhead during playback. Everything about its shape follows from that.
+   *
+   * `request.state` is the value the plugin returned for the previous frame,
+   * and it is CLONED rather than transferred. The host keeps checkpoints of it
+   * (see `generator/generatorState.ts`), and transferring would neuter the very
+   * snapshots a scrub seeks back to — the frame after the first scrub would
+   * then fail with a detached buffer, which presents as the plugin breaking
+   * only after the user drags the playhead.
+   */
+  | {
+      k: 'generate';
+      id: number;
+      kindId: string;
+      request: unknown;
+    }
   | { k: 'ping'; id: number };
 
 /** A line in a plugin's log, as shown in the manager. */
@@ -139,6 +196,19 @@ export type WorkerMessage =
   /** RGBA8, `width * height * 4` bytes. */
   | { k: 'importResult'; id: number; ok: true; width: number; height: number; pixels: ArrayBuffer }
   | { k: 'importResult'; id: number; ok: false; error: string }
+  /**
+   * One generated frame. `value` is the plugin's raw return — validated by the
+   * host in `generator/generatorContract.ts`, never trusted here.
+   *
+   * `transfer` says the plugin has given up its buffers, so they may be moved
+   * rather than copied. Opt-IN, and the default is the safe one: the natural
+   * way to write a 50 000-particle simulation is a persistent pool, and
+   * returning a view of one that the host then transferred would detach the
+   * plugin's own memory — the next frame throws inside the plugin, on a line
+   * that has nothing to do with the cause.
+   */
+  | { k: 'generateResult'; id: number; ok: true; value: unknown; transfer?: boolean }
+  | { k: 'generateResult'; id: number; ok: false; error: string }
   | { k: 'fatal'; error: string };
 
 /** Every RPC method the host implements, with the permission it requires.
@@ -148,8 +218,53 @@ export const METHOD_PERMISSIONS: Record<string, PluginPermission | null> = {
   'ui.notify': null,
   'ui.openPanel': null,
   'ui.closePanel': null,
+  /*
+    The UI surface (API 7).
+
+    All `null`, and the reason is the same one storage gets: none of them reads
+    or changes the user's DOCUMENT. `ui.draw` posts shapes into the viewport,
+    `ui.setStatus` writes a line of text the host never saves, and both are
+    already bounded by what a plugin had to be granted to get a layer id in the
+    first place. A consent line reading "may draw a rectangle" costs attention
+    on the one screen where attention is the point.
+
+    The two that DO touch the document are `params.*`, and they are gated as the
+    document verbs they are.
+  */
+  'ui.draw': null,
+  'ui.clearDraw': null,
+  'ui.setStatus': null,
+  'expressions.provide': null,
+
+  /*
+    The plugin's own contributed parameters, on somebody else's layer.
+
+    Read is `scene:read` and write is `scene:write`, for the reason the effect
+    stack gets the same pair: a contributed parameter is stored ON the layer and
+    saved with the document, so reading one is reading the user's project and
+    writing one changes it. That the plugin declared the parameter itself does
+    not make the layer its own.
+  */
+  'params.get': 'scene:read',
+  'params.set': 'scene:write',
   'commands.register': null,
   'composition.get': null,
+  /*
+    Reading a file out of the plugin's OWN package.
+
+    No permission, and that is a decision rather than an omission. The bytes in
+    question are the plugin's own — they arrived inside the package the user
+    installed, under the same signature as its JavaScript, and its entry module
+    could already have carried every one of them as a base64 string. A grant
+    line reading "read files it shipped itself" would describe no capability the
+    plugin does not already have, on the one screen where every line the user
+    skims makes the next one cheaper to skim.
+
+    What actually needs enforcing is that "its own package" means that: the host
+    resolves the path against the installed payload and never against a
+    filesystem. See `PluginHost.readPackageFile`.
+  */
+  'package.read': null,
 
   'scene.getSelection': 'scene:read',
   'scene.setSelection': 'scene:read',
@@ -217,6 +332,14 @@ export const METHOD_PERMISSIONS: Record<string, PluginPermission | null> = {
   'effects.add': 'scene:write',
   'effects.remove': 'scene:write',
   'effects.setParam': 'scene:write',
+  /*
+    An effect TYPE's parameter list — ids, types, ranges. Needs nothing: it is
+    the host's own catalogue, the same for every project, and reveals nothing
+    about the user's document. Gating it would push authors back to guessing
+    parameter names, which is the failure it exists to end. (Null entries are
+    deliberately absent from the registry's fixture, so this adds no drift.)
+  */
+  'effects.describe': null,
 
   'animation.getTracks': 'animation:read',
   'animation.sample': 'animation:read',
@@ -319,6 +442,25 @@ export function collectTransferables(msg: HostMessage | WorkerMessage): Transfer
   else if (msg.k === 'exportResult' && msg.ok && msg.bytes) take(msg.bytes);
   else if (msg.k === 'import') take(msg.bytes);
   else if (msg.k === 'importResult' && msg.ok) take(msg.pixels);
+  /*
+    A generated frame, ONLY when the plugin said its buffers may move.
+
+    The default is a copy, which is a memcpy of two megabytes at 50 000
+    instances — real, and much cheaper than the failure mode transferring by
+    default produces: a plugin that reuses a particle pool loses it on the
+    first frame, and the exception surfaces inside plugin code a frame later.
+    `transfer: true` is how an author states they built a fresh buffer.
+
+    `scan` rather than `take`, because the payload is an OBJECT — `instances`,
+    and a mesh's `vertices`/`indices` one level down are picked up by the same
+    shallow walk that handles a `result` value. The mesh's own buffers sit one
+    level deeper than `scan` reaches, and are copied; a generator's mesh is
+    static geometry that the host caches, so it is uploaded once rather than
+    per frame.
+  */
+  else if (msg.k === 'generateResult' && msg.ok && msg.transfer) scan(msg.value);
+  // `generate` deliberately transfers NOTHING: its `state` is the host's
+  // checkpoint data — see the message's own note.
 
   return out;
 }

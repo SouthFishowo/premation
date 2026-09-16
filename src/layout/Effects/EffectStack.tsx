@@ -479,7 +479,7 @@ function EffectParamRow({
           aria-label={label}
           className={panel.paramSelect}
         >
-          <option value="">None</option>
+          <option value="">{param.noneLabel ?? 'None'}</option>
           {stale && <option value={current}>Missing mask ({current})</option>}
           {paths.map((mp, i) => (
             <option key={mp.id} value={mp.id}>{mp.name || `Mask ${i + 1}`}</option>

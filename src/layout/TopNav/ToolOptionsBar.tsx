@@ -10,14 +10,18 @@ import { useReducer } from 'react';
 import { drawToolOptions } from '@motion/workspace';
 import { useUIStore } from '@stores/uiStore';
 import { usePaintStore } from '@stores/paintStore';
+import { useLayoutStore } from '@stores/layoutStore';
 import { useSelectionStore } from '@stores/selectionStore';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { isPaintableKind } from '@core/paint/paintCoords';
 import { removeLastStroke } from '@core/paint/paintStrokes';
+import { runDocumentEdit } from '@core/commands/documentEdit';
 import { ValueField } from '@components/ValueField';
 import { ColorPicker } from '@components/ColorPicker';
 import { Checkbox } from '@components/Checkbox';
 import { PIN_KIND_CATALOG, PUPPET_PIN_ICONS } from './puppetPinTools';
+import { ShapePaintOptions } from './ShapePaintOptions';
+import { SHAPE_PAINT_TOOLS } from '@core/workspace/shapeToolPaint';
 import { pinColor } from '@core/rig/puppet';
 import { Icon } from '@components/Icon';
 import { Badge } from '@components/Badge';
@@ -86,7 +90,7 @@ export function ToolOptionsBar(): JSX.Element | null {
     content = (
       <>
         <Row label="Size">
-          <ValueField value={drawToolOptions.brushSize} unit="px" min={1} max={200} onChange={(v) => set('brushSize', Number(v))} />
+          <ValueField value={drawToolOptions.brushSize} unit="px" min={1} max={activeTool === 'brush' ? 200 : 2500} onChange={(v) => set('brushSize', Number(v))} />
         </Row>
         {/* Taper and Pressure shape the freehand RIBBON's outline. A paint
             stroke is a polyline drawn at a constant width, so neither has
@@ -107,18 +111,9 @@ export function ToolOptionsBar(): JSX.Element | null {
         </Row>
         {paintingLayer && (
           <>
-            {/* Only the Paint tool gets a mode switch. Offering it under the
-                ERASER would be a checkbox that turns the eraser into a brush —
-                the exact hidden-mode confusion the tools were split to end. */}
-            {activeTool === 'paint' && (
-              <Row label="Erase">
-                <Checkbox
-                  checked={paint.mode === 'erase'}
-                  onChange={() => paint.set({ mode: paint.mode === 'erase' ? 'paint' : 'erase' })}
-                  title="Erase cuts holes in the layer instead of painting"
-                />
-              </Row>
-            )}
+            {/* Only the Paint tool gets a Brush/Clone switch. Erasing is the
+                Eraser tool's whole identity (Ctrl+B cycles all three), so there
+                is no Erase checkbox here that could turn a brush into one. */}
             {activeTool === 'paint' && (
               <Row label="Clone">
                 <Checkbox
@@ -131,9 +126,20 @@ export function ToolOptionsBar(): JSX.Element | null {
             <Row label="Opacity">
               <ValueField value={Math.round(paint.opacity * 100)} unit="%" min={0} max={100} precision={0} onChange={(v) => paint.set({ opacity: Number(v) / 100 })} />
             </Row>
+            <Row label="Flow">
+              <ValueField value={Math.round(paint.flow * 100)} unit="%" min={0} max={100} precision={0} onChange={(v) => paint.set({ flow: Number(v) / 100 })} />
+            </Row>
             <Row label="Hardness">
               <ValueField value={Math.round(paint.hardness * 100)} unit="%" min={0} max={100} precision={0} onChange={(v) => paint.set({ hardness: Number(v) / 100 })} />
             </Row>
+            {/* The full AE panels: Mode, Channels, Duration, Clone Options,
+                the stroke list (Paint, Ctrl+8) and tips + dynamics (Brushes, Ctrl+9). */}
+            <button type="button" className={styles.action} title="Paint panel (Ctrl+8)" onClick={() => useLayoutStore.getState().openPanel('paint')}>
+              Paint…
+            </button>
+            <button type="button" className={styles.action} title="Brushes panel (Ctrl+9)" onClick={() => useLayoutStore.getState().openPanel('brushes')}>
+              Brushes…
+            </button>
             {/* AE's "Erase: Last Stroke Only", as a button rather than a mode.
                 `removeLastStroke` already existed with no caller — this is the
                 one place a user would look for it. */}
@@ -142,7 +148,9 @@ export function ToolOptionsBar(): JSX.Element | null {
                 type="button"
                 className={styles.action}
                 title="Remove the most recent paint stroke on this layer"
-                onClick={() => removeLastStroke(selectedIds[0]!)}
+                // Its own undo step, like the stroke it removes — unwrapped, it
+                // left no history entry and Ctrl+Z skipped straight past it.
+                onClick={() => runDocumentEdit('Remove Last Stroke', () => removeLastStroke(selectedIds[0]!))}
               >
                 Undo last stroke
               </button>
@@ -305,6 +313,17 @@ export function ToolOptionsBar(): JSX.Element | null {
   } else if (activeTool === 'roto') {
     // ── VIEWPORT-ROTO-OPTIONS (unique anchor) ──────────────────────────
     content = <RotoOptions />;
+  }
+
+  // AE's toolbar Fill / Stroke beside the shape and pen tools — the paint the
+  // NEXT drawn shape takes, after any options the tool already shows.
+  if (SHAPE_PAINT_TOOLS.has(activeTool)) {
+    content = (
+      <>
+        {content}
+        <ShapePaintOptions />
+      </>
+    );
   }
 
   // The bar shows even with no per-tool content when snap-to-pixel is on: the

@@ -300,6 +300,23 @@ export function boundScopeNames(): readonly string[] {
   return boundNames;
 }
 
+/**
+ * What `plugin` resolves to, supplied by the host.
+ *
+ * Frozen empty by default. The host installs a provider at boot; everything
+ * downstream of it — the cache, the declared defaults, the request that goes to
+ * a worker on a miss — lives in the editor's `core/plugins/uiExpressions.ts`,
+ * because none of it is a property of the language.
+ */
+const NO_PLUGINS: Readonly<Record<string, unknown>> = Object.freeze({});
+let pluginScopeProvider: () => Readonly<Record<string, unknown>> = () => NO_PLUGINS;
+
+export function setPluginExpressionScope(
+  provider: (() => Readonly<Record<string, unknown>>) | null,
+): void {
+  pluginScopeProvider = provider ?? (() => NO_PLUGINS);
+}
+
 export function compileExpression(src: string): CompiledExpression {
   const trimmed = src.trim();
   if (trimmed === '') {
@@ -848,6 +865,23 @@ export function compileExpression(src: string): CompiledExpression {
         ['dot', dot], ['cross', cross], ['length', length], ['normalize', normalize],
         // ── Text ──
         ['text', ownText],
+        /*
+          ── Plugins ──
+
+          ONE name, holding every function any installed plugin contributes,
+          reached as `plugin.<namespace>.<fn>(…)`. One rather than many because
+          the names here are the LANGUAGE: `wiggle` is part of it and
+          `plugin.acme_lab.pulse` is not, and a scope whose keys appear and
+          disappear with what the user has installed cannot satisfy the
+          discoverability guard below — nor should it.
+
+          The provider is injected (`setPluginExpressionScope`) because this
+          package knows nothing about the plugin host and must keep evaluating
+          in a test with no worker. Unset, it is an empty object, so an
+          expression naming a plugin that is not installed fails as an unknown
+          MEMBER — which is what it is — rather than as an unknown identifier.
+        */
+        ['plugin', pluginScopeProvider()],
       ]);
       // Reflect the REAL Map for the discoverability guard. Captured once
       // (first evaluation) rather than per run, because `run` is called per
@@ -1022,6 +1056,10 @@ export function matchBracket(src: string, caret: number): [number, number] | nul
 /** API tokens offered for autocomplete / quick-insert in the editor. */
 export const EXPRESSION_API: { insert: string; label: string; hint: string }[] = [
   { insert: 'time', label: 'time', hint: 'playhead seconds' },
+  // Documented as the ROOT, not per function: what hangs off it depends on what
+  // the user has installed, and the editor appends the live list from
+  // `pluginExpressionHints()` when it builds the autocomplete.
+  { insert: 'plugin', label: 'plugin', hint: 'functions installed plugins provide' },
   { insert: 'value', label: 'value', hint: 'the keyframed value' },
   { insert: 'velocity', label: 'velocity', hint: 'rate of change per second' },
   { insert: 'speed', label: 'speed', hint: 'magnitude of rate of change' },

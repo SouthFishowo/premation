@@ -21,6 +21,7 @@ import { bumpScene } from '@stores/sceneStore';
 import { useGuidesStore, type Camera3dMode, type CameraOrbitPivot } from '@stores/guidesStore';
 import { useCompositionStore } from '@stores/compositionStore';
 import { getTime } from '@stores/playbackClockStore';
+import { governingClipsFor } from '@core/timeline/TimelineController';
 import { Matrix4Math, Project3D, type Camera3D, type OrthoView, type Vec3 } from '@motion/scene';
 import { getWorkspaceController } from '@core/workspace/WorkspaceController';
 import {
@@ -62,6 +63,22 @@ export interface CameraNavTarget {
 }
 
 /**
+ * Is this layer inside its in/out bar at the playhead — the renderer's
+ * `isLiveAt` rule (end-exclusive spans, clamped to the last comp frame) asked
+ * of the live timeline. Without it the camera tools picked the topmost camera
+ * even while it was trimmed out, and orbited a camera nobody was looking
+ * through.
+ */
+function isLiveAtPlayhead(nodeId: string): boolean {
+  const clips = governingClipsFor(nodeId);
+  if (clips.length === 0) return true;
+  const { fps, durationSeconds } = useCompositionStore.getState();
+  const raw = Math.round(getTime() * fps);
+  const frame = Math.min(raw, Math.max(0, Math.round(durationSeconds * fps) - 1));
+  return clips.some((l) => l.isActiveAt(frame));
+}
+
+/**
  * The camera the viewport navigates, or null when navigation is meaningless:
  * requires a Camera layer AND at least one 3D content layer (a camera over a
  * flat scene moves nothing).
@@ -80,7 +97,7 @@ export function findCameraNav(
   // Resolved through the VIEW for the same reason: in a `camera:<id>` view the
   // camera on screen is not the topmost, and orbiting the topmost would bring
   // that exact bug back.
-  const camNode = viewCameraNode(defaultSceneGraph, mode, rootId);
+  const camNode = viewCameraNode(defaultSceneGraph, mode, rootId, { isLiveAt: isLiveAtPlayhead });
   if (!camNode || !compHasAny3D()) return null;
   const t = camNode.components.find((c) => c.type === 'Transform');
   return t ? { nodeId: camNode.id, transId: t.id } : null;
@@ -279,7 +296,7 @@ export function resolveOrbitPivot(
 
   const rootId = activeCompRootId();
   const view = useGuidesStore.getState().camera3dMode;
-  const camNode = viewCameraNode(defaultSceneGraph, view, rootId);
+  const camNode = viewCameraNode(defaultSceneGraph, view, rootId, { isLiveAt: isLiveAtPlayhead });
   const cam = camNode
     ? cameraFromNode(camNode, compWidth, compHeight)
     : Project3D.defaultCamera(compWidth, compHeight);

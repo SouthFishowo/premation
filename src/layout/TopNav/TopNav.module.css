@@ -303,6 +303,23 @@
   border: none !important;
 }
 
+/* ── macOS unified toolbar ────────────────────────────────────────────
+   On a Mac the title bar and this row are one 44px bar (TitleBar draws nothing
+   on the editor route): traffic lights, tools, the project, the actions. The
+   height matches where main places the real traffic lights. The whole row
+   drags the window; anything that can be pressed opts back out. */
+.macUnified {
+  height: 44px;
+  min-height: 44px;
+  padding-left: 0;
+  border-top: none;
+  -webkit-app-region: drag;
+}
+
+.macUnified :is(button, input, select, textarea, a, [role='button'], [role='menuitem']) {
+  -webkit-app-region: no-drag;
+}
+
 /* ── Responsive Overrides ─────────────────────────────────────────── */
 @media (max-width: 1024px) {
   .compMeta {

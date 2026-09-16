@@ -17,7 +17,8 @@
  */
 
 import type { Effect } from './effects';
-import { effectCss, effectHasOpacity, effectOpacityOf } from './effects';
+import { effectCss, effectHasOpacity, effectOpacityOf, paramsOf } from './effects';
+import { writeOnUsesBrush } from './writeOnBrush';
 import { paintMaskMatte, type LayerMask, type MaskPath } from '@core/effects/mask';
 import { isLutEffect, buildChannelLut, applyChannelLut } from './colorLut';
 import { isCanvas2dProcedural, applyProceduralEffect } from './proceduralCanvas2d';
@@ -28,6 +29,7 @@ import {
   withStyleSilhouette,
 } from './canvas2dEffects';
 import { isColorEffect, effectColorMatrix, applyColorMatrixImage } from './effectColorMatrix';
+import { applyPluginCpuEffect, isPluginEffectType, pluginEffectNeedsCpuBake } from './pluginCpuEffect';
 
 /** True when an effect has NO GPU shader form and must be CPU-baked into the
  *  layer texture for the GPU backend (interior styles, warps, keylight, beam,
@@ -49,7 +51,8 @@ export function isGpuUnbakeableEffect(type: string): boolean {
  * Scoping is honoured only in the bake, so requesting it forces the bake.
  *
  * An effect carrying a COMPOSITING-OPTIONS OPACITY counts for the same reason
- * and one more. Blending an effect against its own input needs both images at
+ * and one more — unless it is one the GPU chain blends itself, see
+ * `gpuBlendsEffectOpacity` below. Blending an effect against its own input needs both images at
  * once, and the GPU chain has only the running one — but more to the point, the
  * blend is defined here in exactly one place, the way fill opacity is (see
  * `layerNeedsCpuBake`), rather than reimplemented in the composition pass and
@@ -65,6 +68,10 @@ function effectFollowsPath(e: Effect): boolean {
   // Energy Beam carries its spine to the GPU in the uniform block — the one
   // path effect with a polyline-aware shader, so it stays on the fast route.
   if (e.type === 'beam-path') return false;
+  // Write-on's brush form (2026-09-15) draws a recorded dab history the classic
+  // shader knows nothing of. Read through `paramsOf` so a stored document with
+  // no `writeOnMode` gets the registry default — Classic — and keeps the GPU.
+  if (e.type === 'write-on' && writeOnUsesBrush(paramsOf(e))) return true;
   const v = (e.params as Record<string, unknown> | undefined)?.pathMaskId;
   return typeof v === 'string' && v !== '';
 }
@@ -72,8 +79,77 @@ function effectFollowsPath(e: Effect): boolean {
 export function effectsNeedCpuBake(effects: ReadonlyArray<Effect> | undefined): boolean {
   return !!effects?.some(
     (e) => e.enabled !== false
-      && (isGpuUnbakeableEffect(e.type) || !!e.maskId || effectHasOpacity(e) || effectFollowsPath(e)),
+      && (isGpuUnbakeableEffect(e.type) || !!e.maskId
+        || (effectHasOpacity(e) && !gpuBlendsEffectOpacity(e.type)) || effectFollowsPath(e)
+        /*
+          A plugin effect the live backend cannot draw, but whose author shipped
+          a CPU kernel.
+
+          Only then. A plugin effect with a GPU kernel for this backend stays on
+          the GPU, where it belongs — routing every plugin effect through a bake
+          because one of them might need it would put a colour grade on the CPU
+          and cost 100 ms a frame. And an effect with NO runnable kernel is not
+          baked either: there is nothing to bake, and it reports itself
+          unsupported instead.
+        */
+        || pluginEffectNeedsCpuBake(e.type)),
   );
+}
+
+/**
+ * Effects whose Compositing Options opacity the GPU chain blends itself
+ * (2026-09-15), so an unmasked opacity no longer drags the layer onto the CPU.
+ *
+ * The paragraph above still holds for everything NOT listed: the blend needs
+ * the effect's input and output at once, and the GPU chain can hold both only
+ * for an effect that is ONE chain entry — `extractSpatialEffects` stamps the
+ * opacity on that entry and `CompositionPass.runEffectsChain` lerps it back
+ * over its input in display space (`fx-effect-opacity`, the twin of the flat
+ * `compositeBlend` below). An effect that folds into the layer's colour matrix
+ * or LUT (CSS grades, Levels, …) is no chain entry at all, and an effect
+ * scoped to a mask needs a per-effect matte the chain has no texture for — both
+ * keep the bake.
+ *
+ * Measured, not guessed: exactly the types that emit ONE chain entry at their
+ * defaults, less the `gpuOnly` family (whose opacity the bake route has never
+ * honoured — moving them would change their look, not just their speed).
+ * `effectOpacityGpu.test.ts` re-derives the membership and fails naming any
+ * drift in either direction.
+ */
+const GPU_BLENDED_OPACITY: ReadonlySet<string> = new Set([
+  // Blur / glow / shadow and the interior styles.
+  'blur', 'glow', 'drop-shadow', 'inner-shadow', 'inner-glow', 'satin', 'bevel', 'deep-glow',
+  'directional-blur', 'gaussian-blur', 'fast-box-blur', 'radial-blur', 'bilateral-blur', 'smart-blur',
+  'camera-lens-blur', 'radial-fast-blur', 'cross-blur', 'vector-blur', 'unsharp-mask', 'sharpen',
+  // Stylize / distort.
+  'mosaic', 'find-edges', 'roughen-edges', 'bulge', 'twirl', 'spherize', 'mirror', 'offset', 'emboss',
+  'scatter', 'ripple', 'magnify', 'warp', 'smear', 'rolling-shutter', 'radial-shadow', 'cartoon',
+  'brush-strokes', 'strobe-light', 'color-emboss', 'halftone', 'kaleidoscope', 'vignette', 'glass',
+  'texturize', 'threads', 'chromatic-aberration', 'hex-tile', 'flo-motion', 'lens', 'griddler',
+  'ball-action', 'drizzle', 'card-dance', 'plastic', 'ripple-pulse', '3d-glasses', 'fractal',
+  'polar-coordinates', 'wave-warp', 'turbulent-displace', 'curl-noise', 'minimax',
+  // Colour / keying / channel.
+  'vibrance', 'colorama', 'shadow-highlight', 'photo-filter', 'black-and-white', 'tritone', 'threshold',
+  'equalize', 'auto-levels', 'auto-contrast', 'auto-color', 'change-color', 'change-to-color',
+  'leave-color', 'toner', 'broadcast-colors', 'simple-choker', 'linear-color-key', 'shift-channels',
+  'keylight', 'luma-key', 'color-key', 'color-range', 'extract', 'spill-suppressor', 'matte-choker',
+  'alpha-levels', 'solid-composite', 'channel-combiner', 'remove-color-matting', 'unmult', 'cc-composite',
+  'color-difference-key', 'wire-removal',
+  // Noise / generate.
+  'turbulent-noise', 'add-grain', 'median', 'dust-scratches', 'noise-alpha', 'noise', 'cell-pattern',
+  'gradient-ramp', 'fractal-noise', 'checkerboard', 'grid', 'fill', 'four-color-gradient', 'stroke',
+  'beam', 'beam-path', 'lens-flare', 'circle', 'ellipse', 'radio-waves', 'light-rays', 'light-sweep',
+  'star-burst', 'snowfall', 'rainfall', 'write-on', 'light-burst', 'particle-systems', 'cc-bubbles',
+]);
+
+/** Does the GPU chain blend this effect's Compositing Options opacity itself? */
+export function gpuBlendsEffectOpacity(type: string): boolean {
+  return GPU_BLENDED_OPACITY.has(type);
+}
+
+/** Test seam: the GPU-blended opacity membership. */
+export function gpuBlendedOpacityEffects(): ReadonlySet<string> {
+  return GPU_BLENDED_OPACITY;
 }
 
 /**
@@ -184,6 +260,11 @@ const DRAWN_CANVAS_EFFECTS = new Set<string>([
   'lens-flare', 'numbers', 'timecode', 'audio-spectrum', 'circle', 'ellipse',
   'radio-waves', 'lightning', 'light-rays', 'light-sweep', 'audio-waveform',
   'fill', 'stroke',
+  // Vegas strokes its lights with canvas ops after READING the frame for its
+  // contour — through the intercepted getImageData, which materialises the
+  // batch. Unlisted, a pixel pass after it wrote that stale batch back over the
+  // lights (found 2026-09-15 while adding its blend modes).
+  'vegas',
 ]);
 
 /** Test seam: the drawn-effect classification, for the triage-parity guard. */
@@ -506,6 +587,22 @@ export function applyEffectChain(
         flushCss();
         flushBatch(); // generators draw/replace on the real canvas
         applyProceduralEffect(oc, w, h, e);
+      } else if (isPluginEffectType(e.type)) {
+        /*
+          A plugin effect with a CPU kernel, run IN ORDER with the rest.
+
+          Before this, a plugin effect on a baked layer simply vanished — the
+          bake drops the layer's GPU effect list wholesale, and there was
+          nothing here to draw it. Not degraded: gone, from that one layer, for
+          a reason nothing on screen explained.
+
+          `applyPluginCpuEffect` returns false when the kernel is not warmed yet
+          (the first frame) or has no CPU kernel at all, and leaves the canvas
+          untouched — the same degradation a failed shader compile gets.
+        */
+        flushCss();
+        flushBatch();
+        applyPluginCpuEffect(oc, w, h, e);
       } else if (hasCanvas2dImplementation(e.type)) {
         // NOT `isCanvas2dOnlyEffect`: Fill / Stroke / Sharpen / Noise have GPU
         // materials and so do not force a bake, but once a layer is baked for
@@ -518,6 +615,11 @@ export function applyEffectChain(
         // intercepted getImageData/putImageData and stay in the batch.
         if (DRAWN_CANVAS_EFFECTS.has(e.type)) flushBatch();
         applyCanvas2dEffect(oc, w, h, e);
+        // And AFTER: a drawn effect may READ the frame first (Vegas traces its
+        // contour through the intercepted getImageData), which leaves a batch
+        // image holding the pre-draw pixels. Not dirty, so this writes nothing —
+        // it drops the stale image so the next pixel pass reads the real canvas.
+        if (DRAWN_CANVAS_EFFECTS.has(e.type)) flushBatch();
       }
       // else: a gpuOnly non-colour effect (displacement-map, motion-tile) has
       // no Canvas2D form and is skipped here.

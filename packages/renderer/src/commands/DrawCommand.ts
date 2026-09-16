@@ -32,6 +32,23 @@ export interface DrawItem {
    */
   originTexture?: TextureHandle;
   /**
+   * A plugin effect's SECOND through FOURTH layer inputs, at bindings 5/6/7.
+   *
+   * A list here where `maskTexture` and `originTexture` are named fields, and
+   * the difference is real rather than inconsistent: those two mean specific
+   * things to the shader, while these are positionally the author's own
+   * parameters — input 2, 3, 4 of an effect nobody in this package has heard
+   * of. Naming them would be inventing meanings for slots whose meaning lives
+   * in a manifest.
+   *
+   * Entries must be filled, never sparse. The material declares exactly as many
+   * bindings as this array has entries, and a declared binding with nothing
+   * bound is an invalid pipeline — so an input the user has not chosen yet
+   * carries the effect's own input texture (self-sampling), which is visibly
+   * wrong and debuggable, rather than nothing.
+   */
+  pluginLayerTextures?: TextureHandle[];
+  /**
    * The glTF PBR map set, at bindings 3–6 of the `mesh3d-pbr` material.
    *
    * Named rather than positional for the same reason `originTexture` is: the
@@ -110,6 +127,24 @@ export interface DrawItem {
   firstIndex?: number;
   /** Index element type (default 'uint16'). A mesh past 65535 vertices needs 32-bit. */
   indexFormat?: 'uint16' | 'uint32';
+  /**
+   * Per-instance vertex data, bound at SLOT 1, for an instanced draw.
+   *
+   * Slot 1 and not slot 0, because the geometry being repeated still comes from
+   * slot 0 — the shared unit quad for sprites, a mesh's own vertex buffer for
+   * `primitive: 'mesh'`. The material declares both layouts
+   * (`buffers: [QUAD_LAYOUT, GENERATOR_INSTANCE_LAYOUT]`) and the second one's
+   * `stepMode: 'instance'` is what makes the attributes advance once per
+   * instance instead of once per vertex.
+   *
+   * Set together with {@link instanceCount}; either alone is ignored, because a
+   * count without a buffer would read the quad as instance data and a buffer
+   * without a count would draw one instance of fifty thousand.
+   */
+  instanceBuffer?: BufferHandle;
+  /** Instances to draw. Zero draws nothing — which is what a generator with no
+   *  live particles this frame means, and is not an error. */
+  instanceCount?: number;
 }
 
 export interface CommandBatch {

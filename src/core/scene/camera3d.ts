@@ -625,6 +625,10 @@ export function readNodeDof(
   }
   strength = sample?.(node.id, 'dofStrength') ?? strength;
   focus = sample?.(node.id, 'focusDistance') ?? focus;
+  // The LENS too: an unset Focus Distance focuses at the zoom, and a dolly-zoom
+  // keyframes exactly that — the static read kept focusing at the first lens
+  // while `readCameraFocusDistance` (the focus-plane gizmo) followed the track.
+  focal = sample?.(node.id, 'focalLength') ?? focal;
   aperture = sample?.(node.id, 'dofAperture') ?? aperture;
   fStop = sample?.(node.id, 'fStop') ?? fStop;
   irisBlades = sample?.(node.id, 'irisBlades') ?? irisBlades;

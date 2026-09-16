@@ -134,7 +134,7 @@ function encode(value: unknown): string {
   if (text === undefined) {
     // `JSON.stringify(undefined)` is `undefined`, not `"undefined"`. Storing it
     // would make `get` indistinguishable from a missing key.
-    throw new Error('`undefined` cannot be stored. Use `storage.delete(scope, key)` instead.');
+    throw new Error('`undefined` cannot be stored. Use `storage.delete(key, scope)` instead.');
   }
   if (byteLength(text) > MAX_VALUE_BYTES) {
     throw new Error(

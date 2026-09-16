@@ -1,10 +1,21 @@
 import { app, BrowserWindow, shell, dialog, Menu, protocol, net, type WebContents } from 'electron';
 import { handle, on } from './ipcGuard';
+import {
+  devUiPlatformOverride,
+  hasTitleBarOverlay,
+  resolveUiChrome,
+  sanitizeOverlayColors,
+  uiChromeQuery,
+  windowChromeOptions,
+  WINDOWS_TITLEBAR_HEIGHT,
+} from './uiPlatform';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readFile, writeFile, mkdir, rename, unlink, readdir, access, rm, copyFile, stat } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { buildEncodeArgs, ffmpegRate, rawVideoInput, stagedVideoInput, type EncodeFormat } from './ffmpegEncodeArgs';
+import { FfmpegStdinStream } from './ffmpegStream';
 import { shouldStartBackend, startBackend, stopBackend } from './backend';
 import { registerIndexIpc } from './localIndexDb';
 import { registerThumbIpc } from './thumbCache';
@@ -17,7 +28,9 @@ import { registerAiMediaProxyIpc } from './aiMediaProxy';
 import { registerApiProxyIpc, abortAllApiStreams } from './apiProxy';
 import { installPluginPublishIpc } from './pluginPublish';
 import { registerPluginNetIpc } from './pluginNet';
-import { aiEnabled, pluginsEnabled, assertRendererEditionMatches } from './edition';
+import { registerPluginLoaderIpc } from './pluginLoader';
+import { disposeNativePlugins, registerPluginNativeIpc } from './pluginNativeIpc';
+import { aiEnabled, pluginsEnabled, pluginPublishEnabled, assertRendererEditionMatches } from './edition';
 import { parseProbeJson, type ProbeJson } from './mediaProbeParse';
 import { checkForUpdatesInteractive, initAutoUpdate } from './updater';
 import { nativeTemplateFromGroups, sanitizeMenuGroups, type NativeMenuGroupSpec, type NativeMenuOptions } from './nativeMenu';
@@ -261,6 +274,17 @@ function registerFileIpc(): void {
     win?.close();
   });
 
+  // The Windows / Linux caption buttons are the OS's, but their colours are the
+  // title bar's, and the theme lives in the renderer. Refused for any window
+  // created without an overlay (macOS, drawn-controls previews, pop-outs).
+  handle('window:setTitleBarOverlay', (event, raw: unknown) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const colors = sanitizeOverlayColors(raw);
+    if (!win || !colors || !overlayWindows.has(win)) return false;
+    win.setTitleBarOverlay({ ...colors, height: WINDOWS_TITLEBAR_HEIGHT });
+    return true;
+  });
+
   handle('app:version', () => app.getVersion());
   handle('app:quit', () => app.quit());
 }
@@ -441,6 +465,16 @@ function registerRenderIpc(): void {
   /** Running ffmpeg children per job, so `render:cancel` can kill them. */
   const running = new Map<string, ReturnType<typeof spawn>>();
   /**
+   * Streaming encodes per job (`render:openStream`), with the file each writes.
+   * Kept apart from `running` because a stream is fed frame by frame and its
+   * child must be reachable for writes, not only for a kill.
+   */
+  const streams = new Map<string, { stream: FfmpegStdinStream; out: string }>();
+  const killStream = (jobId: string): void => {
+    streams.get(jobId)?.stream.kill();
+    streams.delete(jobId);
+  };
+  /**
    * Chapter metadata, staged in the job dir next to the frames.
    *
    * The name is deliberately outside `frame_%04d` so `stagedFrames` cannot
@@ -533,17 +567,8 @@ function registerRenderIpc(): void {
     return { count: scan.indices.length, ext: scan.ext };
   };
 
-  /**
-   * ffmpeg-exact frame rate. The NTSC family are RATIONALS (30000/1001…);
-   * handing ffmpeg the decimal builds a 2997/100 timebase — flagged by
-   * broadcast QC, and drifting against the 48kHz mix on long renders.
-   */
-  const ffmpegRate = (fps: number): string => {
-    if (Math.abs(fps - 23.976) < 0.001) return '24000/1001';
-    if (Math.abs(fps - 29.97) < 0.001) return '30000/1001';
-    if (Math.abs(fps - 59.94) < 0.001) return '60000/1001';
-    return String(fps);
-  };
+  // `ffmpegRate` (the NTSC rationals) lives in ffmpegEncodeArgs.ts now, beside
+  // the command-line builder the staged and streaming encodes share.
 
   /**
    * Probe a media file's real stream facts.
@@ -694,6 +719,9 @@ function registerRenderIpc(): void {
   app.on('before-quit', () => {
     for (const proc of proxyJobs.values()) proc.kill();
     proxyJobs.clear();
+    // A streaming encode's child is waiting on a pipe nobody will write to
+    // again; left alone it would outlive the app holding a half-written file.
+    for (const jobId of [...streams.keys()]) killStream(jobId);
   });
 
   /**
@@ -761,6 +789,7 @@ function registerRenderIpc(): void {
   handle('render:discardJob', async (_e, jobId: string) => {
     running.get(jobId)?.kill();
     running.delete(jobId);
+    killStream(jobId);
     const dir = jobs.get(jobId) ?? resumeJobDir(stagingRoot(), jobId);
     jobs.delete(jobId);
     try {
@@ -844,19 +873,11 @@ function registerRenderIpc(): void {
       const crf = opts.quality === 'draft' ? '28' : opts.quality === 'medium' ? '23' : '18';
 
       /*
-        Chapters ride in as an extra INPUT, not as a flag.
-
-        ffmpeg has no "set chapter" option: chapters are read from a demuxer, so
-        the only way to attach them is to hand it a file it can parse chapters
-        OUT of — an FFMETADATA1 text file — and then map that input's chapters
-        onto the output. The file lands in the job's own staging dir, so
-        `cleanJob` already deletes it and there is no second temp path to leak.
-
-        `-map_chapters` rather than `-map_metadata`: the latter would also
-        replace the output's GLOBAL metadata with the (empty) metadata of a file
-        that contains nothing but chapters. Only MP4/MOV get it — the WebM muxer
-        has no Chapters element, and passing this to a VP9 encode would produce
-        an identical file plus a stray temp write.
+        Chapters ride in as an extra INPUT, not as a flag — see
+        ffmpegEncodeArgs.ts for the mapping rules. The file lands in the job's
+        own staging dir, so `cleanJob` already deletes it and there is no second
+        temp path to leak. Only MP4/MOV get it: passing it to a VP9 encode would
+        produce an identical file plus a stray temp write.
       */
       const wantsChapters =
         (opts.format === 'mp4' || opts.format === 'mov')
@@ -876,7 +897,6 @@ function registerRenderIpc(): void {
         ...(hasAudio ? ['-i', audio!] : []),
         ...chapterInput,
       ];
-      let args: string[];
 
       // HDR10 / HLG: frames are already PQ/HLG-baked; tag BT.2020 + transfer.
       // Prefer libx265 10-bit; fall back to libx264 high10 with the same tags.
@@ -940,91 +960,127 @@ function registerRenderIpc(): void {
         return { path: out, frames, videoCodec: 'libx264' as const };
       }
 
-      switch (opts.format) {
-        case 'webm':
-          args = [
-            ...base,
-            '-c:v', 'libvpx-vp9',
-            '-crf', crf, '-b:v', '0',
-            // VP9 encodes far faster with row-based threading, and an export is
-            // the one place where using every core is exactly what the user wants.
-            '-row-mt', '1', '-threads', '0',
-            // VP9 is the only mainstream video codec with an alpha channel, so a
-            // transparent comp (staged as PNG) keeps its transparency here.
-            // alt-ref frames must be off for alpha, or the channel is discarded.
-            ...(staged.ext === 'png' ? ['-pix_fmt', 'yuva420p', '-auto-alt-ref', '0'] : ['-pix_fmt', 'yuv420p']),
-            '-vf', evenScale,
-            ...(hasAudio ? ['-c:a', 'libopus', '-b:a', '160k', '-shortest'] : []),
-            out,
-          ];
-          break;
-        case 'gif':
-          // Two passes in one graph: palettegen builds an optimal 256-colour
-          // palette for the whole animation, paletteuse dithers against it. A
-          // single-pass GIF quantises per frame and visibly bands and flickers.
-          args = [
-            '-y', '-framerate', ffmpegRate(opts.fps), '-i', input,
-            '-filter_complex',
-            `[0:v] ${evenScale},split [a][b];[a] palettegen=stats_mode=diff [p];[b][p] paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle`,
-            '-loop', '0',
-            out,
-          ];
-          break;
-        case 'mov': {
-          // ProRes 4444 keeps the alpha channel (the classic reason to pick a
-          // .mov); the 422 family halves the file for opaque delivery/edit
-          // handoff, matching what AE's output modules offer.
-          const profile = opts.proresProfile ?? '4444';
-          const proresArgs: Record<string, [string, string]> = {
-            proxy: ['0', 'yuv422p10le'],
-            lt: ['1', 'yuv422p10le'],
-            '422': ['2', 'yuv422p10le'],
-            hq: ['3', 'yuv422p10le'],
-            '4444': ['4', 'yuva444p10le'],
-          };
-          const [profileFlag, pixFmt] = proresArgs[profile] ?? proresArgs['4444']!;
-          args = [
-            ...base,
-            '-c:v', 'prores_ks', '-profile:v', profileFlag, '-pix_fmt', pixFmt,
-            '-vf', evenScale,
-            ...(hasAudio ? ['-c:a', 'pcm_s16le', '-shortest'] : []),
-            ...chapterMap,
-            out,
-          ];
-          break;
-        }
-        case 'mp4':
-        default:
-          args = [
-            ...base,
-            '-c:v', 'libx264',
-            '-preset', opts.quality === 'draft' ? 'veryfast' : 'medium',
-            '-crf', crf,
-            // H.264 carries no alpha. A transparent comp stages as RGBA PNG and
-            // this conversion flattens it over BLACK — ffmpeg's own behaviour,
-            // relied on deliberately rather than stumbled into, and now stated
-            // in the composition settings dialog so nobody first discovers it
-            // in a delivered file. mov (ProRes 4444) and webm (VP9) keep alpha.
-            '-pix_fmt', 'yuv420p',
-            // Streaming-friendly: without faststart the moov atom lands at the
-            // end and browsers refuse to play the file until it fully downloads.
-            '-movflags', '+faststart',
-            '-vf', evenScale,
-            ...(hasAudio ? ['-c:a', 'aac', '-b:a', '192k', '-shortest'] : []),
-            ...chapterMap,
-            out,
-          ];
-      }
+      // The codec/container half is shared with the streaming encode, so the two
+      // paths cannot drift. Alpha follows what was staged: only a PNG sequence
+      // carries it (a transparent comp stages PNG; see videoSink.ts).
+      const args = buildEncodeArgs({
+        format: opts.format,
+        videoInput: stagedVideoInput(input, opts.fps),
+        quality: opts.quality,
+        proresProfile: opts.proresProfile,
+        audio: hasAudio ? audio : null,
+        chaptersFile: wantsChapters ? path.join(dir, CHAPTER_METADATA_FILE) : null,
+        alpha: staged.ext === 'png',
+        out,
+      });
 
       await runFfmpeg(jobId, args);
       return { path: out, frames };
     },
   );
 
+  /**
+   * Streaming encode: ONE ffmpeg child, opened when the export begins and fed
+   * raw RGBA frames as they render (electron/ffmpegStream.ts).
+   *
+   * The counterpart of `stageFrame` × N + `encode`, sharing everything else
+   * with them: the same job dir, the same staged `audio.wav` and chapters file,
+   * the same command line bar the video input (`buildEncodeArgs`), and the same
+   * `out.<ext>` — so `save`, `saveTo`, `cancel` and `cleanJob` work on a
+   * streamed job unchanged. HDR is refused: its mastering metadata is measured
+   * over every frame before the encode starts (see ffmpegEncodeArgs.ts).
+   *
+   * No resume manifest is ever written for a stream: its intermediate state is
+   * inside the encoder, so there is nothing a later run could pick up.
+   */
+  handle('render:streamPreference', async (): Promise<'stream' | 'staged'> =>
+    // The escape hatch, and the A/B switch the export benchmark uses.
+    (process.env.MOTION_EXPORT_PIPELINE === 'staged' ? 'staged' : 'stream'));
+
+  handle(
+    'render:openStream',
+    async (
+      _e,
+      jobId: string,
+      opts: {
+        format: EncodeFormat;
+        fps: number;
+        width: number;
+        height: number;
+        hasAudio?: boolean;
+        quality?: 'high' | 'medium' | 'draft';
+        proresProfile?: 'proxy' | 'lt' | '422' | 'hq' | '4444';
+        alpha?: boolean;
+        chaptersFfmetadata?: string;
+      },
+    ) => {
+      const dir = jobs.get(jobId);
+      if (!dir) throw new Error('unknown render job');
+      if (streams.has(jobId)) throw new Error('this render job is already streaming');
+      if (!['mp4', 'webm', 'gif', 'mov'].includes(opts.format)) {
+        throw new Error(`"${String(opts.format)}" cannot be streamed`);
+      }
+      const width = Math.trunc(opts.width);
+      const height = Math.trunc(opts.height);
+      if (!(width > 0 && height > 0 && width <= 16384 && height <= 16384)) {
+        throw new Error(`invalid stream frame size ${opts.width}x${opts.height}`);
+      }
+      if (!(Number.isFinite(opts.fps) && opts.fps > 0)) throw new Error('invalid stream frame rate');
+
+      const audio = opts.hasAudio ? path.join(dir, 'audio.wav') : null;
+      const hasAudio = !!(audio && existsSync(audio));
+      const wantsChapters =
+        (opts.format === 'mp4' || opts.format === 'mov')
+        && typeof opts.chaptersFfmetadata === 'string'
+        && opts.chaptersFfmetadata.trim().length > 0;
+      if (wantsChapters) {
+        await writeFile(path.join(dir, CHAPTER_METADATA_FILE), opts.chaptersFfmetadata!, 'utf8');
+      }
+      const out = path.join(dir, `out.${opts.format}`);
+      const args = buildEncodeArgs({
+        format: opts.format,
+        videoInput: rawVideoInput(width, height, opts.fps),
+        quality: opts.quality,
+        proresProfile: opts.proresProfile,
+        audio: hasAudio ? audio : null,
+        chaptersFile: wantsChapters ? path.join(dir, CHAPTER_METADATA_FILE) : null,
+        alpha: !!opts.alpha,
+        out,
+      });
+      const stream = await FfmpegStdinStream.open({ bin: resolveFfmpeg(), args, frameBytes: width * height * 4 });
+      streams.set(jobId, { stream, out });
+    },
+  );
+
+  /**
+   * One frame into the stream. Resolves only once ffmpeg's stdin has drained —
+   * that await IS the back-pressure: the renderer does not send the next frame
+   * until this returns, so a slow encoder slows the render instead of growing
+   * this process's heap.
+   */
+  handle('render:streamFrame', async (_e, jobId: string, index: number, bytes: Uint8Array) => {
+    const entry = streams.get(jobId);
+    if (!entry) throw new Error('this render job is not streaming');
+    await entry.stream.write(index, bytes);
+  });
+
+  /** Close the stream and wait for the encoder to write `out.<ext>`. */
+  handle('render:finishStream', async (_e, jobId: string) => {
+    const entry = streams.get(jobId);
+    if (!entry) throw new Error('this render job is not streaming');
+    try {
+      const frames = await entry.stream.finish();
+      return { path: entry.out, frames };
+    } finally {
+      streams.delete(jobId);
+    }
+  });
+
   /** Kill a running encode (the queue's Pause / the dialog's Cancel). */
   handle('render:cancel', async (_e, jobId: string) => {
     running.get(jobId)?.kill();
     running.delete(jobId);
+    killStream(jobId);
   });
 
   /**
@@ -1097,6 +1153,7 @@ function registerRenderIpc(): void {
     if (!dir) return;
     running.get(jobId)?.kill();
     running.delete(jobId);
+    killStream(jobId);
     jobs.delete(jobId);
     try {
       await rm(dir, { recursive: true, force: true });
@@ -1176,8 +1233,22 @@ function resolveAppIcon(): string | undefined {
   return candidates.find((p) => p && existsSync(p));
 }
 
+/** Windows created with a Window Controls Overlay — the only ones `window:setTitleBarOverlay` may restyle. */
+const overlayWindows = new WeakSet<BrowserWindow>();
+
 function createMainWindow(): BrowserWindow {
   const appIcon = resolveAppIcon();
+  // macOS or Windows / Linux chrome: the OS, or `PREMATION_UI_PLATFORM` in
+  // development (electron/uiPlatform.ts). dist-electron/ sits one level under
+  // the repo root, where Vite reads the same dotenv files.
+  const chrome = resolveUiChrome({
+    osPlatform: process.platform,
+    isDev,
+    override: isDev ? devUiPlatformOverride(process.env, path.join(__dirname, '..')) : undefined,
+  });
+  if (chrome.overridden) {
+    console.info(`[ui] previewing the ${chrome.platform} chrome (PREMATION_UI_PLATFORM), ${chrome.windowControls} window controls`);
+  }
   const win = new BrowserWindow({
     width: 1600,
     height: 1000,
@@ -1188,7 +1259,7 @@ function createMainWindow(): BrowserWindow {
     backgroundColor: '#0a0a0b',
     show: false,
     autoHideMenuBar: true,
-    frame: false,
+    ...windowChromeOptions(chrome),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -1260,11 +1331,15 @@ function createMainWindow(): BrowserWindow {
   });
 
   buildApplicationMenu(win);
+  if (hasTitleBarOverlay(chrome)) overlayWindows.add(win);
 
+  // The renderer draws the bar at first paint, so it reads the chrome off the
+  // URL rather than asking over IPC (src/core/config/uiPlatform.ts).
+  const chromeQuery = uiChromeQuery(chrome);
   if (isDev) {
-    void win.loadURL('http://localhost:5173');
+    void win.loadURL(`http://localhost:5173/?${new URLSearchParams(chromeQuery).toString()}`);
   } else {
-    void win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+    void win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), { query: chromeQuery });
   }
 
   mainWindow = win;
@@ -1591,13 +1666,26 @@ app.whenReady().then(() => {
   // app shell's `connect-src` does not name a plugin's hosts, and widening it
   // to cover them would widen the whole renderer rather than the plugin.
   //
-  // GATED, for exactly the reason the assistant below is. The local edition
-  // ships no plugins, and "the renderer never calls it" is not a gate on the
-  // privileged side of this boundary. It is also the second of the two channels
-  // in this process that reach a third-party host — the other is aiProxy — so
-  // leaving it registered would hold an outbound path open in a build whose
-  // whole claim is that it has none.
+  // GATED on `pluginsEnabled()`, which is on in both editions now that the
+  // local edition installs plugins from local files. "The renderer never calls
+  // it" is not a gate on the privileged side of this boundary, so the predicate
+  // stays the one switch. A request still leaves only for a plugin granted
+  // `net:fetch`, to a host its manifest declared — see edition.ts.
   if (pluginsEnabled()) registerPluginNetIpc();
+  // Plugins that live in a folder on this machine — the user's own, a
+  // machine-wide one an installer wrote, and anything MOTION_PLUGIN_PATH names.
+  // Gated with the rest: it reads directories and hands the bytes to the
+  // renderer, which is a filesystem capability and belongs behind the same
+  // switch. The paths it will read are fixed in pluginLoader.ts, never named by
+  // the renderer.
+  if (pluginsEnabled()) registerPluginLoaderIpc();
+  // A plugin's COMPILED module, in a utility process of its own.
+  //
+  // Behind the same switch, and it starts nothing on its own: no process exists
+  // until the renderer asks for one, which it does only after a signature check
+  // and a consent step naming the binary. What this registration adds to a
+  // machine with no native plugins is four idle IPC handlers.
+  if (pluginsEnabled()) registerPluginNativeIpc();
   // The account session, and every authenticated call that uses it.
   //
   // Both tokens live in this process. There is no `credentials:get` any more:
@@ -1615,7 +1703,9 @@ app.whenReady().then(() => {
   // Gated with the rest. Publishing needs an account and a registry, neither of
   // which the local edition has, and the channel opens a file picker — a UI
   // affordance appearing in a build with no way to use what it produces.
-  if (pluginsEnabled()) installPluginPublishIpc();
+  // (`pluginPublishEnabled`, not `pluginsEnabled`: the local edition runs
+  // plugins installed from local files but has no registry to publish to.)
+  if (pluginPublishEnabled()) installPluginPublishIpc();
 
   // The assistant. Provider keys live here rather than in the renderer —
   // encrypted with the OS keystore, with NO read-back verb (aiKeyVault.ts) — and
@@ -1689,4 +1779,8 @@ app.on('before-quit', () => {
   abortAllStreams();
   abortAllApiStreams();
   abortAllModelDownloads();
+  // A plugin's utility process is a child of this one and would otherwise keep
+  // running after the last window closed — a stranger's compiled code with no
+  // editor left to serve.
+  disposeNativePlugins();
 });

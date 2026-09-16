@@ -78,9 +78,39 @@ const LINE_JOINS: ReadonlyArray<{ value: StrokeLineJoin; label: string }> = [
   { value: 'bevel', label: 'Bevel' },
 ];
 
+/**
+ * The standalone Text panel: the selection's text layer, or the defaults a new
+ * text layer would take when nothing is selected.
+ */
 export function CharacterPanel(): JSX.Element {
   const selected = useSelectionStore((s) => s.ids);
-  const primary = selected[0] ?? undefined;
+  return <TextSettingsBody nodeId={selected[0]} nodeIds={selected} variant="panel" />;
+}
+
+export interface TextSettingsBodyProps {
+  /** The text layer to edit. Absent in the standalone panel with nothing selected. */
+  nodeId?: string;
+  /** Every layer a text style preset applies to, primary first. */
+  nodeIds?: ReadonlyArray<string>;
+  /**
+   * `panel` — the dock tab's card layout, every control in view.
+   * `section` — the Properties panel's Text section: the everyday controls
+   * (font, size, leading, tracking, fill, alignment) up top and the rest behind
+   * a collapsed "More text options", sized for a ~280px column.
+   */
+  variant?: 'panel' | 'section';
+}
+
+/**
+ * Character + Paragraph settings — ONE implementation of every text control,
+ * arranged two ways. The Properties section and the Text panel were once two
+ * copies (the old TextSection was deleted for drifting from this panel), so the
+ * handlers, fallbacks and range styling below are shared and only the layout
+ * at the bottom differs.
+ */
+export function TextSettingsBody({ nodeId, nodeIds, variant = 'panel' }: TextSettingsBodyProps): JSX.Element {
+  const primary = nodeId;
+  const selected = useMemo(() => nodeIds ?? (nodeId ? [nodeId] : []), [nodeIds, nodeId]);
   useSceneRevision((s) => s.rev);
   // Swap Fill and Stroke (Shift+X) is a registered command.
   useEffect(() => installTextCommands(), []);
@@ -170,6 +200,8 @@ export function CharacterPanel(): JSX.Element {
   const [fallbackRoman, setFallbackRoman] = useState(false);
   const [fallbackTcyAuto, setFallbackTcyAuto] = useState(false);
   const [fallbackTcyDigits, setFallbackTcyDigits] = useState(TATE_CHU_YOKO_DEFAULT_DIGITS);
+  /** The section layout's "More text options" — shut by default: they are the rarer controls. */
+  const [moreOpen, setMoreOpen] = useState(false);
 
   const hasTarget = Boolean(primary && tComp && node);
 
@@ -567,12 +599,8 @@ export function CharacterPanel(): JSX.Element {
   const setRangeVerticalAlign = (next: 'super' | 'sub' | undefined, layerWide: () => void): void =>
     ranged ? setCharProp('verticalAlign', next, () => {}) : layerWide();
 
-  return (
-    <TooltipProvider>
-      {/* Focus moving into the panel keeps on-canvas text editing (and its
-          character selection) alive — see TextEditOverlay. */}
-      <div className={styles.root} {...{ [TEXT_EDIT_KEEP_ATTR]: '' }}>
-      {/* Target Status Banner */}
+  // ── The blocks. Built once, arranged by `variant` at the bottom. ──
+  const panelHead = (
       <div className={styles.panelHead}>
         <div className={styles.panelHeadLeft}>
           <span className={styles.panelHeadTitle}>Text</span>
@@ -589,9 +617,9 @@ export function CharacterPanel(): JSX.Element {
           />
         )}
       </div>
+  );
 
-      {/* Ranged Selection Banner */}
-      {ranged && (
+  const rangeNotice = ranged && (
         <div className={styles.rangeNotice}>
           <span>{`Styling ${selection.end - selection.start} character${selection.end - selection.start === 1 ? '' : 's'}`}</span>
           <Button
@@ -603,10 +631,10 @@ export function CharacterPanel(): JSX.Element {
             Reset
           </Button>
         </div>
-      )}
+  );
 
-      {/* Text Content & Source Text Keyframing */}
-      {hasTarget && (
+  // Text content & Source Text keyframing.
+  const contentCard = hasTarget && (
         <div className={styles.sectionCard}>
           <div className={styles.contentHead}>
             <span className={styles.sectionHeader}>Content</span>
@@ -628,13 +656,10 @@ export function CharacterPanel(): JSX.Element {
             rows={2}
           />
         </div>
-      )}
+  );
 
-      {/* Typography & Character Formatting */}
-      <div className={styles.sectionCard}>
-        <div className={styles.sectionHeader}>Typography</div>
-
-        {/* Font Family & Weight */}
+  // Font family & weight.
+  const fontRow = (
         <div className={styles.fontRow}>
           <FontPicker
             value={activeFamily}
@@ -653,10 +678,9 @@ export function CharacterPanel(): JSX.Element {
             ))}
           </select>
         </div>
+  );
 
-        {/* Font Size & Leading */}
-        <div className={styles.metricGrid}>
-          {/* Font Size */}
+  const sizeCell = (
           <div className={styles.metricCell}>
             <span className={styles.metricLabel} title="Font Size (TT)">Size</span>
             <input
@@ -668,8 +692,10 @@ export function CharacterPanel(): JSX.Element {
             />
             <span className={styles.metricUnit}>px</span>
           </div>
+  );
 
-          {/* Leading (Line Height) — Auto or explicit */}
+  // Leading (line height) — Auto or explicit.
+  const leadingCell = (
           <div className={styles.metricCell}>
             <span className={styles.metricLabel} title="Leading / Line Height (A/A). Clear the field or press Auto for 120% of the font size.">Leading</span>
             <input
@@ -696,9 +722,10 @@ export function CharacterPanel(): JSX.Element {
               Auto
             </button>
           </div>
-        </div>
+  );
 
-        {/* Tactile Character Style Button Group */}
+  // Faux bold / italic, caps, super / subscript, tate-chu-yoko.
+  const styleToolbar = (
         <div className={styles.controlGroup} role="toolbar" aria-label="Character Formatting Styles">
           <IconButton
             size="sm"
@@ -805,16 +832,13 @@ export function CharacterPanel(): JSX.Element {
             TCY
           </IconButton>
         </div>
+  );
 
-        {/* OpenType: ligatures, contextual alternates, stylistic sets */}
-        {hasTarget && primary && <OpenTypeControls nodeId={primary} />}
-      </div>
+  // OpenType: ligatures, contextual alternates, stylistic sets.
+  const openType = hasTarget && primary ? <OpenTypeControls nodeId={primary} /> : null;
 
-      {/* Paragraph Alignment & Spacing Deck */}
-      <div className={styles.sectionCard}>
-        <div className={styles.sectionHeader}>Paragraph &amp; Alignment</div>
-
-        {/* 7 Alignment buttons in professional segmented deck */}
+  // The seven alignment / justify buttons.
+  const alignGroup = (
         <div className={styles.controlGroup} role="radiogroup" aria-label="Paragraph Alignment">
           <IconButton
             size="sm"
@@ -894,8 +918,11 @@ export function CharacterPanel(): JSX.Element {
             <Icon name="distribute-horizontal" size="sm" />
           </IconButton>
         </div>
+  );
 
-        {/* AE: Right-to-left text direction, and horizontal / vertical type */}
+  // AE: right-to-left text direction, and horizontal / vertical type.
+  const directionRows = (
+    <>
         <div className={styles.controlRow}>
           <Segmented
             size="sm"
@@ -956,8 +983,11 @@ export function CharacterPanel(): JSX.Element {
             )}
           </div>
         )}
+    </>
+  );
 
-        {/* Paragraph Spacing & Indents Grid */}
+  // Paragraph spacing & indents.
+  const spacingGrid = (
         <div className={styles.metricGrid}>
           {/* Paragraph Spacing (legacy: between every line) */}
           <div className={styles.metricCell}>
@@ -1037,11 +1067,10 @@ export function CharacterPanel(): JSX.Element {
             <span className={styles.metricUnit}>px</span>
           </div>
         </div>
-      </div>
+  );
 
-      {/* Appearance (Fill & Stroke) */}
-      <div className={styles.sectionCard}>
-        <div className={styles.sectionHeader}>Appearance</div>
+  // The fill / stroke swatch pair with the face readout beside it.
+  const swatchDeck = (
         <div className={styles.appearanceRow}>
           <div className={styles.swatchPair}>
             <div className={styles.fillSwatchWrap} title="Character Fill Color">
@@ -1081,11 +1110,13 @@ export function CharacterPanel(): JSX.Element {
             </span>
           </div>
         </div>
+  );
 
-        {/* Solid / Linear / Radial — a gradient spans the whole text block */}
-        {hasTarget && primary && <TextFillRows nodeId={primary} textColor={activeFill} />}
+  // Solid / Linear / Radial — a gradient spans the whole text block.
+  const fillRows = hasTarget && primary ? <TextFillRows nodeId={primary} textColor={activeFill} /> : null;
 
-        {/* AE's "none" swatches */}
+  // AE's "none" swatches.
+  const noneToggles = (
         <div className={styles.controlGroup} role="group" aria-label="Fill and Stroke None">
           <IconButton
             size="sm"
@@ -1116,8 +1147,10 @@ export function CharacterPanel(): JSX.Element {
             ⊘ Stroke
           </IconButton>
         </div>
+  );
 
-        {/* Stroke Width, Line Join, Fill & Stroke order */}
+  // Stroke width, line join, fill & stroke order.
+  const strokeGrid = (
         <div className={styles.metricGrid}>
           <div className={styles.metricCell}>
             <span className={styles.metricLabel} title="Stroke Width">Stroke</span>
@@ -1162,16 +1195,13 @@ export function CharacterPanel(): JSX.Element {
             </select>
           </div>
         </div>
+  );
 
-        {/* Stroke Solid / Linear / Radial — a gradient spans the whole block */}
-        {hasTarget && primary && <TextStrokeRows nodeId={primary} strokeColor={shownStroke} />}
-      </div>
+  // Stroke Solid / Linear / Radial — a gradient spans the whole block.
+  const strokeRows = hasTarget && primary ? <TextStrokeRows nodeId={primary} strokeColor={shownStroke} /> : null;
 
-      {/* Advanced Metrics Grid (Tracking, Kerning, Scales, Baseline) */}
-      <div className={styles.sectionCard}>
-        <div className={styles.sectionHeader}>Metrics &amp; Scale</div>
-        <div className={styles.metricGrid}>
-          {/* Tracking (Letter Spacing) */}
+  // Tracking (letter spacing).
+  const trackingCell = (
           <div className={`${styles.metricCell} ${styles.metricCellWide}`}>
             <span className={styles.metricLabel} title="Tracking (Letter Spacing) (VA)">Tracking</span>
             <input
@@ -1183,7 +1213,11 @@ export function CharacterPanel(): JSX.Element {
             />
             <span className={styles.metricUnit}>px</span>
           </div>
+  );
 
+  // Kerning, vertical / horizontal scale, baseline shift, tsume.
+  const metricsRest = (
+    <>
           {/* Kerning — mode for the layer, manual value at the text caret */}
           <div className={`${styles.metricCell} ${styles.metricCellWide}`}>
             <span
@@ -1281,14 +1315,19 @@ export function CharacterPanel(): JSX.Element {
             />
             <span className={styles.metricUnit}>%</span>
           </div>
-        </div>
-      </div>
+    </>
+  );
 
-      {/* Variable-font axes (AE 26.0) — only for fonts that have them */}
-      {hasTarget && primary && <VariableAxesSection nodeId={primary} />}
+  // Variable-font axes (AE 26.0) — only for fonts that have them.
+  const variableAxes = hasTarget && primary ? <VariableAxesSection nodeId={primary} /> : null;
 
-      {/* Text Box — AE point vs paragraph text, box size, auto-size, vertical alignment */}
-      {hasTarget && primary && node && (() => {
+  /**
+   * Text Box — AE point vs paragraph text, box size, auto-size, vertical
+   * alignment. A function rather than a block: it MEASURES the text, so it runs
+   * only where it is drawn, not behind a collapsed disclosure.
+   */
+  const renderTextBox = (): JSX.Element | null => {
+        if (!hasTarget || !primary || !node) return null;
         const paraBox = readParagraphBox(node);
         // Text on a path is point text (AE): no box to convert into or edit.
         const onPath = hasTextPath(node);
@@ -1396,10 +1435,10 @@ export function CharacterPanel(): JSX.Element {
             )}
           </div>
         );
-      })()}
+  };
 
-      {/* Path Options (Mask text path riding) */}
-      {hasTarget && maskPaths.length > 0 && (
+  // Path options (mask text path riding).
+  const pathCard = hasTarget && maskPaths.length > 0 && (
         <div className={styles.sectionCard}>
           <div className={styles.controlRow}>
             <span className={styles.sectionHeader}>Mask Path</span>
@@ -1423,9 +1462,10 @@ export function CharacterPanel(): JSX.Element {
           {/* Path Options — keyframeable, also listed under Text in the timeline */}
           {textPathCfg && primary && <TextPathOptions nodeId={primary} />}
         </div>
-      )}
+  );
 
-      {/* Quick Typography Presets */}
+  // Quick typography presets.
+  const presetsCard = (
       <div className={styles.sectionCard}>
         <div className={styles.sectionHeader}>Presets</div>
         <div className={styles.presetGrid}>
@@ -1442,7 +1482,115 @@ export function CharacterPanel(): JSX.Element {
           ))}
         </div>
       </div>
-    </div>
-  </TooltipProvider>
-);
+  );
+
+  if (variant === 'section') {
+    return (
+      <TooltipProvider>
+        {/* Same keep attribute as the panel: focus in here keeps on-canvas
+            text editing (and its character selection) alive. */}
+        <div className={styles.sectionRoot} {...{ [TEXT_EDIT_KEEP_ATTR]: '' }}>
+          {rangeNotice}
+          {fontRow}
+          <div className={styles.metricGrid}>
+            {sizeCell}
+            {leadingCell}
+            {trackingCell}
+          </div>
+          <div className={styles.sectionRow}>
+            <span className={styles.sectionRowLabel}>Fill</span>
+            <ColorPicker value={activeFill} onChange={handleFillChange} aria-label="Character Fill Color" />
+          </div>
+          {alignGroup}
+          <button
+            type="button"
+            className={styles.disclosure}
+            aria-expanded={moreOpen}
+            onClick={() => setMoreOpen((v) => !v)}
+          >
+            <Icon name={moreOpen ? 'chevron-down' : 'chevron-right'} size="sm" />
+            <span>More text options</span>
+          </button>
+          {moreOpen && (
+            <div className={styles.moreBody}>
+              {contentCard}
+              <div className={styles.sectionCard}>
+                <div className={styles.sectionHeader}>Character</div>
+                {styleToolbar}
+                {openType}
+                <div className={styles.metricGrid}>{metricsRest}</div>
+              </div>
+              <div className={styles.sectionCard}>
+                <div className={styles.sectionHeader}>Paragraph</div>
+                {directionRows}
+                {spacingGrid}
+              </div>
+              <div className={styles.sectionCard}>
+                <div className={styles.sectionHeader}>Fill &amp; stroke</div>
+                {fillRows}
+                {noneToggles}
+                <div className={styles.sectionRow}>
+                  <span className={styles.sectionRowLabel}>Stroke</span>
+                  <ColorPicker value={shownStroke} onChange={handleStrokeChange} aria-label="Character Stroke Color" />
+                </div>
+                {strokeGrid}
+                {strokeRows}
+              </div>
+              {variableAxes}
+              {renderTextBox()}
+              {pathCard}
+              {presetsCard}
+            </div>
+          )}
+        </div>
+      </TooltipProvider>
+    );
+  }
+
+  return (
+    <TooltipProvider>
+      {/* Focus moving into the panel keeps on-canvas text editing (and its
+          character selection) alive — see TextEditOverlay. */}
+      <div className={styles.root} {...{ [TEXT_EDIT_KEEP_ATTR]: '' }}>
+        {panelHead}
+        {rangeNotice}
+        {contentCard}
+        <div className={styles.sectionCard}>
+          <div className={styles.sectionHeader}>Typography</div>
+          {fontRow}
+          <div className={styles.metricGrid}>
+            {sizeCell}
+            {leadingCell}
+          </div>
+          {styleToolbar}
+          {openType}
+        </div>
+        <div className={styles.sectionCard}>
+          <div className={styles.sectionHeader}>Paragraph &amp; Alignment</div>
+          {alignGroup}
+          {directionRows}
+          {spacingGrid}
+        </div>
+        <div className={styles.sectionCard}>
+          <div className={styles.sectionHeader}>Appearance</div>
+          {swatchDeck}
+          {fillRows}
+          {noneToggles}
+          {strokeGrid}
+          {strokeRows}
+        </div>
+        <div className={styles.sectionCard}>
+          <div className={styles.sectionHeader}>Metrics &amp; Scale</div>
+          <div className={styles.metricGrid}>
+            {trackingCell}
+            {metricsRest}
+          </div>
+        </div>
+        {variableAxes}
+        {renderTextBox()}
+        {pathCard}
+        {presetsCard}
+      </div>
+    </TooltipProvider>
+  );
 }

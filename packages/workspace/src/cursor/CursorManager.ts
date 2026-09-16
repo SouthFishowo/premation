@@ -25,6 +25,15 @@ export type CursorType =
   | 'text'
   | 'vertical-text'
   | 'pen'
+  // The Pen's state cursors (AE): over a segment it adds a vertex, over a
+  // vertex it converts one, over an open end it continues the path, over the
+  // first vertex it closes; the Delete Vertex and Mask Feather tools' own.
+  | 'pen-add'
+  | 'pen-remove'
+  | 'pen-convert'
+  | 'pen-continue'
+  | 'pen-close'
+  | 'feather'
   | 'pencil'
   | 'brush'
   | 'eraser'
@@ -95,6 +104,27 @@ const PEN_SVG =
 export const PEN_CURSOR_CSS =
   `url("data:image/svg+xml;utf8,${encodeURIComponent(PEN_SVG)}") 4 4, crosshair`;
 
+/**
+ * The pen nib with a small badge at its lower right — AE's pen-plus / pen-minus
+ * / caret / circle family. Same two-pass dark-then-white drawing as the plain
+ * pen so the badge reads on any artwork; the hotspot stays on the nib.
+ */
+function penBadgeCss(badge: string): string {
+  const svg = PEN_SVG.replace(
+    '</svg>',
+    `<g fill="none" stroke="#000" stroke-width="3" stroke-linecap="round">${badge}</g>` +
+      `<g fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round">${badge}</g></svg>`,
+  );
+  return `url("data:image/svg+xml;utf8,${encodeURIComponent(svg)}") 4 4, crosshair`;
+}
+
+const PEN_ADD_CSS = penBadgeCss('<path d="M19 22h6M22 19v6"/>');
+const PEN_REMOVE_CSS = penBadgeCss('<path d="M19 22h6"/>');
+const PEN_CONVERT_CSS = penBadgeCss('<path d="M18 25l4-6 4 6"/>');
+const PEN_CONTINUE_CSS = penBadgeCss('<path d="M19 22h6M23 20l2 2-2 2"/>');
+const PEN_CLOSE_CSS = penBadgeCss('<circle cx="22" cy="22" r="3"/>');
+const FEATHER_CSS = penBadgeCss('<path d="M19 25c0-4 3-6 6-6"/>');
+
 const PENCIL_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="-3 -3 30 30">' +
   '<g fill="none" stroke="#000" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">' +
@@ -144,6 +174,12 @@ export const CURSOR_CSS: Record<CursorType, string> = {
   text: 'text',
   'vertical-text': 'vertical-text',
   pen: PEN_CURSOR_CSS,
+  'pen-add': PEN_ADD_CSS,
+  'pen-remove': PEN_REMOVE_CSS,
+  'pen-convert': PEN_CONVERT_CSS,
+  'pen-continue': PEN_CONTINUE_CSS,
+  'pen-close': PEN_CLOSE_CSS,
+  feather: FEATHER_CSS,
   pencil: PENCIL_CURSOR_CSS,
   brush: BRUSH_CURSOR_CSS,
   eraser: ERASER_CURSOR_CSS,

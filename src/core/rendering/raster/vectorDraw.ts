@@ -13,16 +13,38 @@
  */
 
 import type { RenderLayer, Subpath, SubpathPaint } from '../RenderBackend';
-import { makeCanvasGradient, type FillPaint } from '@core/paint/fill';
-import type { Stroke, StrokeCap, StrokeJoin } from '@core/paint/stroke';
+import {
+  makeCanvasGradient,
+  sortedStops,
+  sortedOpacityStops,
+  sampleGradientColor,
+  sampleGradientOpacity,
+  applyAlpha,
+  type FillPaint,
+  type LinearFill,
+  type RadialFill,
+} from '@core/paint/fill';
+import type { Stroke, StrokeCap, StrokeGradientGeometry, StrokeJoin } from '@core/paint/stroke';
+import { paintCompositeOperation, type PaintOpOptions } from './paintBlend';
 import type { Pt } from '@core/scene/trimPath';
 import { layerSubpaths, hasPathGeometry } from './subpaths';
+import { paintReach } from '@core/paint/paintRaster';
+import { pluginEffectSpreadPx } from '@core/effects/pluginCpuEffect';
 import { flattenOutline, ADAPTIVE } from '@core/scene/mergePaths';
+import { shapeOutline } from '@core/scene/pathOps';
 import { offsetAlongNormals, closedRibbon, type OffsetSides } from '@motion/scene';
 import {
   taperWidthFactorAt, waveOffsetAt, isIdentityTaper, isIdentityWave,
+  taperForLength, waveForLength,
   type StrokeWave,
 } from '@core/scene/strokeProfile';
+
+/** Total length of a polyline, in its own units. */
+function polylineLength(pts: ReadonlyArray<{ x: number; y: number }>): number {
+  let len = 0;
+  for (let i = 1; i < pts.length; i++) len += Math.hypot(pts[i]!.x - pts[i - 1]!.x, pts[i]!.y - pts[i - 1]!.y);
+  return len;
+}
 
 /**
  * Bezier sampling for a profiled stroke: ADAPTIVE, sized per segment.
@@ -127,6 +149,27 @@ function bakedEffectSpread(layer: RenderLayer): number {
       case 'vegas':
         s = effectNumber(e, 'width');
         break;
+      // The mask-path paint effects (2026-09-15) belong with Vegas: their
+      // geometry is the mask in CENTRED layer px, so padding translates the
+      // result and changes nothing about it — it only un-clips a brush that
+      // straddles a mask lying on the layer's edge. AE clips them to the layer
+      // bounds, which is what the reach below keeps: a dab's radius past the
+      // box, not the whole mask.
+      case 'path-stroke':
+        s = effectNumber(e, 'brushSize') / 2 + 1;
+        break;
+      // Edge bands reach Edge Width past the outline, the pen line half its
+      // width past that, and Path Overlap / Curviness push turns up to about
+      // two spacings further.
+      case 'scribble':
+        s = effectNumber(e, 'edgeWidth') + effectNumber(e, 'strokeWidth') + 2 * effectNumber(e, 'spacing');
+        break;
+      // Only the brush form: the classic line is a GPU pass on unbaked layers
+      // and was never padded, and padding it now would move nothing but the
+      // raster size of every stored Write-on document.
+      case 'write-on':
+        s = effectNumber(e, 'writeOnMode') === 0 ? effectNumber(e, 'brushSize') / 2 + 1 : 0;
+        break;
       // NOT bezier-warp either, and for a sharper version of the same reason.
       // Its patch is built by `defaultWarpPoints(w, h)` from the dimensions the
       // effect is HANDED, which are the padded canvas's — so padding does not
@@ -149,9 +192,20 @@ function bakedEffectSpread(layer: RenderLayer): number {
       // them unpadded keeps the (correct) appearance and costs only the tail of
       // a displacement that reaches past the layer box.
       default:
-        // Everything else (colour grades, LUTs, generators, sharpen, noise,
-        // keylight) is a per-pixel pass — it cannot paint outside the box.
-        s = 0;
+        /*
+          A PLUGIN effect answers for itself, from its own declaration.
+
+          Its reach is a manifest formula over live parameter values — the same
+          number `extractSpatialEffects` computes for the GPU path — so this
+          branch asks the plugin registry rather than guessing. Without it a
+          plugin glow on a BAKED layer was clipped flat at the layer box while
+          the identical effect on an unbaked one bled correctly, which reads as
+          the bake being broken rather than as a missing budget.
+
+          Everything else (colour grades, LUTs, generators, sharpen, noise,
+          keylight) is a per-pixel pass — it cannot paint outside the box.
+        */
+        s = e.type.includes('.') ? pluginEffectSpreadPx(e) : 0;
     }
     if (s > spread) spread = s;
   }
@@ -258,6 +312,13 @@ export function rasterPadding(layer: RenderLayer): number {
     // both are resolved per-frame in buildSnapshot, so both are known here.
     const escape = Math.min(MAX_GLYPH_PAD, Math.max(glyphSpread(layer), textPathSpread(layer)));
     if (escape > pad) pad = escape;
+    // Text draws its paint strokes into this raster, and a stroke may leave the
+    // box as it does on a shape. Images and video take no paint pad: their bake
+    // is the source frame, so paint clips to it, as AE clips paint to footage.
+    if (layer.kind === 'text') {
+      const textPaintPad = paintReach(layer.paint);
+      if (textPaintPad > pad) pad = textPaintPad;
+    }
     // Clamped AFTER the rounding nudge, or the cap is not a cap: ceil(512 + 1)
   // is 513, and MAX_GLYPH_PAD exists precisely to bound the allocation.
   return pad > 0 ? Math.min(MAX_GLYPH_PAD, Math.ceil(pad + 1)) : 0;
@@ -266,9 +327,23 @@ export function rasterPadding(layer: RenderLayer): number {
   let strokeOvershoot = 0;
   for (const s of strokes) {
     if (!s || s.width <= 0) continue;
-    // center/miter: a full width covers the half-width band + a 90° miter tip
-    // (~0.71×w). outside: the band sits fully outside (~1×w) + miter → 2×w.
-    const overshoot = s.align === 'outside' ? s.width * 2 : s.align === 'inside' ? 0 : s.width;
+    // Inside is clipped to the fill, so nothing it draws (wave included) escapes.
+    if (s.align === 'inside') continue;
+    // An aligned stroke is built at DOUBLE width and clipped, so its reach
+    // doubles with it.
+    const band = s.align === 'outside' ? s.width * 2 : s.width;
+    // A full band covers the half-width edge, a round/square cap and a 90° miter
+    // tip (~0.71×band). It does NOT cover a sharper miter: the tip reaches
+    // (band/2)·ratio past its vertex and only bevels once ratio passes
+    // `miterLimit` — 2×band at the default 4 — so a star's tips at the box edge
+    // were sliced off. Rect corners are 90° and an ellipse has none, so only a
+    // PATH can reach the limit.
+    const miterReach = s.join === 'miter' && layer.primitive === 'path'
+      ? (band / 2) * Math.max(1, s.miterLimit ?? 4)
+      : 0;
+    // Wave displaces the whole band off the outline by up to its amount.
+    const waveReach = isIdentityWave(s.wave) ? 0 : Math.abs(s.wave!.amount);
+    const overshoot = Math.max(band, miterReach) + waveReach;
     if (overshoot > strokeOvershoot) strokeOvershoot = overshoot;
   }
   if (strokeOvershoot > pad) pad = strokeOvershoot;
@@ -319,13 +394,10 @@ export function rasterPadding(layer: RenderLayer): number {
       if (total > pad) pad = total;
     }
   }
-  if (layer.paint && layer.paint.strokes.length > 0) {
-    let maxStroke = 0;
-    for (const s of layer.paint.strokes) {
-      if (s.size > maxStroke) maxStroke = s.size;
-    }
-    if (maxStroke / 2 > pad) pad = maxStroke / 2;
-  }
+  // Paint reaches half the brush PLUS its soft edge's tail (3σ). Padding by the
+  // half-width alone sliced a feathered stroke's falloff flat at the raster edge.
+  const paintPad = paintReach(layer.paint);
+  if (paintPad > pad) pad = paintPad;
   // Clamped AFTER the rounding nudge, or the cap is not a cap: ceil(512 + 1)
   // is 513, and MAX_GLYPH_PAD exists precisely to bound the allocation.
   return pad > 0 ? Math.min(MAX_GLYPH_PAD, Math.ceil(pad + 1)) : 0;
@@ -343,6 +415,173 @@ export function fillStyleFor(
   if (!paint || paint.type === 'solid') return fallback;
   // Context is translated to the box centre at every call site → origin (0, 0).
   return makeCanvasGradient(ctx, paint, w, h);
+}
+
+/**
+ * A stroke's paint as a Canvas style — what BOTH the plain stroke (`strokeStyle`)
+ * and the profiled ribbon (`fillStyle`) draw with, so the two cannot disagree.
+ *
+ * A gradient with `gradient` points takes AE's Start/End geometry; without them
+ * it is the fill's angle/centre model, exactly the expression that stood here
+ * before, so every existing gradient stroke is untouched.
+ */
+export function strokePaintStyle(
+  ctx: CanvasRenderingContext2D,
+  stroke: Stroke,
+  w: number,
+  h: number,
+): string | CanvasGradient {
+  if (stroke.paint && stroke.paint.type !== 'solid') {
+    return stroke.gradient
+      ? strokeGradientFor(ctx, stroke.paint, stroke.gradient, w, h)
+      : fillStyleFor(ctx, stroke.paint, stroke.color, w, h);
+  }
+  return stroke.paint?.type === 'solid' ? stroke.paint.color : stroke.color;
+}
+
+/**
+ * AE's Gradient Stroke from free points, in the layer's centred local space.
+ *
+ *  • linear — the ramp runs Start → End, offset 0 at Start.
+ *  • radial — Start is the centre, |End − Start| the radius. The HIGHLIGHT is
+ *    the focal point: `highlightLength` × radius from the centre, at
+ *    `highlightAngle` degrees from the Start→End axis. Canvas's two-circle
+ *    radial gradient with a zero-radius focal circle is that model directly;
+ *    the length is held inside ±0.99 so the focal point never lands ON the rim,
+ *    where the ramp degenerates into a cone.
+ *
+ * Stops merge colour and opacity lists exactly as `makeCanvasGradient` does — a
+ * stop from either list is a stop in the result — so switching a stroke to
+ * point geometry changes where the ramp lies, never what it contains.
+ */
+export function strokeGradientFor(
+  ctx: CanvasRenderingContext2D,
+  paint: LinearFill | RadialFill,
+  g: StrokeGradientGeometry,
+  w: number,
+  h: number,
+): CanvasGradient {
+  const sx = (g.startX - 0.5) * w;
+  const sy = (g.startY - 0.5) * h;
+  const ex = (g.endX - 0.5) * w;
+  const ey = (g.endY - 0.5) * h;
+  let grad: CanvasGradient;
+  if (paint.type === 'linear') {
+    grad = ctx.createLinearGradient(sx, sy, ex, ey);
+  } else {
+    const r = Math.max(1e-3, Math.hypot(ex - sx, ey - sy));
+    const hl = Math.max(-0.99, Math.min(0.99, g.highlightLength ?? 0));
+    const ang = Math.atan2(ey - sy, ex - sx) + ((g.highlightAngle ?? 0) * Math.PI) / 180;
+    grad = ctx.createRadialGradient(sx + Math.cos(ang) * hl * r, sy + Math.sin(ang) * hl * r, 0, sx, sy, r);
+  }
+  const colors = sortedStops(paint.stops);
+  const alphas = sortedOpacityStops(paint.opacityStops);
+  if (alphas.length === 0) {
+    for (const s of colors) grad.addColorStop(clamp01(s.offset), s.color);
+    return grad;
+  }
+  const offsets = [...new Set([...colors.map((c) => c.offset), ...alphas.map((a) => a.offset)])]
+    .map(clamp01)
+    .sort((p, q) => p - q);
+  for (const off of offsets) {
+    grad.addColorStop(off, applyAlpha(sampleGradientColor(colors, off), sampleGradientOpacity(alphas, off)));
+  }
+  return grad;
+}
+
+// ── Ordered paint stack (AE Composite + per-paint blend) ─────────────
+
+/** One paint operation of a shape, as the rasterizer draws it. */
+export type PaintOp =
+  | { kind: 'fill'; fill: FillPaint | undefined }
+  | { kind: 'stroke'; stroke: Stroke };
+
+/** The composite/blend fields of a paint, which a fill carries structurally. */
+function opOptions(op: PaintOp): PaintOpOptions {
+  return (op.kind === 'fill' ? op.fill : op.stroke) as PaintOpOptions | undefined ?? {};
+}
+
+/**
+ * True when any paint asks for something the fixed fills-then-strokes order
+ * cannot draw: a Composite of Above, or a non-normal blend mode.
+ *
+ * FALSE for every layer that uses neither — and the rasterizer then takes its
+ * original branch untouched, which is what keeps those layers byte-identical
+ * (the ordered path re-traces the outline per fill, a different call sequence).
+ */
+export function hasOrderedPaint(
+  fills: ReadonlyArray<FillPaint | undefined>,
+  strokes: ReadonlyArray<Stroke>,
+): boolean {
+  const flagged = (o: PaintOpOptions | undefined): boolean =>
+    !!o && (o.composite === 'above' || (o.blendMode !== undefined && o.blendMode !== 'normal'));
+  return fills.some((f) => flagged(f as PaintOpOptions | undefined)) || strokes.some((s) => flagged(s));
+}
+
+/** `hasOrderedPaint` over a render layer's own stacks. */
+export function layerHasOrderedPaint(layer: RenderLayer): boolean {
+  const fills = layer.fillPaints && layer.fillPaints.length > 0 ? layer.fillPaints : [layer.fillPaint];
+  const strokes = layer.strokes && layer.strokes.length > 0 ? layer.strokes : layer.stroke ? [layer.stroke] : [];
+  return hasOrderedPaint(fills, strokes);
+}
+
+/**
+ * The paints BACK → FRONT, resolving AE's Composite.
+ *
+ * AE's Contents list, top to bottom, is our stacks read front-first: the top
+ * stroke, …, the first stroke, the top fill, …, the first fill. Walking that
+ * list, each paint is inserted directly BEHIND the previous one ('below', the
+ * default) or directly IN FRONT of it ('above'). With every paint 'below' the
+ * result is fills[0…n], strokes[0…n] — the order this rasterizer has always
+ * drawn in, which is why the default needs no migration.
+ *
+ * "Directly" is relative to where the previous paint ENDED UP, not to the list:
+ * a fill set Above over a stroke that was itself set Above lands in front of
+ * both, which is how AE resolves a chain.
+ */
+export function paintRenderOrder(
+  fills: ReadonlyArray<FillPaint | undefined>,
+  strokes: ReadonlyArray<Stroke>,
+): PaintOp[] {
+  const list: PaintOp[] = [
+    ...[...strokes].reverse().map((stroke): PaintOp => ({ kind: 'stroke', stroke })),
+    ...[...fills].reverse().map((fill): PaintOp => ({ kind: 'fill', fill })),
+  ];
+  const z: PaintOp[] = [];
+  list.forEach((op, j) => {
+    if (j === 0) { z.push(op); return; }
+    const at = z.indexOf(list[j - 1]!);
+    z.splice(opOptions(op).composite === 'above' ? at + 1 : at, 0, op);
+  });
+  return z;
+}
+
+/**
+ * Draw an ordered paint stack. `trace` builds the outline into the current path
+ * (it is re-run before every fill, because a stroke's own trace/restore leaves
+ * no usable path behind); `strokeOne` draws one stroke with the caller's
+ * profiled/plain dispatch. Each paint runs in its own save/restore with its
+ * blend mode as the composite operation.
+ */
+export function drawPaintStack(
+  ctx: CanvasRenderingContext2D,
+  ops: ReadonlyArray<PaintOp>,
+  trace: () => void,
+  fillStyle: (fill: FillPaint | undefined) => string | CanvasGradient,
+  strokeOne: (stroke: Stroke) => void,
+): void {
+  for (const op of ops) {
+    ctx.save();
+    ctx.globalCompositeOperation = paintCompositeOperation(opOptions(op).blendMode);
+    if (op.kind === 'fill') {
+      trace();
+      ctx.fillStyle = fillStyle(op.fill);
+      ctx.fill();
+    } else {
+      strokeOne(op.stroke);
+    }
+    ctx.restore();
+  }
 }
 
 /** Apply a stroke's paint state (colour+opacity, width, dash, cap, join).
@@ -369,10 +608,7 @@ export function applyStrokeStyle(ctx: CanvasRenderingContext2D, stroke: Stroke, 
    */
   const opacity = Number.isFinite(stroke.opacity) ? stroke.opacity : 1;
   ctx.globalAlpha *= clamp01(opacity);
-  ctx.strokeStyle =
-    stroke.paint && stroke.paint.type !== 'solid'
-      ? fillStyleFor(ctx, stroke.paint, stroke.color, w, h)
-      : (stroke.paint?.type === 'solid' ? stroke.paint.color : stroke.color);
+  ctx.strokeStyle = strokePaintStyle(ctx, stroke, w, h);
   ctx.lineWidth = stroke.width;
   ctx.lineCap = stroke.cap;
   ctx.lineJoin = stroke.join;
@@ -537,7 +773,8 @@ export function strokeShape(ctx: CanvasRenderingContext2D, stroke: Stroke, trace
  *
  *   • identity profiles — nothing to do, and skipping keeps an untapered stroke
  *     BYTE-identical rather than merely numerically equal (§2·0);
- *   • non-path primitives — rect/ellipse taper is not modelled yet;
+ *   • a path primitive with no geometry. (Rect and ellipse primitives are
+ *     ACCEPTED — see `primitiveRun`.)
  * ## A GEOMETRIC LIMIT this shares with every naive offset
  *
  * Offsetting a curve along its normals SELF-INTERSECTS wherever the local radius
@@ -731,9 +968,6 @@ function capPoints(
  */
 const JOIN_CORNER_ANGLE = (40 * Math.PI) / 180;
 
-/** Canvas2D's own default. Past this a miter degenerates into a long spike. */
-const MITER_LIMIT = 10;
-
 /** Samples across a round join's arc. Joins turn less than a cap's half-circle. */
 const JOIN_ARC_STEPS = 10;
 
@@ -758,11 +992,25 @@ const JOIN_ARC_STEPS = 10;
  * its single bisector point and is allowed to self-overlap, which a nonzero fill
  * absorbs. Which side is outer follows the turn: turning left, the left side is
  * the inside.
+ *
+ * `miterLimit` is the STROKE's (plain strokes hand the same number to Canvas2D's
+ * `ctx.miterLimit`). This used to be a hard-coded 10, so switching Taper on
+ * turned a bevelled star tip back into a spike.
+ *
+ * ## The seam of a closed run
+ *
+ * `closed` marks a whole closed run, which arrives with its first point repeated
+ * at the end. Vertex 0 and vertex n−1 are then ONE vertex, and it gets a real
+ * join between the last segment and the first. Treated as two open ends it got
+ * neither a join nor a cap — each end offset along its own segment only — and a
+ * closed shape whose first vertex is a corner showed a notch there.
  */
 function ribbonSidesWithJoins(
   pts: readonly Pt[],
   halfAt: (i: number) => number,
   join: StrokeJoin,
+  miterLimit = 4,
+  closed = false,
 ): OffsetSides {
   const base = offsetAlongNormals(pts, halfAt);
   const n = pts.length;
@@ -775,10 +1023,27 @@ function ribbonSidesWithJoins(
     const d = unitFrom(pts[i]!, pts[i + 1]!);
     return d ? { x: -d.y, y: d.x } : null;
   };
+  // Only when the ends really meet: a WAVE moves them apart (its offset at arc 0
+  // and at the full length generally differ), and then there is no seam to join.
+  const seam = closed && n >= 4
+    && Math.hypot(pts[0]!.x - pts[n - 1]!.x, pts[0]!.y - pts[n - 1]!.y) < 1e-6;
+  /** Seam point along the CENTRED difference across the seam — the same rule
+   *  `offsetAlongNormals` applies at every interior vertex. */
+  const seamSides = (i: number): { l: Pt; r: Pt } => {
+    const p = pts[i]!;
+    const tx = pts[1]!.x - pts[n - 2]!.x;
+    const ty = pts[1]!.y - pts[n - 2]!.y;
+    const len = Math.hypot(tx, ty) || 1;
+    const d = halfAt(i);
+    const nx = (-ty / len) * d;
+    const ny = (tx / len) * d;
+    return { l: { x: p.x + nx, y: p.y + ny }, r: { x: p.x - nx, y: p.y - ny } };
+  };
 
   for (let i = 0; i < n; i++) {
-    const nPrev = i > 0 ? segNormal(i - 1) : null;
-    const nNext = i < n - 1 ? segNormal(i) : null;
+    const atSeam = seam && (i === 0 || i === n - 1);
+    const nPrev = i > 0 ? segNormal(i - 1) : atSeam ? segNormal(n - 2) : null;
+    const nNext = i < n - 1 ? segNormal(i) : atSeam ? segNormal(0) : null;
     // Ends have one segment and therefore no join; the cap owns them.
     if (!nPrev || !nNext) {
       left.push(base.left[i]!);
@@ -792,8 +1057,14 @@ function ribbonSidesWithJoins(
     const dot = nPrev.x * nNext.x + nPrev.y * nNext.y;
     const turn = Math.atan2(cross, dot);
     if (Math.abs(turn) < JOIN_CORNER_ANGLE) {
-      left.push(base.left[i]!);
-      right.push(base.right[i]!);
+      if (atSeam) {
+        const s = seamSides(i);
+        left.push(s.l);
+        right.push(s.r);
+      } else {
+        left.push(base.left[i]!);
+        right.push(base.right[i]!);
+      }
       continue;
     }
 
@@ -820,7 +1091,7 @@ function ribbonSidesWithJoins(
       // falls back to a bevel, and so does this.
       const half = Math.abs(turn) / 2;
       const ratio = 1 / Math.max(1e-6, Math.cos(half));
-      if (ratio <= MITER_LIMIT) {
+      if (ratio <= miterLimit) {
         const bx = a.x - p.x + (b.x - p.x);
         const by = a.y - p.y + (b.y - p.y);
         const bl = Math.hypot(bx, by);
@@ -832,14 +1103,19 @@ function ribbonSidesWithJoins(
     // 'bevel' adds nothing: a and b joined directly IS the bevel.
     outer.push(b);
 
+    // At the seam the join is emitted ONCE, at the last vertex; the first vertex
+    // contributes only `b`, where the outgoing segment starts. The side then ends
+    // exactly where it began, and the inner side takes the across-seam point.
+    const outerPts = atSeam && i === 0 ? [b] : outer;
+    const inner = atSeam ? seamSides(i) : { l: base.left[i]!, r: base.right[i]! };
     if (outerIsLeft) {
-      left.push(...outer);
-      right.push(base.right[i]!);
+      left.push(...outerPts);
+      right.push(inner.r);
     } else {
       // `right` is walked in reverse when the ring closes, so the join's points
       // go in forward order here and reverse correctly with everything else.
-      right.push(...outer);
-      left.push(base.left[i]!);
+      right.push(...outerPts);
+      left.push(inner.l);
     }
   }
   return { left, right };
@@ -875,21 +1151,72 @@ function cappedRibbon(pts: readonly Pt[], sides: OffsetSides, cap: StrokeCap): P
   ];
 }
 
+/** Cubic handle length for a quarter ellipse, as a fraction of its radius. */
+const ELLIPSE_KAPPA = 0.5522847498307936;
+
+/**
+ * A rect or ellipse primitive's outline as ONE closed run, so Taper and Wave
+ * have a path to walk.
+ *
+ * Primitives carry no path geometry (they are drawn from w/h), which is why the
+ * profiled stroke used to refuse them while the Stroke panel still showed the
+ * Taper and Wave rows — controls that provably did nothing. The outline matches
+ * what the path-operator chain converts the same primitive to (`shapeOutline`:
+ * rect from the top-left corner clockwise, rounded corners and their scale
+ * compensation included), so a taper's start does not jump when an operator is
+ * added. The ellipse is four exact cubics from angle 0, clockwise on screen —
+ * `shapeOutline`'s start and direction, without its 48-gon facets.
+ */
+function primitiveRun(layer: RenderLayer): Subpath {
+  const w = layer.width;
+  const h = layer.height;
+  if (layer.primitive === 'ellipse') {
+    const rx = w / 2;
+    const ry = h / 2;
+    const kx = rx * ELLIPSE_KAPPA;
+    const ky = ry * ELLIPSE_KAPPA;
+    return {
+      open: false,
+      points: [
+        { x: rx, y: 0, inX: rx, inY: -ky, outX: rx, outY: ky },
+        { x: 0, y: ry, inX: kx, inY: ry, outX: -kx, outY: ry },
+        { x: -rx, y: 0, inX: -rx, inY: ky, outX: -rx, outY: -ky },
+        { x: 0, y: -ry, inX: -kx, inY: -ry, outX: kx, outY: -ry },
+      ],
+    };
+  }
+  const outline = shapeOutline(
+    'rect', w, h, 48, 0, layer.cornerRadii ?? layer.cornerRadius, layer.cornerRadiusScale,
+  );
+  return {
+    open: false,
+    points: outline.map((p) => ({ x: p.x, y: p.y, inX: p.x, inY: p.y, outX: p.x, outY: p.y })),
+  };
+}
+
+/**
+ * `runs` restricts the ribbon to a subset of the layer's runs — a per-run paint
+ * batch. Without it every batch stroked EVERY run: a repeater ×3 with a tapered
+ * stroke drew each copy once per batch, in each copy's colour. The alignment clip
+ * follows the same subset.
+ */
 export function strokeShapeProfiled(
   ctx: CanvasRenderingContext2D,
   stroke: Stroke,
   layer: RenderLayer,
   w = 100,
   h = 100,
+  runsOverride?: ReadonlyArray<Subpath>,
 ): boolean {
   if (stroke.width <= 0) return false;
   const taper = stroke.taper;
   const wave = stroke.wave;
   if (isIdentityTaper(taper) && isIdentityWave(wave)) return false;
-  if (layer.primitive !== 'path') return false;
 
-
-  const runs = layerSubpaths(layer);
+  // A path primitive with no geometry still refuses — `shapePath` falls back to
+  // the box for it, and there is no outline to profile.
+  const runs = runsOverride
+    ?? (layer.primitive === 'path' ? layerSubpaths(layer) : [primitiveRun(layer)]);
   if (runs.length === 0) return false;
 
   ctx.save();
@@ -908,7 +1235,12 @@ export function strokeShapeProfiled(
    */
   const aligned = stroke.align !== 'center';
   if (aligned) {
-    shapePath(ctx, layer);
+    if (runsOverride) {
+      ctx.beginPath();
+      for (const r of runsOverride) traceRun(ctx, r);
+    } else {
+      shapePath(ctx, layer);
+    }
     if (stroke.align === 'inside') {
       ctx.clip();
     } else {
@@ -920,10 +1252,7 @@ export function strokeShapeProfiled(
   // The ribbon is FILLED, so the stroke's paint becomes a fill style. A gradient
   // stroke gets easier here rather than harder: a filled outline takes a fill
   // gradient directly, instead of Canvas2D's stroke-gradient special case.
-  ctx.fillStyle =
-    stroke.paint && stroke.paint.type !== 'solid'
-      ? fillStyleFor(ctx, stroke.paint, stroke.color, w, h)
-      : (stroke.paint?.type === 'solid' ? stroke.paint.color : stroke.color);
+  ctx.fillStyle = strokePaintStyle(ctx, stroke, w, h);
 
   let drew = false;
   for (const run of runs) {
@@ -941,7 +1270,12 @@ export function strokeShapeProfiled(
     // chord is sampled like every other) is what makes a tapered closed shape
     // meet itself.
     if (!open && flat.length > 1) flat.push({ x: flat[0]!.x, y: flat[0]!.y });
-    const poly = densifyForWave(flat, wave);
+    // Wave Units = Cycles is a wavelength of (run length / cycles), so it needs
+    // the run's length BEFORE densifying — measured on the flattened curve,
+    // which densifying (points along existing chords) does not change. A pixel
+    // wave skips the walk and is the original object.
+    const runWave = wave?.units === 'cycles' ? waveForLength(wave, polylineLength(flat)) : wave;
+    const poly = densifyForWave(flat, runWave);
     if (poly.length < 2) continue;
 
     // Cumulative arc length. Taper is a FRACTION of it; wave is measured in the
@@ -951,10 +1285,13 @@ export function strokeShapeProfiled(
       arc.push(arc[i - 1]! + Math.hypot(poly[i]!.x - poly[i - 1]!.x, poly[i]!.y - poly[i - 1]!.y));
     }
     const total = arc[arc.length - 1] || 1;
+    // Taper Length Units = Pixels: the ramp lengths become fractions of THIS
+    // run. A percent taper passes through as the same object.
+    const runTaper = taper ? taperForLength(taper, total) : taper;
 
-    const centre = isIdentityWave(wave)
+    const centre = isIdentityWave(runWave)
       ? poly
-      : offsetAlongNormals(poly, (i) => waveOffsetAt(wave!, arc[i]!)).left;
+      : offsetAlongNormals(poly, (i) => waveOffsetAt(runWave!, arc[i]!)).left;
 
     // Dash splits the path into spans; each span becomes its OWN ribbon, and
     // every vertex still reads its width from the GLOBAL arc position — so a
@@ -971,7 +1308,7 @@ export function strokeShapeProfiled(
     const spanCap: StrokeCap = open || dashed ? stroke.cap : 'butt';
 
     const halfWidthAt = (i: number): number => {
-      const factor = taper ? taperWidthFactorAt(taper, arc[i]! / total) : 1;
+      const factor = runTaper ? taperWidthFactorAt(runTaper, arc[i]! / total) : 1;
       return (effectiveWidth * factor) / 2;
     };
 
@@ -987,7 +1324,10 @@ export function strokeShapeProfiled(
         const f = a - lo;
         return halfWidthAt(lo) * (1 - f) + halfWidthAt(hi) * f;
       };
-      const sides = ribbonSidesWithJoins(piece.pts, widthOf, stroke.join);
+      // A closed run drawn whole joins across its seam; a dash never does.
+      const sides = ribbonSidesWithJoins(
+        piece.pts, widthOf, stroke.join, Math.max(1, stroke.miterLimit ?? 4), !open && !dashed,
+      );
       const ring = cappedRibbon(piece.pts, sides, spanCap);
       if (ring.length < 3) continue;
       ctx.beginPath();

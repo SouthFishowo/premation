@@ -270,4 +270,7 @@ export const EFFECT_CATEGORY: Record<EffectType, string> = {
   // The two simulations file with the weather generators (Snowfall, Rainfall).
   'particle-systems': 'Generate',
   'cc-bubbles': 'Generate',
+  // ── Stroke-like paint effects (2026-09-15) — AE's own folder for both ──
+  'path-stroke': 'Generate',
+  scribble: 'Generate',
 };

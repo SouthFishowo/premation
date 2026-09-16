@@ -465,13 +465,34 @@ export function insertSvgShapeGroup(
       const fillPaint = s.fillPaint ? parsedGradientToFillPaint(s.fillPaint) : undefined;
       const fxProps: Record<string, unknown> = {};
       if (fillPaint) fxProps.fill = fillPaint;
+      // `paint-order: stroke` covers the stroke's inner half with the fill —
+      // the fill's Composite "Above Previous". A composite needs a fill PAINT to
+      // live on, so a solid fill is promoted onto fx for it (nothing else
+      // changes: a solid fx fill resolves to the same colour Style.fill held).
+      if (s.fillAboveStroke && s.strokeColor && s.fill && s.fill !== 'none') {
+        fxProps.fill = fillPaint
+          ? { ...fillPaint, composite: 'above' }
+          : { type: 'solid', color: svgFillToCss(s.fill, s.fillOpacity), composite: 'above' };
+      }
       if (s.strokeColor) {
+        // `non-scaling-stroke` keeps the stroke (and its dashes) at the width
+        // the file states, whatever scale the artwork is placed at.
+        const sk = s.nonScalingStroke ? 1 : k;
+        // A draw-on dasharray is the MECHANISM of the animation, already
+        // translated into a trim-end track; laying the dash down as well would
+        // hide the stroke twice.
+        const dash = s.animation?.trimEnd ? undefined : s.strokeDash;
         fxProps.stroke = {
           enabled: true,
           color: s.strokeColor,
-          width: (s.strokeWidth ?? 1) * k,
+          width: (s.strokeWidth ?? 1) * sk,
           opacity: clamp01(s.strokeOpacity ?? 1),
-          cap: 'butt', join: 'miter', align: 'center', dash: [],
+          cap: s.strokeCap ?? 'butt',
+          join: s.strokeJoin ?? 'miter',
+          align: 'center',
+          dash: dash ? dash.map((v) => v * sk) : [],
+          ...(dash && s.strokeDashOffset ? { dashOffset: s.strokeDashOffset * sk } : {}),
+          ...(s.strokeMiterLimit !== undefined ? { miterLimit: s.strokeMiterLimit } : {}),
         };
       }
       const components: SceneNode['components'] = [
@@ -1221,6 +1242,11 @@ export function insertLight(seed: LightSeed = {}): void {
   if (t) {
     t.props.x = compSize.width / 2;
     t.props.y = compSize.height / 2;
+    // In FRONT of the comp plane, as AE seeds a new light (z ≈ −0.23·width,
+    // −444 on a 1920 comp). At z = 0 a point or spot light sat IN the plane of
+    // every unmoved 3D layer: N·L = 0, so it lit nothing but its glow and its
+    // projected shadow hit the same-plane guard.
+    t.props.z = -Math.round(compSize.width * 0.2315);
     t.props.intensity = typeof seed.intensity === 'number' ? seed.intensity : 100;
     t.props.radius = Math.round(Math.max(compSize.width, compSize.height) * 0.45);
     // Only write the optional props when chosen — an unseeded light keeps the
@@ -1783,7 +1809,12 @@ export async function insertImageSequence(files: File[], fps = 30): Promise<bool
     const f = byName.get(n);
     if (f) frames.push(URL.createObjectURL(f));
   }
-  if (frames.length < 2) return false;
+  if (frames.length < 2) {
+    // Nothing will reference these — revoke, or each refused drop keeps its
+    // file bytes pinned for the session.
+    for (const url of frames) URL.revokeObjectURL(url);
+    return false;
+  }
   // First frame's native size.
   const dims = await new Promise<{ w: number; h: number }>((resolve) => {
     const img = new Image();

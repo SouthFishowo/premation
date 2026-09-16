@@ -64,10 +64,12 @@ describe('the step itself', () => {
     expect(exprOf(input)).toBe('value + 200');
   });
 
-  test('registered in the chain, and 1.6.0 is what this build writes', () => {
-    expect(MIGRATIONS.map((m) => m.from)).toContain('1.5.0');
+  test('registered in the chain, stepping 1.5.0 → 1.6.0 exactly once', () => {
+    // NOT pinned to CURRENT_DOCUMENT_VERSION any more: the trim-mode rename
+    // added 1.6.0 → 1.7.0, and pinning the latest version here made a later,
+    // unrelated migration fail this suite.
+    expect(MIGRATIONS.filter((m) => m.to === '1.6.0').map((m) => m.from)).toEqual(['1.5.0']);
     expect(MIGRATIONS[MIGRATIONS.length - 1]!.to).toBe(CURRENT_DOCUMENT_VERSION);
-    expect(CURRENT_DOCUMENT_VERSION).toBe('1.6.0');
   });
 
   test('a document with no expressions at all passes through untouched', () => {
@@ -154,7 +156,7 @@ describe('boundaries — what the clean fixture excludes', () => {
    */
   test('a 1.0.0 document walks the whole chain and arrives converted', () => {
     const out = migrateDocument(legacyDoc(IMPLIED_LEGACY_VERSION));
-    expect(out.version).toBe('1.6.0');
+    expect(out.version).toBe(CURRENT_DOCUMENT_VERSION);
     expect(exprOf(out)).toEqual({ src: 'value + 200', enabled: true });
   });
 

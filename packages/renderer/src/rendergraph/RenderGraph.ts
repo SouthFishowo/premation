@@ -244,9 +244,36 @@ export class RenderGraph {
       },
     };
 
+    /*
+      Per-pass error isolation.
+
+      A pass that throws — a bad uniform pack, a target lookup that fails, a
+      plugin effect reaching for something that is not there — used to unwind
+      straight out of `execute` and take the whole frame with it: nothing after
+      it ran, `Renderer.endFrame` never ran, and the viewport stayed blank (or,
+      worse, stuck mid-frame) until the editor was reopened.
+
+      So each pass is guarded on its own. The failing pass is skipped, any
+      render pass it left open is closed (WebGPU invalidates the whole command
+      encoder otherwise), and a `pass-failed` diagnostic says what was lost.
+      That diagnostic is what keeps this from becoming silent: preview warns and
+      keeps the frame, export refuses it (see RenderDiagnostics).
+
+      A try around the call costs nothing measurable when nothing throws, and
+      allocates nothing per frame.
+    */
     for (const pass of order) {
       args.services.commands.clear();
-      pass.execute(ctx);
+      try {
+        pass.execute(ctx);
+      } catch (err) {
+        args.services.backend.abortOpenPass?.();
+        args.services.commands.clear();
+        args.services.diagnostics.push({
+          code: 'pass-failed',
+          detail: `Render pass "${pass.name}" failed and was skipped: ${errorText(err)}`,
+        });
+      }
     }
     return targetMap;
   }
@@ -254,4 +281,10 @@ export class RenderGraph {
   get passNames(): string[] {
     return this.passes.map((p) => p.name);
   }
+}
+
+/** A thrown value as one line of diagnostic text. Only runs on the error path. */
+function errorText(err: unknown): string {
+  if (err instanceof Error) return err.message || err.name;
+  return String(err);
 }

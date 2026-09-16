@@ -122,18 +122,32 @@ export const aiEnabled = (): boolean => true;
 /**
  * Plugins, in this process.
  *
- * Mirrors `pluginsEnabled()` on the renderer side, and gates the same thing
- * from the privileged end. When false, `registerPluginNetIpc` and
- * `installPluginPublishIpc` are never called, so `pluginNet:*` and the publish
- * channels do not exist. An `ipcRenderer.invoke` against them rejects with "No
- * handler registered", which is the correct answer rather than a soft refusal a
- * caller could mistake for a transient failure and retry.
+ * Mirrors `pluginsEnabled()` on the renderer side: ON in both editions, because
+ * the local edition installs plugins from local files (see the renderer's note
+ * for why that needs no backend). When true, `registerPluginNetIpc` registers
+ * `pluginNet:*` — the transport for `motion.net.fetch`.
  *
- * `pluginNet` is the other half of the network story above: it is the second
- * channel here that reaches a host we do not control, and unlike `aiProxy` the
- * host is chosen by a third party's manifest.
+ * `pluginNet` is the second channel here that reaches a host we do not control,
+ * and unlike `aiProxy` the host is chosen by a third party's manifest. It stays
+ * safe to register in a local build for the same reasons it is in a hosted one:
+ * a request is made only for a plugin the user granted `net:fetch`, only to a
+ * host that plugin's manifest declared and the consent screen showed, and the
+ * guards (https, private addresses, redirects, size, rate) are in
+ * `pluginNetFetch`, not in the edition.
  */
-export const pluginsEnabled = (): boolean => isServerEdition();
+export const pluginsEnabled = (): boolean => true;
+
+/**
+ * Publishing a plugin to the registry, in this process.
+ *
+ * Server edition only. When false, `installPluginPublishIpc` is never called and
+ * the publish channels do not exist — an `ipcRenderer.invoke` against them
+ * rejects with "No handler registered", the correct answer rather than a soft
+ * refusal a caller could retry. Publishing needs an account and a registry,
+ * neither of which the local edition has, and the channel opens a file picker:
+ * a UI affordance in a build with no way to use what it produces.
+ */
+export const pluginPublishEnabled = (): boolean => isServerEdition();
 
 /**
  * Shout if the renderer's edition disagrees with this process's.

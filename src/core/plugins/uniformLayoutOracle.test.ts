@@ -27,6 +27,8 @@
 
 import {
   parameterBlock,
+  HOST_BLOCK_FLOAT_OFFSET,
+  HOST_BLOCK_MEMBERS,
   UNIFORM_HEADER_BYTES,
   UNIFORM_PASS_BLOCK_BYTES,
   UNIFORM_RENDERER_HEADER_BYTES,
@@ -180,12 +182,15 @@ describe('★ the generated struct, laid out independently', () => {
 
   it('★ puts the host pass block between the header and the parameters', () => {
     /*
-      The multi-pass change, pinned the same way.
+      The multi-pass change, pinned the same way — and then the host-inputs
+      change, which GREW this block from 32 bytes to 64.
 
       A pass needs its own texel size — a separable blur samples `uv ±
       texelSize`, and a pass at `scale: 0.25` renders into a target a quarter
       the size, so the value differs per pass and an author cannot compute it.
-      The block carrying it sits at 64, and the parameters moved to 96.
+      It now also needs the things no plugin effect could read at all before:
+      the time, the comp size, the frame rate, a stable seed. The block
+      carrying all of it sits at 64, and the parameters moved 96 → 128.
 
       Asserted through the ORACLE, which re-derives every offset from the WGSL
       text by the spec's alignment rules, so this fails if the emitted struct
@@ -199,8 +204,37 @@ describe('★ the generated struct, laid out independently', () => {
     expect(at('texelSize')).toBe(64);
     expect(at('passScale')).toBe(72);
     expect(at('passIndex')).toBe(76);
-    expect(at('_reserved')).toBe(80);
-    expect(block.layout[0]!.offset).toBe(96);
+    // The host-filled inputs (GAP 3), each at the offset `packPassBlock` and
+    // `packPluginEffect` write to.
+    expect(at('compSize')).toBe(80);
+    expect(at('layerSize')).toBe(88);
+    expect(at('time')).toBe(96);
+    expect(at('compTime')).toBe(100);
+    expect(at('frame')).toBe(104);
+    expect(at('fps')).toBe(108);
+    expect(at('pixelScale')).toBe(112);
+    expect(at('downsample')).toBe(116);
+    expect(at('seed')).toBe(120);
+    expect(at('_reserved')).toBe(124);
+    // `layerRect`: the block grew again, 64 → 80, and the parameters 128 → 144.
+    expect(at('layerRect')).toBe(128);
+    expect(block.layout[0]!.offset).toBe(144);
+  });
+
+  it('agrees with the float-offset table the packers walk', () => {
+    /*
+      The oracle re-derives offsets from the WGSL TEXT; `HOST_BLOCK_FLOAT_OFFSET`
+      is what the two packers (CPU and renderer) actually index by. They are
+      different derivations of one layout and nothing else compares them — which
+      is the exact shape of the bug that let a shader read `fps` out of the
+      `frame` slot and look merely wrong.
+    */
+    const oracle = layOutStruct(parameterBlock({}).wgsl);
+    for (const [name, floats] of Object.entries(HOST_BLOCK_FLOAT_OFFSET)) {
+      const member = oracle.members.find((m) => m.name === name);
+      expect(member).toBeDefined();
+      expect(member!.offset).toBe(UNIFORM_RENDERER_HEADER_BYTES + floats * 4);
+    }
   });
 
   it('emits the pass block for a SINGLE-pass effect too', () => {
@@ -215,21 +249,33 @@ describe('★ the generated struct, laid out independently', () => {
     */
     const block = parameterBlock({ amount: p('number') });
     expect(block.wgsl).toContain('texelSize : vec2<f32>');
-    expect(block.layout[0]!.offset).toBe(96);
+    expect(block.layout[0]!.offset).toBe(144);
   });
 
   it('confirms the header constant against the rules, not against itself', () => {
     // Derived here rather than read from the module, so a changed constant
     // fails rather than propagates: 48 for the padded mat3, 16 for the vec4,
-    // then the host block — vec2 + f32 + f32 packs into 16, and the reserved
-    // vec4 is another 16.
+    // then the host block, summed from the DECLARED members by the spec's own
+    // sizes rather than from the constant it is checking.
     const renderer = RULES['mat3x3<f32>']!.size + RULES['vec4<f32>']!.size;
-    const passBlock = RULES['vec2<f32>']!.size + RULES['f32']!.size * 2 + RULES['vec4<f32>']!.size;
+    const passBlock = HOST_BLOCK_MEMBERS.reduce((n, m) => n + RULES[m.wgsl]!.size, 0);
     expect(UNIFORM_RENDERER_HEADER_BYTES).toBe(renderer);
     expect(UNIFORM_PASS_BLOCK_BYTES).toBe(passBlock);
     expect(UNIFORM_HEADER_BYTES).toBe(renderer + passBlock);
     // A multiple of 16, or the first `vec4` parameter after it is misaligned.
     expect(UNIFORM_HEADER_BYTES % 16).toBe(0);
+  });
+
+  it('keeps every host member on an offset its own type allows', () => {
+    // `HOST_BLOCK_FLOAT_OFFSET` accumulates without re-aligning, which is only
+    // correct while the LIST is ordered so that each vec2 lands on a multiple
+    // of 8. Asserted rather than fixed up in the builder: a list that needed
+    // fixing up is a list somebody got wrong, and silently padding it would
+    // move every parameter offset without anyone deciding to.
+    for (const m of HOST_BLOCK_MEMBERS) {
+      const align = RULES[m.wgsl]!.align;
+      expect((UNIFORM_RENDERER_HEADER_BYTES + HOST_BLOCK_FLOAT_OFFSET[m.name]! * 4) % align).toBe(0);
+    }
   });
 
   it('★ leaves no member overlapping another', () => {

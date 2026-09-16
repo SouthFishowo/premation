@@ -8,12 +8,18 @@
  * adaptive resolution moves it), whether adaptive is currently degrading, and
  * which GPU backend came up.
  *
+ * Expanded (the `stages` row), it answers the next question — WHERE the frame
+ * goes: rolling mean and p95 per render stage from `core/perf/framePerf`
+ * (snapshot, flatten, texture feed, raster, CPU bake, GPU submit, cache
+ * readback), plus how many rasters and bakes a frame pays and, on WebGPU, how
+ * long the GPU takes to finish after submit.
+ *
  * ## Why it does not re-render sixty times a second
  *
- * The render loop reports into `viewportHudStats`, a plain module object, and
- * this samples it on a 250ms timer. Nothing about the HUD is in the render
- * path: a frame does not touch React, and turning the HUD off costs one
- * `clearInterval`.
+ * The render loop reports into `viewportHudStats` and `framePerf`, plain module
+ * objects, and this samples them on a 250ms timer. Nothing about the HUD is in
+ * the render path: a frame does not touch React, and turning the HUD off costs
+ * one `clearInterval`.
  *
  * `FpsMeter` in the status bar is the same idea for the DISPLAY's rate and is
  * left alone — this reads the renderer's own counters instead, which is the
@@ -33,6 +39,7 @@ import {
 } from '@stores/renderQualityStore';
 import { useRenderBackendStore, type ActiveRenderTier } from '@stores/renderBackendStore';
 import { cpuBakeStats, type CpuBakeSample } from '@core/effects/effectBake';
+import { framePerf, type PerfSample, type PerfStageName } from '@core/perf/framePerf';
 import styles from './ViewportHud.module.css';
 
 /** Sampling period. Fast enough to feel live, slow enough to be readable. */
@@ -49,19 +56,40 @@ const BACKEND_LABEL: Record<ActiveRenderTier, string> = {
   software: 'software',
 };
 
+/** The expanded rows, in pipeline order. `total` is the collapsed `frame` row. */
+const STAGE_ROWS: ReadonlyArray<{ stage: PerfStageName; label: string; counted?: boolean }> = [
+  { stage: 'snapshot', label: 'snapshot' },
+  { stage: 'flatten', label: 'flatten' },
+  { stage: 'textureFeed', label: 'tex feed' },
+  { stage: 'raster', label: 'raster', counted: true },
+  { stage: 'bake', label: 'cpu bake', counted: true },
+  { stage: 'gpuSubmit', label: 'gpu submit' },
+  { stage: 'cacheReadback', label: 'cache copy' },
+];
+
+const ms = (v: number): string => (v >= 10 ? v.toFixed(0) : v.toFixed(1));
+
 export function ViewportHud(): JSX.Element | null {
   const on = useViewportDisplayStore((s) => s.hud);
+  const expanded = useViewportDisplayStore((s) => s.hudStages);
+  const toggleStages = useViewportDisplayStore((s) => s.toggleHudStages);
   const [sample, setSample] = useState<HudSample>(() => viewportHudStats.sample());
   const [bake, setBake] = useState<CpuBakeSample>(() => cpuBakeStats.sample());
+  const [perf, setPerf] = useState<PerfSample | null>(null);
 
   const quality = useRenderQualityStore((s) => s);
   const tier = useRenderBackendStore((s) => s.activeTier);
 
   useEffect(() => {
     if (!on) return;
-    const id = setInterval(() => { setSample(viewportHudStats.sample()); setBake(cpuBakeStats.sample()); }, SAMPLE_MS);
+    const id = setInterval(() => {
+      setSample(viewportHudStats.sample());
+      setBake(cpuBakeStats.sample());
+      // The stage sort only runs while someone is looking at the stages.
+      if (expanded) setPerf(framePerf.sample());
+    }, SAMPLE_MS);
     return () => clearInterval(id);
-  }, [on]);
+  }, [on, expanded]);
 
   if (!on) return null;
 
@@ -106,6 +134,37 @@ export function ViewportHud(): JSX.Element | null {
           ? 'none'
           : `${bake.bakedLayers} layer${bake.bakedLayers === 1 ? '' : 's'}${bake.forcedBy.length > 0 ? ` · ${bake.forcedBy.slice(0, 3).map((f) => f.type).join(', ')}` : ''}`}
       </span>
+
+      {/* The one interactive element in the HUD: everything else stays
+          pointer-transparent so the readout never eats a click on the layer
+          behind it. */}
+      <button
+        type="button"
+        className={styles.toggle}
+        onClick={toggleStages}
+        aria-expanded={expanded}
+        title={expanded ? 'Hide per-stage timings' : 'Show per-stage timings (mean / p95 ms per frame)'}
+      >
+        {expanded ? '▾' : '▸'} stages
+      </button>
+
+      {expanded && (
+        <>
+          <span className={styles.key}>ms/frame</span>
+          <span className={styles.value}>mean · p95</span>
+          {STAGE_ROWS.map(({ stage, label, counted }) => {
+            const s = perf?.stages[stage];
+            return [
+              <span key={`${stage}-k`} className={styles.key}>{label}</span>,
+              <span key={`${stage}-v`} className={`${styles.value} ${s && s.p95 > SLOW_FRAME_MS ? styles.warn : ''}`}>
+                {s ? `${ms(s.mean)} · ${ms(s.p95)}${counted ? ` ×${s.perFrame.toFixed(1)}` : ''}` : '—'}
+              </span>,
+            ];
+          })}
+          <span className={styles.key}>gpu done</span>
+          <span className={styles.value}>{perf?.gpuDoneMs != null ? `${ms(perf.gpuDoneMs)} ms` : 'n/a'}</span>
+        </>
+      )}
     </div>
   );
 }

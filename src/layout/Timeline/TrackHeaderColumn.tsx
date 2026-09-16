@@ -92,9 +92,9 @@ export const TrackHeader = memo(function TrackHeader({
   onToggleFlag,
   onRename,
   onTrackColorChange,
-  switchesOnHover = false,
-  switchesPinned = false,
-  onToggleSwitchPin,
+  switchesOnHover: _switchesOnHover = false,
+  switchesPinned: _switchesPinned = false,
+  onToggleSwitchPin: _onToggleSwitchPin,
   showSwitches = true,
   showModes = true,
   extraColumns,
@@ -260,12 +260,12 @@ export const TrackHeader = memo(function TrackHeader({
           title={hidden ? 'Hide' : 'Show (Video)'}
           onClick={(e) => { e.stopPropagation(); onToggleVisible(); }}
         >
-          <Icon name={hidden ? 'eye-off' : 'eye'} size="sm" />
+          {!hidden ? <Icon name="eye" size="sm" /> : null}
         </button>
         {/* AE's A/V Features column puts the speaker next to the eye. The clip
             bar has the same glyph; both write the one prop, so a layer scrolled
             past its bar still has a reachable audio switch. Layers that make no
-            sound get a spacer instead, so the column stays aligned. */}
+            sound get a disabled dark box button so the column stays aligned. */}
         {track.hasAudio && onToggleAudio ? (
           <button
             type="button"
@@ -277,10 +277,18 @@ export const TrackHeader = memo(function TrackHeader({
             title={audioMuted ? 'Unmute audio' : 'Mute audio'}
             onClick={(e) => { e.stopPropagation(); onToggleAudio(); }}
           >
-            <Icon name={audioMuted ? 'audio-off' : 'audio'} size="sm" />
+            {!audioMuted ? <Icon name="audio" size="sm" /> : null}
           </button>
         ) : (
-          <span className={styles.trackAction} data-kind="audio" data-spacer="" aria-hidden="true" />
+          <button
+            type="button"
+            className={styles.trackAction}
+            data-kind="audio"
+            disabled
+            tabIndex={-1}
+            aria-hidden="true"
+            title="Audio not available for this layer"
+          />
         )}
         <button
           type="button"
@@ -291,7 +299,7 @@ export const TrackHeader = memo(function TrackHeader({
           title={solo ? 'Unsolo' : 'Alt-click to solo only this layer'}
           onClick={(e) => { e.stopPropagation(); onToggleSolo(e.altKey); }}
         >
-          <Icon name="circle" size="sm" />
+          {solo ? <Icon name="circle" size="sm" /> : null}
         </button>
         <button
           type="button"
@@ -302,7 +310,7 @@ export const TrackHeader = memo(function TrackHeader({
           title={locked ? 'Unlock' : 'Lock'}
           onClick={(e) => { e.stopPropagation(); onToggleLock(); }}
         >
-          <Icon name="lock" size="sm" />
+          {locked ? <Icon name="lock" size="sm" /> : null}
         </button>
       </div>
 
@@ -389,14 +397,7 @@ export const TrackHeader = memo(function TrackHeader({
       </div>
 
       {showSwitches && (
-        <div
-          className={styles.aeSwitchesCol}
-          // An ATTRIBUTE, not a class, so the stylesheet can key both the
-          // resting state and the row's own `:hover` off one selector. A class
-          // would need this component to re-render on hover, which is exactly
-          // the per-row work `areRowPropsEqual` exists to avoid.
-          data-quiet={switchesOnHover && !switchesPinned ? '' : undefined}
-        >
+        <div className={styles.aeSwitchesCol}>
           <button
             type="button"
             className={styles.trackAction}
@@ -405,12 +406,11 @@ export const TrackHeader = memo(function TrackHeader({
             title="Toggle Shy Layer"
             onClick={(e) => { e.stopPropagation(); onToggleFlag?.('shy'); }}
           >
-            <Icon name="shy" size="sm" />
+            {(track as any).shy ? <Icon name="shy" size="sm" /> : null}
           </button>
 
           {/* AE's sunburst: Collapse Transformations on a placed comp,
-              Continuous Rasterize on a vector layer, nothing elsewhere (a
-              spacer keeps the column aligned). */}
+              Continuous Rasterize on a vector layer, disabled dark box button elsewhere. */}
           {collapseKind ? (
             <button
               type="button"
@@ -422,10 +422,18 @@ export const TrackHeader = memo(function TrackHeader({
               title={collapseKind === 'collapse' ? 'Collapse Transformations' : 'Continuous Rasterize'}
               onClick={(e) => { e.stopPropagation(); toggleCollapseSwitch(track.id); }}
             >
-              <Icon name="star" size="sm" />
+              {collapseOn ? <Icon name="star" size="sm" /> : null}
             </button>
           ) : (
-            <span className={styles.trackAction} data-kind="collapse" data-spacer="" aria-hidden="true" />
+            <button
+              type="button"
+              className={styles.trackAction}
+              data-kind="collapse"
+              disabled
+              tabIndex={-1}
+              aria-hidden="true"
+              title="Not available for this layer"
+            />
           )}
 
           {hasQuality ? (
@@ -443,7 +451,15 @@ export const TrackHeader = memo(function TrackHeader({
               <span className={styles.fxText}>{QUALITY_SWITCH[quality].glyph}</span>
             </button>
           ) : (
-            <span className={styles.trackAction} data-kind="quality" data-spacer="" aria-hidden="true" />
+            <button
+              type="button"
+              className={styles.trackAction}
+              data-kind="quality"
+              disabled
+              tabIndex={-1}
+              aria-hidden="true"
+              title="Quality not available for this layer"
+            />
           )}
 
           <button
@@ -454,7 +470,7 @@ export const TrackHeader = memo(function TrackHeader({
             title="Toggle Effects (fx)"
             onClick={(e) => { e.stopPropagation(); onToggleFlag?.('fxEnabled'); }}
           >
-            <span className={styles.fxText}>fx</span>
+            {track.fxEnabled !== false ? <span className={styles.fxText}>fx</span> : null}
           </button>
 
           {hasFrameBlend ? (
@@ -468,10 +484,18 @@ export const TrackHeader = memo(function TrackHeader({
               title={frameBlendOn ? 'Frame Blending on — click to turn off' : 'Frame Blending'}
               onClick={(e) => { e.stopPropagation(); toggleFrameBlendSwitch(track.id); }}
             >
-              <Icon name="video" size="sm" />
+              {frameBlendOn ? <Icon name="video" size="sm" /> : null}
             </button>
           ) : (
-            <span className={styles.trackAction} data-kind="frameBlend" data-spacer="" aria-hidden="true" />
+            <button
+              type="button"
+              className={styles.trackAction}
+              data-kind="frameBlend"
+              disabled
+              tabIndex={-1}
+              aria-hidden="true"
+              title="Frame Blending not available for this layer"
+            />
           )}
 
           <button
@@ -482,7 +506,7 @@ export const TrackHeader = memo(function TrackHeader({
             title="Toggle Motion Blur"
             onClick={(e) => { e.stopPropagation(); onToggleFlag?.('motionBlur'); }}
           >
-            <Icon name="motion-blur" size="sm" />
+            {track.motionBlur ? <Icon name="motion-blur" size="sm" /> : null}
           </button>
           <button
             type="button"
@@ -492,7 +516,7 @@ export const TrackHeader = memo(function TrackHeader({
             title="Toggle Adjustment Layer"
             onClick={(e) => { e.stopPropagation(); onToggleFlag?.('adjustment'); }}
           >
-            <Icon name="adjustment" size="sm" />
+            {track.adjustment ? <Icon name="adjustment" size="sm" /> : null}
           </button>
           <button
             type="button"
@@ -503,12 +527,7 @@ export const TrackHeader = memo(function TrackHeader({
             title={track.guide ? 'Guide layer — not rendered on export' : 'Make Guide Layer'}
             onClick={(e) => { e.stopPropagation(); onToggleFlag?.('guide'); }}
           >
-            {/* NOT `eye-off`. That is the glyph the VISIBILITY switch shows when
-                a layer is hidden, so every row carried two eyes doing unrelated
-                jobs — visibility over in the pre-info column, guide-layer here —
-                and the pair read as one control duplicated. A guide layer is
-                reference framing the render skips, which is what `frame` says. */}
-            <Icon name="frame" size="sm" />
+            {track.guide ? <Icon name="frame" size="sm" /> : null}
           </button>
           {/* Preserve Underlying Transparency — AE's "T" switch. A glyph rather
               than an icon because that is what it is called and what AE draws;
@@ -525,7 +544,7 @@ export const TrackHeader = memo(function TrackHeader({
               : 'Preserve Underlying Transparency'}
             onClick={(e) => { e.stopPropagation(); onToggleFlag?.('preserveTransparency'); }}
           >
-            <span className={styles.fxText}>T</span>
+            {track.preserveTransparency ? <span className={styles.fxText}>T</span> : null}
           </button>
           <button
             type="button"
@@ -535,27 +554,8 @@ export const TrackHeader = memo(function TrackHeader({
             title="Toggle 3D Layer"
             onClick={(e) => { e.stopPropagation(); onToggleFlag?.('threeD'); }}
           >
-            <Icon name="3d" size="sm" />
+            {track.threeD ? <Icon name="3d" size="sm" /> : null}
           </button>
-
-          {/* The per-row pin. Shown on hover like the switches themselves
-              unless the row has pinned them, in which case it has to stay
-              visible — it is the only way back. */}
-          {onToggleSwitchPin && switchesOnHover && (
-            <button
-              type="button"
-              className={styles.switchPin}
-              data-on={switchesPinned || undefined}
-              aria-pressed={switchesPinned}
-              aria-label={switchesPinned ? 'Unpin layer switches' : 'Pin layer switches'}
-              title={switchesPinned
-                ? 'Switches pinned open for this layer — click to let them hide again'
-                : 'Keep this layer’s switches visible'}
-              onClick={(e) => { e.stopPropagation(); onToggleSwitchPin(); }}
-            >
-              <Icon name="more-horizontal" size="sm" />
-            </button>
-          )}
         </div>
       )}
 

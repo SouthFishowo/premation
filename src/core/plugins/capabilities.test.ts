@@ -72,6 +72,9 @@ describe('the vocabulary', () => {
       'storage.global', 'storage.project',
       'effects.single', 'effects.multipass',
       'layerkinds', 'exporters', 'importers', 'presets', 'panels', 'wasm',
+      'effects.describe', 'animation.typed',
+      'layerkinds.generator', 'layerkinds.shader',
+      'ui.inspector', 'ui.canvas', 'ui.tools', 'ui.shortcuts', 'ui.expressions',
     ]);
     expect([...RUNTIME_CAPABILITIES]).toEqual(['webgpu']);
   });
@@ -110,7 +113,9 @@ describe('the two version numbers', () => {
       would pass forever and say nothing the day they move again.
     */
     expect(HOST_API_VERSION).toBe(5);
-    expect(MANIFEST_VERSION).toBe(6);
+    // 7 since the UI block (`contributes.inspector` / `tools` / `shortcuts` /
+    // `expressions`) — a GRAMMAR change, so this moved and the host API did not.
+    expect(MANIFEST_VERSION).toBe(7);
   });
 
   it('refuses a manifest whose GRAMMAR is newer than this host reads', () => {

@@ -20,6 +20,7 @@
 import { registeredEffects, effectById } from '@core/plugins/pluginEffects';
 import { pluginsEnabled } from '@core/config/edition';
 import { hasCapability } from '@core/plugins/capabilities';
+import { effectKernelFor } from '@core/plugins/effectSchema';
 import type { EffectDef, EffectParamDef, EffectParamValue, EffectType } from './effects';
 
 /**
@@ -101,8 +102,23 @@ export function pluginEffectDefs(): EffectDef[] {
  * sends the user to uninstall it. Every surface that can show a plugin effect
  * asks this and says so instead.
  */
-export function pluginEffectsCanRender(): boolean {
-  return hasCapability('webgpu');
+export function pluginEffectsCanRender(type?: string): boolean {
+  if (hasCapability('webgpu')) return true;
+  /*
+    Without WebGPU the answer is now per EFFECT, not per machine.
+
+    It used to be one fact about the tier — a plugin effect was WGSL, and WGSL
+    needs WebGPU. An effect may now ship a GLSL ES 3.0 kernel for exactly this
+    tier, or a CPU kernel that stands in for any missing backend, and both
+    render here. Asked without an effect this still answers the old tier
+    question, which is what a surface warning about the machine in general
+    wants; asked about one it answers about that one, so a plugin that did the
+    work is not tagged "No WebGPU" beside one that did not.
+  */
+  if (!type) return false;
+  const registered = effectById(type);
+  if (!registered) return false;
+  return effectKernelFor(registered.contribution, 'webgl2').ok;
 }
 
 /**

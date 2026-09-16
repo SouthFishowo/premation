@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import {
   aiEnabled,
   pluginsEnabled,
+  pluginPublishEnabled,
   getEdition,
   isLocalEdition,
   parseEdition,
@@ -62,26 +63,29 @@ describe('the main process resolves its own edition', () => {
     expect(aiEnabled()).toBe(true);
   });
 
-  it('turns plugins off in the local edition', () => {
+  it('keeps plugins on in the local edition, and publishing off', () => {
     process.env.MOTION_EDITION = 'local';
     __setEditionForTests(null);
     /*
-      What this controls: main.ts calls `registerPluginNetIpc` and
-      `installPluginPublishIpc` only when it is true, so `pluginNet:*` and the
-      publish channels do not exist. Renderer-side hiding is not a gate here —
-      this is the privileged end of the boundary, and `pluginNet` is one of only
-      two channels in this process that reach a host we do not control. Unlike
-      the assistant's, that host is chosen by a third party's manifest.
+      What these control: main.ts calls `registerPluginNetIpc` only when
+      `pluginsEnabled()` is true, and `installPluginPublishIpc` only when
+      `pluginPublishEnabled()` is. The local edition installs plugins from local
+      files, so a plugin granted `net:fetch` needs its transport — still limited
+      to the hosts its manifest declared. Publishing needs an account and a
+      registry, which the local edition does not have, so those channels must
+      not exist here: renderer-side hiding is not a gate on this side.
     */
-    expect(pluginsEnabled()).toBe(false);
+    expect(pluginsEnabled()).toBe(true);
+    expect(pluginPublishEnabled()).toBe(false);
   });
 
-  it('leaves plugins on by default, like every other capability', () => {
+  it('leaves plugins and publishing on by default, like every other capability', () => {
     // An unconfigured build behaves as it always did. A typo in a deploy env
     // must not silently ship a paying customer a build with no plugins.
     delete process.env.MOTION_EDITION;
     __setEditionForTests(null);
     expect(pluginsEnabled()).toBe(true);
+    expect(pluginPublishEnabled()).toBe(true);
   });
 
   it('survives an unreadable packaged manifest', () => {

@@ -4,8 +4,8 @@
  * A layer's outline: width, colour, opacity, alignment, dashes, caps and joins.
  * Stored on the node's `fx` component (key 'stroke'), captured by History /
  * autosave / export like the other fx data. Rendered by Canvas2D over the
- * layer's primitive path; the GPU backend skips strokes for now (documented
- * gap, mirrors deferred GPU passes).
+ * layer's primitive path; the GPU backend draws the same strokes by rasterizing
+ * any stroked shape through that shared Canvas2D code (`needsShapeRaster`).
  *
  * Alignment shifts the stroke relative to the fill edge: 'center' straddles it
  * (Canvas default), 'inside'/'outside' clip one half away — implemented in the
@@ -16,6 +16,13 @@ import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import type { SceneNode } from '@core/types';
 import { bumpScene } from '@stores/sceneStore';
 import { getEventBus } from '@core/events/EventBus';
+import { defaultAnimation } from '@motion/animation';
+import { strokeTrackPathsFor } from '@core/rendering/strokeTracks';
+import {
+  normalizePaintOpOptions,
+  type PaintBlendMode,
+  type PaintComposite,
+} from '@core/rendering/raster/paintBlend';
 import type { FillPaint } from './fill';
 
 export type StrokeAlign = 'inside' | 'center' | 'outside';
@@ -24,6 +31,42 @@ export type StrokeJoin = 'miter' | 'round' | 'bevel';
 
 import type { StrokeTaper, StrokeWave } from '@core/scene/strokeProfile';
 import { clamp01 } from '@utils/lang';
+
+// ── Paint operation options (AE: Composite + Blend Mode) ─────────────
+// Defined in the pure `paintBlend` module so the rasterizer can use them
+// without importing this file's scene-graph dependencies; re-exported here,
+// where the model lives.
+export {
+  PAINT_BLEND_MODES,
+  PAINT_COMPOSITES,
+  isPaintBlendMode,
+  normalizePaintOpOptions,
+  paintCompositeOperation,
+  type PaintBlendMode,
+  type PaintComposite,
+  type PaintOpOptions,
+} from '@core/rendering/raster/paintBlend';
+
+/**
+ * AE's Gradient Stroke geometry: a free Start Point and End Point, plus the
+ * radial Highlight.
+ *
+ * In the RELATIVE box units the fill's radial centre uses (0.5, 0.5 = the
+ * layer's centre), so the handles ride a resize the way the rest of the paint
+ * does. Absent means the gradient keeps its original angle/centre/radius model
+ * (`LinearFill.angle`, `RadialFill.cx/cy/radius`) — every gradient stroke
+ * authored before this renders byte-identically.
+ */
+export interface StrokeGradientGeometry {
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
+  /** Radial: the focal highlight's distance from the centre, −1..1 of the radius. Absent = 0. */
+  highlightLength?: number;
+  /** Radial: degrees, measured from the Start→End axis. Absent = 0. */
+  highlightAngle?: number;
+}
 
 export interface Stroke {
   enabled: boolean;
@@ -80,6 +123,12 @@ export interface Stroke {
    */
   taper?: StrokeTaper;
   wave?: StrokeWave;
+  /** AE Composite — see `PaintComposite`. Absent = below previous. */
+  composite?: PaintComposite;
+  /** Blend with the paints already drawn in this shape. Absent = normal. */
+  blendMode?: PaintBlendMode;
+  /** Free Start/End points and radial highlight for a gradient `paint`. */
+  gradient?: StrokeGradientGeometry;
 }
 
 export const STROKE_ALIGNS: ReadonlyArray<{ value: StrokeAlign; label: string }> = [
@@ -142,6 +191,11 @@ export function normalizeStroke(v: unknown): Stroke {
     // project on first open — for a value that means "unchanged".
     ...(normTaper(s.taper) ? { taper: normTaper(s.taper)! } : {}),
     ...(normWave(s.wave) ? { wave: normWave(s.wave)! } : {}),
+    // Composite, blend mode and gradient points: appended LAST and omitted at
+    // their defaults, so a stroke that uses none of them normalises to exactly
+    // the object (and raster cache key) it did before they existed.
+    ...normalizePaintOpOptions(s),
+    ...(validPaint && paint!.type !== 'solid' && normGradient(s.gradient) ? { gradient: normGradient(s.gradient)! } : {}),
   };
 }
 
@@ -149,18 +203,24 @@ export function normalizeStroke(v: unknown): Stroke {
  * Normalise a stored Taper, or undefined when it is absent or says nothing.
  *
  * Ranges are clamped HERE rather than trusted, because these arrive from a
- * saved document as well as from the inspector: fractions to 0..1, so a
- * hand-edited file cannot ask for a 300% ramp and get a stroke that inverts.
+ * saved document as well as from the inspector: widths to 0..1, percentage
+ * lengths to 0..1 (so a hand-edited file cannot ask for a 300% ramp and get a
+ * stroke that inverts), pixel lengths to ≥ 0, eases to AE's −1..1.
  */
 function normTaper(v: unknown): StrokeTaper | undefined {
   if (!v || typeof v !== 'object') return undefined;
   const t = v as Partial<StrokeTaper>;
-  const n = (x: unknown, d: number): number =>
-    clamp01(Number.isFinite(x) ? (x as number) : d);
+  const fin = (x: unknown, d: number): number => (Number.isFinite(x) ? (x as number) : d);
+  const n = (x: unknown, d: number): number => clamp01(fin(x, d));
+  const pixels = t.lengthUnits === 'pixels';
+  const len = (x: unknown): number => (pixels ? Math.max(0, fin(x, 0)) : n(x, 0));
+  const ease = (x: unknown): number => Math.max(-1, Math.min(1, fin(x, 0)));
   const out: StrokeTaper = {
     startWidth: n(t.startWidth, 1), endWidth: n(t.endWidth, 1),
-    startLength: n(t.startLength, 0), endLength: n(t.endLength, 0),
-    startEase: n(t.startEase, 0), endEase: n(t.endEase, 0),
+    startLength: len(t.startLength), endLength: len(t.endLength),
+    startEase: ease(t.startEase), endEase: ease(t.endEase),
+    // Percent is the default and is not written — the cache-key argument.
+    ...(pixels ? { lengthUnits: 'pixels' as const } : {}),
   };
   // An identity taper is dropped, not stored — same cache-key argument.
   const noRamp = out.startLength <= 0 && out.endLength <= 0;
@@ -177,11 +237,27 @@ function normWave(v: unknown): StrokeWave | undefined {
     amount: num(w.amount, 0),
     // A negative wavelength is not a backwards wave, it is a sign flip on the
     // phase — which the phase control already expresses. Clamped so there is
-    // one way to say it.
+    // one way to say it. Under Cycles it is the cycle count, same floor.
     wavelength: Math.max(0, num(w.wavelength, 0)),
     phase: num(w.phase, 0),
+    ...(w.units === 'cycles' ? { units: 'cycles' as const } : {}),
   };
   return out.amount === 0 || out.wavelength <= 0 ? undefined : out;
+}
+
+/** Normalise stored gradient points; undefined unless all four coordinates are finite. */
+function normGradient(v: unknown): StrokeGradientGeometry | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const g = v as Partial<StrokeGradientGeometry>;
+  const coords = [g.startX, g.startY, g.endX, g.endY];
+  if (!coords.every((c) => Number.isFinite(c))) return undefined;
+  return {
+    startX: g.startX as number, startY: g.startY as number,
+    endX: g.endX as number, endY: g.endY as number,
+    ...(Number.isFinite(g.highlightLength) && g.highlightLength !== 0
+      ? { highlightLength: Math.max(-1, Math.min(1, g.highlightLength as number)) } : {}),
+    ...(Number.isFinite(g.highlightAngle) && g.highlightAngle !== 0 ? { highlightAngle: g.highlightAngle as number } : {}),
+  };
 }
 
 
@@ -257,4 +333,58 @@ export function setNodeStroke(nodeId: string, stroke: Stroke | undefined): void 
 export function updateNodeStroke(nodeId: string, patch: Partial<Stroke>): void {
   const current = getNodeStroke(nodeId) ?? defaultStroke();
   setNodeStroke(nodeId, normalizeStroke({ ...current, ...patch }));
+}
+
+// ── Any stroke of the stack, by index ───────────────────────────────
+
+/** The stored stroke at `index` of the stack (normalized, disabled included), or undefined. */
+export function getNodeStrokeAt(nodeId: string, index: number): Stroke | undefined {
+  return index === 0 ? getNodeStroke(nodeId) : getNodeStrokes(nodeId)[index];
+}
+
+/**
+ * Patch the stroke at `index`. Index 0 routes through `updateNodeStroke`, so the
+ * primary keeps its create-on-first-edit behaviour and the legacy single-stroke
+ * slot stays mirrored; a higher index that does not exist is a no-op rather than
+ * a silent append.
+ */
+export function updateNodeStrokeAt(nodeId: string, index: number, patch: Partial<Stroke>): void {
+  if (index === 0) {
+    updateNodeStroke(nodeId, patch);
+    return;
+  }
+  const stack = getNodeStrokes(nodeId);
+  const current = stack[index];
+  if (!current) return;
+  const next = [...stack];
+  next[index] = normalizeStroke({ ...current, ...patch });
+  setNodeStrokes(nodeId, next);
+}
+
+/**
+ * Remove the stroke at `index` AND re-key the tracks of every stroke above it.
+ *
+ * Stroke tracks are index-scoped (`strokeTracks.ts`), so deleting stroke 2 of 3
+ * without this would leave stroke 3's keyframes on `stroke.2.*` — the old
+ * stroke 3 would lose its animation and nothing would own stroke 2's leftover
+ * tracks. The removed stroke's own tracks are dropped with it.
+ */
+export function removeNodeStrokeAt(nodeId: string, index: number): void {
+  const stack = getNodeStrokes(nodeId);
+  if (index < 0 || index >= stack.length) return;
+  const byProp = new Map(defaultAnimation.tracksFor(nodeId).map((t) => [t.prop, t]));
+  defaultAnimation.batch(() => {
+    for (const prop of strokeTrackPathsFor(index)) if (byProp.has(prop)) defaultAnimation.removeTrack(nodeId, prop);
+    for (let j = index + 1; j < stack.length; j++) {
+      const from = strokeTrackPathsFor(j);
+      const to = strokeTrackPathsFor(j - 1);
+      from.forEach((prop, k) => {
+        const track = byProp.get(prop);
+        if (!track) return;
+        defaultAnimation.setKeyframes(nodeId, to[k]!, track.keyframes);
+        defaultAnimation.removeTrack(nodeId, prop);
+      });
+    }
+  });
+  setNodeStrokes(nodeId, stack.filter((_, i) => i !== index));
 }

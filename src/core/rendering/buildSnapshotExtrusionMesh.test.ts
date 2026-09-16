@@ -103,6 +103,71 @@ describe('buildSnapshot — colour LUT on the mesh extrusion', () => {
   });
 });
 
+/**
+ * A STYLED complex outline (text, path). Layer styles compile to effects, so a
+ * drop shadow or a stroke used to trip the spatial-effect gate and send a text
+ * or path to the SLICE STACK — hundreds of flat copies lit as fronts, which is
+ * what "adding a style breaks 3D text" looked like. The solid now stays: the
+ * body takes the colour grades, the full-size front quad takes every style.
+ * (Pinned on a path: jsdom has no canvas to trace text from.)
+ */
+describe('buildSnapshot — styled text/path keeps its solid', () => {
+  function styledPath(styles: Record<string, unknown>, extra: Record<string, unknown> = {}): SceneNode {
+    return {
+      id: 'p', name: 'p', parent: null, children: [], visible: true, locked: false,
+      transform: { position: { x: 400, y: 300 }, rotation: 0, scale: { x: 1, y: 1 } },
+      components: [
+        { id: 'p_t', type: 'Transform', props: { [SCENE_KIND_PROP]: 'shape', shapeType: 'path', x: 400, y: 300, rotation: 0, width: 120, height: 120, z: 0, extrusionDepth: 40, ...extra } },
+        {
+          id: 'p_g', type: 'Geometry',
+          props: {
+            points: [
+              { x: 0, y: -60, inX: 0, inY: -60, outX: 0, outY: -60 },
+              { x: 60, y: 60, inX: 60, inY: 60, outX: 60, outY: 60 },
+              { x: -60, y: 60, inX: -60, inY: 60, outX: -60, outY: 60 },
+            ],
+          },
+        },
+        { id: 'p_s', type: 'Style', props: { opacity: 100, fill: '#2b7eff' } },
+        { id: 'p_fx', type: 'fx', props: { layerStyles: styles } },
+      ],
+    } as unknown as SceneNode;
+  }
+  const SHADOW = { enabled: true, color: '#000000', opacity: 0.5, distance: 8, angle: 90, blur: 8, spread: 0 };
+  const STROKE = { enabled: true, color: '#ffffff', opacity: 1, size: 3, position: 'outside' };
+
+  it('a drop shadow + stroke keep ONE mesh body and no slices; the front quad carries the styles', () => {
+    const g = new SceneGraph();
+    g.addNode(styledPath({ dropShadow: SHADOW, stroke: STROKE }));
+    const layers = snap(g).layers;
+    expect(layers.map((l) => l.id)).toEqual(['p::ext-mesh', 'p']);
+    const [body, front] = layers;
+    // The carrier holds nothing it cannot draw.
+    expect((body!.effects ?? []).some((e) => e.type === 'drop-shadow')).toBe(false);
+    expect(front!.effects?.some((e) => e.type === 'drop-shadow')).toBe(true);
+    // And the object stays one depth-tested solid.
+    const scene = snapshotToFrameScene(snap(g));
+    expect(scene.renderables.some((r) => r.id === 'p::ext-mesh')).toBe(true);
+  });
+
+  it('a bevelled styled path: the full-size front quad draws the face, the mesh chamfers the back only', () => {
+    const g = new SceneGraph();
+    g.addNode(styledPath({ stroke: STROKE }, { bevelDepth: 4 }));
+    const layers = snap(g).layers;
+    expect(layers.map((l) => l.id)).toEqual(['p::ext-mesh', 'p']);
+    const body = layers[0]!;
+    expect(body.extrudedMesh!.ranges.some((r) => r.role === 'front')).toBe(false);
+    // Not inset: nothing would meet a smaller quad's edge.
+    expect(layers[1]!.width).toBe(120);
+    // Every chamfer vertex sits at the BACK (z ≥ depth − bevel).
+    const bevel = body.extrudedMesh!.ranges.find((r) => r.role === 'bevel')!;
+    const { vertices, indices } = body.extrudedMesh!;
+    for (let i = bevel.first; i < bevel.first + bevel.count; i++) {
+      expect(vertices[indices[i]! * MESH_VERTEX_FLOATS + 2]!).toBeGreaterThan(40 - 4 - 1e-3);
+    }
+  });
+});
+
 describe('buildSnapshot — mesh extrusion', () => {
   it('extrusion > 0 emits ONE mesh carrier immediately before the front face', () => {
     const g = new SceneGraph();

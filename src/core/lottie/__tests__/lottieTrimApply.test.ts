@@ -60,7 +60,7 @@ describe('Lottie trim paths → trim operator', () => {
     expect(op).not.toBeNull();
     expect(op!.start).toBe(0);
     expect(op!.offset).toBeCloseTo(25); // 90° = a quarter turn
-    expect(op!.trimMultiple).toBe('simultaneously');
+    expect(op!.trimMultipleShapes).toBe('simultaneously');
 
     const endProp = pathOpPropPath(op!.id, 'end');
     expect(defaultAnimation.isAnimated(node.id, endProp)).toBe(true);

@@ -9,7 +9,8 @@ import { SCENE_KIND_PROP } from '@core/scene/seedDefaultScene';
 import { world2DAt } from '@core/scene/layerSpace';
 import { Matrix } from '@motion/scene';
 import type { SceneNode } from '@core/types';
-import { createNullsFromPath, pathVertices } from './nullsFromPaths';
+import { setCommandSystem, getCommandSystem, CommandSystem } from '@core/commands/CommandSystem';
+import { createNullsFromPath, createNullsFromPathUndoable, pathVertices } from './nullsFromPaths';
 
 function triangle(id: string, x: number, y: number, rotation = 0): SceneNode {
   return {
@@ -52,6 +53,26 @@ it('does nothing for a non-shape or a primitive with no vertices', () => {
     { id: 'r_t', type: 'Transform', props: { [SCENE_KIND_PROP]: 'shape', x: 0, y: 0, shapeType: 'rect', width: 10, height: 10 } },
   ] });
   expect(createNullsFromPath('r', 0)).toEqual([]);
+});
+
+describe('Create Nulls From Paths is one undo step', () => {
+  it('records exactly one labelled entry, and none when nothing was made', () => {
+    setCommandSystem(new CommandSystem({ services: {} as never, getState: () => ({}) }));
+    const history = getCommandSystem().getHistory();
+    defaultSceneGraph.addNode(triangle('t', 0, 0));
+    const before = history.getEntries().length;
+
+    const ids = createNullsFromPathUndoable('t', 0);
+    expect(ids).toHaveLength(3);
+    expect(history.getEntries()).toHaveLength(before + 1);
+    expect(history.peek()?.label).toBe('Create Nulls From Path Points');
+
+    defaultSceneGraph.addNode({ ...triangle('r', 0, 0), components: [
+      { id: 'r_t', type: 'Transform', props: { [SCENE_KIND_PROP]: 'shape', x: 0, y: 0, shapeType: 'rect', width: 10, height: 10 } },
+    ] });
+    expect(createNullsFromPathUndoable('r', 0)).toEqual([]);
+    expect(history.getEntries()).toHaveLength(before + 1);
+  });
 });
 
 describe('points follow nulls', () => {

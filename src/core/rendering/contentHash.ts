@@ -40,6 +40,12 @@ export const CONTENT_HASH_VERSION = 3;
 // contentOf constructs every object with a fixed literal order, which is the
 // same assumption the JSON scheme already leaned on.
 
+// Bound once. Resolving the global `Math` on every mix is free in a browser
+// but not in every host: under jest's vm-context globals it cost ~120 ns per
+// lookup, which made this leaf ~30× slower in the benches than in the app and
+// buried every other number in `npm run bench`. Identical results either way.
+const imul = Math.imul;
+
 const f64Scratch = new Float64Array(1);
 const u32Scratch = new Uint32Array(f64Scratch.buffer);
 
@@ -53,49 +59,49 @@ const TAG_ARR = 0x61727200;
 const TAG_OBJ = 0x6f626a00;
 const TAG_END = 0x656e6400;
 
-// The mix is written inline everywhere (`h = Math.imul(h ^ w, 0x01000193)`)
+// The mix is written inline everywhere (`h = imul(h ^ w, 0x01000193)`)
 // rather than through a helper: this leaf runs hundreds of times per layer per
 // frame and the call itself was the measurable cost.
 function hashUnknown(h: number, v: unknown): number {
-  if (v === null) return Math.imul(h ^ TAG_NULL, 0x01000193);
+  if (v === null) return imul(h ^ TAG_NULL, 0x01000193);
   switch (typeof v) {
     case 'undefined':
-      return Math.imul(h ^ TAG_UNDEF, 0x01000193);
+      return imul(h ^ TAG_UNDEF, 0x01000193);
     case 'boolean':
-      return Math.imul(h ^ (v ? TAG_TRUE : TAG_FALSE), 0x01000193);
+      return imul(h ^ (v ? TAG_TRUE : TAG_FALSE), 0x01000193);
     case 'number':
       f64Scratch[0] = v;
-      h = Math.imul(h ^ TAG_NUM, 0x01000193);
-      h = Math.imul(h ^ u32Scratch[0]!, 0x01000193);
-      return Math.imul(h ^ u32Scratch[1]!, 0x01000193);
+      h = imul(h ^ TAG_NUM, 0x01000193);
+      h = imul(h ^ u32Scratch[0]!, 0x01000193);
+      return imul(h ^ u32Scratch[1]!, 0x01000193);
     case 'string': {
-      h = Math.imul(h ^ TAG_STR, 0x01000193);
-      h = Math.imul(h ^ v.length, 0x01000193);
-      for (let i = 0; i < v.length; i++) h = Math.imul(h ^ v.charCodeAt(i), 0x01000193);
+      h = imul(h ^ TAG_STR, 0x01000193);
+      h = imul(h ^ v.length, 0x01000193);
+      for (let i = 0; i < v.length; i++) h = imul(h ^ v.charCodeAt(i), 0x01000193);
       return h;
     }
     case 'object': {
       if (Array.isArray(v)) {
-        h = Math.imul(h ^ TAG_ARR, 0x01000193);
-        h = Math.imul(h ^ v.length, 0x01000193);
+        h = imul(h ^ TAG_ARR, 0x01000193);
+        h = imul(h ^ v.length, 0x01000193);
         for (let i = 0; i < v.length; i++) h = hashUnknown(h, v[i]);
-        return Math.imul(h ^ TAG_END, 0x01000193);
+        return imul(h ^ TAG_END, 0x01000193);
       }
-      h = Math.imul(h ^ TAG_OBJ, 0x01000193);
+      h = imul(h ^ TAG_OBJ, 0x01000193);
       const o = v as Record<string, unknown>;
       for (const k in o) {
         const val = o[k];
         // JSON.stringify dropped undefined-valued keys; keep that shape so
         // optional fields present-but-undefined hash like absent ones.
         if (val === undefined) continue;
-        h = Math.imul(h ^ TAG_STR, 0x01000193);
-        for (let i = 0; i < k.length; i++) h = Math.imul(h ^ k.charCodeAt(i), 0x01000193);
+        h = imul(h ^ TAG_STR, 0x01000193);
+        for (let i = 0; i < k.length; i++) h = imul(h ^ k.charCodeAt(i), 0x01000193);
         h = hashUnknown(h, val);
       }
-      return Math.imul(h ^ TAG_END, 0x01000193);
+      return imul(h ^ TAG_END, 0x01000193);
     }
     default:
-      return Math.imul(h ^ TAG_UNDEF, 0x01000193);
+      return imul(h ^ TAG_UNDEF, 0x01000193);
   }
 }
 

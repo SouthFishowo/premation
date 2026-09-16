@@ -183,7 +183,7 @@ describe('a scrub on one layer', () => {
 /*
  * `React.memo` is the third leg. Without it the subscription work above is
  * wasted: the panel shell re-renders for its own reasons (a selection change,
- * a sub-tab switch) and hands every section identical props, and an unmemoized
+ * a search keystroke) and hands every section identical props, and an unmemoized
  * section re-renders anyway. These are identity assertions rather than render
  * counts because that is exactly what React checks at the boundary.
  */

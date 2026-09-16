@@ -514,6 +514,16 @@ export class Workspace implements InputSink {
     this.reconcile();
     return handled;
   }
+
+  /**
+   * The chords the active tool wants kept from the host's global shortcuts
+   * right now — see `Tool.claimedKeys`. The host mirrors this onto the viewport
+   * element's `data-shortcut-claim`, which is how the editor's capture-phase
+   * dispatcher is told to let a key through to the viewport.
+   */
+  toolClaimedKeys(): readonly string[] {
+    return this.tools.activeTool?.claimedKeys?.() ?? [];
+  }
   onKeyUp(e: KeyInput): void {
     if (e.code === 'Space') this.releaseTemporaryTool();
     this.tools.onKeyUp(e);
@@ -812,17 +822,22 @@ export class Workspace implements InputSink {
     const activeTool = this.tools.activeTool;
     const ctx = this.makeToolContext();
     const hoveredHandle = activeTool?.hoveredHandleId?.() ?? null;
-    const decorate = (h: { id: string; position: Vec2; kind: OverlayHandle['kind'] }): OverlayHandle => ({
+    const decorate = (h: OverlayHandle): OverlayHandle => ({
       id: h.id,
       position: this.worldToScreen(h.position),
       kind: h.kind,
       ...(h.id === hoveredHandle ? { hovered: true } : {}),
+      // Path-editing flags ride through untouched; `origin` is a world point
+      // like `position`, so it is projected the same way.
+      ...(h.selected ? { selected: true } : {}),
+      ...(h.first ? { first: true } : {}),
+      ...(h.origin ? { origin: this.worldToScreen(h.origin) } : {}),
     });
     const handles: OverlayHandle[] = activeTool?.getHandles
       ? activeTool.getHandles(ctx).map(decorate)
       : this.selectionController.handles().map(decorate);
 
-    const marqueeWorld = this.selectionController.marqueeRect;
+    const marqueeWorld = activeTool?.getMarquee?.() ?? this.selectionController.marqueeRect;
     const marquee = marqueeWorld ? this.worldRectToScreen(marqueeWorld) : null;
 
     const snapLines: SnapLine[] = this.snapLines.map((l) => this.snapLineToScreen(l));
@@ -857,6 +872,12 @@ export class Workspace implements InputSink {
     const hud = activeTool?.getHud?.(ctx) ?? null;
     const dragHud = hud ? { anchor: this.worldToScreen(hud.anchorWorld), lines: hud.lines } : null;
 
+    // Free Transform Points box, projected corner by corner like the selection boxes.
+    const box = activeTool?.getTransformBox?.(ctx) ?? null;
+    const pathTransformBox = box
+      ? { corners: this.cornersToScreen(box.corners), anchor: this.worldToScreen(box.anchor) }
+      : null;
+
     return {
       selectionBounds,
       selectionBoxes,
@@ -869,6 +890,7 @@ export class Workspace implements InputSink {
       pendingPath,
       dragHud,
       smartGuides: this.buildSmartGuides(),
+      pathTransformBox,
     };
   }
 

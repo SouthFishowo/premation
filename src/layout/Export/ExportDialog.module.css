@@ -443,12 +443,23 @@
 .shellPanel {
   height: auto;
   min-height: 0;
+  margin: 0;
 }
 
 .layoutStacked {
   grid-template-columns: 1fr;
   height: auto;
   max-height: none;
+  padding: var(--space-4) var(--space-6);
+  gap: var(--space-4);
+  box-sizing: border-box;
+  width: 100%;
+}
+
+.layoutStacked .previewCol,
+.layoutStacked .settingsCol {
+  overflow: visible;
+  padding-right: 0;
 }
 
 /* The in-form Cancel during an export — a plain secondary button, sized to

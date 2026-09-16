@@ -51,6 +51,7 @@ import pluginHost from '@core/plugins/PluginHost';
 import { usePluginStore } from '@stores/pluginStore';
 import { reconcileInstalledSet, installInstalledSyncSink } from '@core/plugins/installedSync';
 import { showPluginPanel, hidePluginPanel } from '@layout/Plugins/PluginPanel';
+import { activatePluginTool, installPluginToolBridge } from '@core/workspace/pluginToolBridge';
 import { openExportDialog } from '@layout/Export/ExportDialog';
 import { usePresentationStore } from '@stores/presentationStore';
 import { useGuidesStore } from '@stores/guidesStore';
@@ -61,7 +62,7 @@ import { getEventBus } from '@core/events/EventBus';
 import { getThemeManager, getProjectManager, getLoadingManager, getSettingsManager, getFileManager } from '@core/services/coreServices';
 import { LoadingScreen } from '@components/LoadingScreen';
 import { isLocalFirst } from '@core/config/flags';
-import { cloudProjectsEnabled, pluginsEnabled } from '@core/config/edition';
+import { cloudProjectsEnabled, pluginRegistryEnabled, pluginsEnabled } from '@core/config/edition';
 import { chooseBundleDir, bundleDirPickerAvailable } from '@core/project/bundle/bundleProjectIO';
 import { OnboardingOverlay } from '@layout/Onboarding/OnboardingOverlay';
 import { useOnboardingStore } from '@stores/onboardingStore';
@@ -148,7 +149,8 @@ import { runSceneEditDetection, type SceneEditMode } from '@core/tracking/sceneE
 import { getWorkspaceManager } from '@core/layout/workspaceManager';
 import { findNavTarget } from '@core/workspace/cameraNav';
 import { insertNull, arrangeNodes } from '@core/scene/parenting';
-import { createNullsFromPath, pathVertices } from '@core/scene/nullsFromPaths';
+import { createNullsFromPathUndoable, pathVertices } from '@core/scene/nullsFromPaths';
+import { buildPathCommands } from '@core/workspace/pathCommands';
 import { createShapesFromText, canCreateShapesFromText } from '@core/scene/shapesFromText';
 import { autoTraceLayer } from '@core/effects/autoTrace';
 import { fitNodeTo, centreAnchorInContent, centreInFrame } from '@core/source/fitCommands';
@@ -370,6 +372,13 @@ function buildToolCommands(): ReadonlyArray<Command> {
     { tool: 'paint', label: 'Paint Tool' },
     { tool: 'eraser', label: 'Eraser Tool' },
     { tool: 'mask-pen', label: 'Pen Mask Tool' },
+    // AE's Pen flyout. No chords of their own: AE reaches them from the Pen
+    // (hover a segment / a vertex, or hold Alt), and G cycles Pen ⇄ Mask
+    // Feather — see `tool.pen` below.
+    { tool: 'add-vertex', label: 'Add Vertex Tool' },
+    { tool: 'delete-vertex', label: 'Delete Vertex Tool' },
+    { tool: 'convert-vertex', label: 'Convert Vertex Tool' },
+    { tool: 'mask-feather', label: 'Mask Feather Tool' },
   ];
   // Every tool used 'crosshair', so the palette/menus showed eleven identical
   // icons — give each tool its actual glyph.
@@ -398,6 +407,10 @@ function buildToolCommands(): ReadonlyArray<Command> {
     star: 'star',
     'mask-rect': 'mask-square',
     'mask-ellipse': 'mask-circle',
+    'add-vertex': 'plus',
+    'delete-vertex': 'minus',
+    'convert-vertex': 'ease',
+    'mask-feather': 'blur',
   };
   return tools.map(({ tool, label, chord }) => ({
     id: asCommandId(`tool.${tool}`),
@@ -407,9 +420,17 @@ function buildToolCommands(): ReadonlyArray<Command> {
     enabled: () => true,
     execute: () => {
       const ui = useUIStore.getState();
+      // Ctrl+B belongs to the paint tools while one is up (AE's Brush / Clone
+      // Stamp / Eraser cycle, `layout/Paint/paintTool.ts`), not to Bone.
+      if (tool === 'bone' && (ui.activeTool === 'paint' || ui.activeTool === 'eraser')) return;
       // AE: with a Type tool already active, Ctrl+T switches to the other one.
       if (tool === 'text' && (ui.activeTool === 'text' || ui.activeTool === 'vertical-text')) {
         ui.setActiveTool(ui.activeTool === 'text' ? 'vertical-text' : 'text');
+        return;
+      }
+      // AE: G with the Pen (or Mask Feather) already active cycles the two.
+      if (tool === 'pen' && (ui.activeTool === 'pen' || ui.activeTool === 'mask-feather')) {
+        ui.setActiveTool(ui.activeTool === 'pen' ? 'mask-feather' : 'pen');
         return;
       }
       ui.setActiveTool(tool);
@@ -1351,6 +1372,7 @@ export function buildStaticCommands(): ReadonlyArray<Command> {
   return [
     ...buildBuiltinCommands(),
     ...buildToolCommands(),
+    ...buildPathCommands(),
     ...buildCameraToolCommands(),
     ...buildViewSwitchCommands(),
     ...buildMarkerCommands(),
@@ -1616,7 +1638,8 @@ function buildProjectCommands(): ReadonlyArray<Command> {
       execute: () => {
         const id = useSelectionStore.getState().ids[0];
         if (!id) return;
-        const made = createNullsFromPath(id, getTimelineController().currentSeconds);
+        // One labelled undo step for the nulls, their parenting and bindings.
+        const made = createNullsFromPathUndoable(id, getTimelineController().currentSeconds);
         notify(made.length ? `Created ${made.length} null${made.length === 1 ? '' : 's'} on the path` : 'No path points to create nulls from', made.length ? 'success' : 'warning');
       },
     },
@@ -1633,7 +1656,7 @@ function buildProjectCommands(): ReadonlyArray<Command> {
       execute: () => {
         const id = useSelectionStore.getState().ids[0];
         if (!id) return;
-        const made = createNullsFromPath(id, getTimelineController().currentSeconds, { pointsFollowNulls: true });
+        const made = createNullsFromPathUndoable(id, getTimelineController().currentSeconds, { pointsFollowNulls: true });
         notify(made.length ? `${made.length} null${made.length === 1 ? '' : 's'} now drive the path — move one and the outline follows` : 'No path points to create nulls from', made.length ? 'success' : 'warning');
       },
     },
@@ -2452,8 +2475,11 @@ export function Providers({ children }: ProvidersProps): JSX.Element {
           // brings up every enabled plugin and starts the ones that asked.
           if (pluginsEnabled()) {
             // Before hydrate, so nothing the reconcile or the user does next
-            // is announced into a no-op sink.
-            installInstalledSyncSink();
+            // is announced into a no-op sink. ACCOUNT sync only — a local build
+            // has no account, so its sink stays the no-op and local-file
+            // installs never try to announce themselves anywhere.
+            const accountSync = pluginRegistryEnabled();
+            if (accountSync) installInstalledSyncSink();
             await usePluginStore.getState().hydrate();
             /*
               Reconcile against the ACCOUNT's installed set.
@@ -2469,9 +2495,11 @@ export function Providers({ children }: ProvidersProps): JSX.Element {
               anything locally — see `installedSync.ts`, where that is the
               load-bearing rule.
             */
-            void reconcileInstalledSet(usePluginStore.getState().plugins)
-              .then((report) => usePluginStore.getState().noteSync(report))
-              .catch(() => undefined);
+            if (accountSync) {
+              void reconcileInstalledSet(usePluginStore.getState().plugins)
+                .then((report) => usePluginStore.getState().noteSync(report))
+                .catch(() => undefined);
+            }
             pluginHost.configure({
               getSelection: () => useSelectionStore.getState().ids,
               // What makes `motion.ui.openPanel()` real. The host cannot import
@@ -2479,7 +2507,14 @@ export function Providers({ children }: ProvidersProps): JSX.Element {
               // shell hands it the two calls it needs.
               showPanel: (id, panelId) => showPluginPanel(id, panelId),
               hidePanel: (id, panelId) => hidePluginPanel(id, panelId),
+              // A contributed tool is selected through the same bridge the
+              // toolbar uses, so the palette, the Plugins menu and the strip
+              // all end up in one state rather than three.
+              activateTool: (id, toolId) => activatePluginTool(id, toolId),
             });
+            // Picking any built-in tool stands the plugin tool down — one tool
+            // at a time, which is what a toolbar means.
+            installPluginToolBridge();
           }
           const registry = getCommandRegistry();
           registry.register({
@@ -2614,6 +2649,32 @@ export function Providers({ children }: ProvidersProps): JSX.Element {
             enabled: () => true,
             execute: () => useLayoutStore.getState().openPanel('audio'),
           });
+          // Window ▸ Panels — one opener per panel that went on demand when
+          // the rails were cut to the everyday set (2026-09-15; see the
+          // header of `panelDefs.ts`). Written out as literal ids, not built
+          // from PANEL_DEFS: `onDemandPanelsReachable.test.ts` greps for the
+          // id, and the menu model names each command statically.
+          for (const p of [
+            { id: 'view.scene', panel: 'scene', label: 'Layers', icon: 'layers' },
+            { id: 'view.character', panel: 'character', label: 'Text', icon: 'type' },
+            { id: 'view.align', panel: 'align', label: 'Align', icon: 'align-center' },
+            { id: 'view.swatches', panel: 'swatches', label: 'Swatches', icon: 'palette' },
+            { id: 'view.info', panel: 'info', label: 'Info', icon: 'info' },
+            { id: 'view.scopes', panel: 'scopes', label: 'Scopes', icon: 'waves' },
+            { id: 'view.preview', panel: 'preview', label: 'Preview', icon: 'play' },
+            { id: 'view.sourceMonitor', panel: 'sourceMonitor', label: 'Source Monitor', icon: 'tv' },
+            { id: 'view.tracker', panel: 'tracker', label: 'Tracker', icon: 'crosshair' },
+            { id: 'view.rig', panel: 'rig', label: 'Rigging', icon: 'bone' },
+            { id: 'view.effects', panel: 'effects', label: 'Effects', icon: 'magic-wand' },
+            { id: 'view.motion', panel: 'motion', label: 'Graph Panel', icon: 'graph-value' },
+            { id: 'view.presets', panel: 'presets', label: 'Presets', icon: 'zap' },
+          ] as const) {
+            registry.register({
+              id: asCommandId(p.id), label: p.label, icon: p.icon,
+              enabled: () => true,
+              execute: () => useLayoutStore.getState().openPanel(p.panel),
+            });
+          }
           registry.register({
             id: asCommandId('help.tour'), label: 'Take a Tour', icon: 'tour',
             enabled: () => true, execute: () => useOnboardingStore.getState().start(),

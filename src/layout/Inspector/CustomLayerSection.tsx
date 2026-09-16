@@ -259,7 +259,7 @@ function PropRow({
       return (
         <div className={styles.popoverRow}>
           <span className={styles.popoverLabel}>{label}</span>
-          <Checkbox checked={value === true} onChange={(v) => write(v)} aria-label={label} />
+          <Checkbox checked={value === true} onChange={(e) => write(e.target.checked)} aria-label={label} />
         </div>
       );
 

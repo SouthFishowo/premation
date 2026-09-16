@@ -49,8 +49,10 @@ describe('auto-orient is offered only where it is read', () => {
     const src = readSource('core/rendering/buildSnapshot.ts');
 
     // The drawn-layer loop's top-of-loop bail. Extracted rather than restated,
-    // so editing the loop moves this test's expectation with it.
-    const skip = /if \(kind === 'group'[^)]*\) continue;/.exec(src)?.[0];
+    // so editing the loop moves this test's expectation with it. `continue` or
+    // `return`: the per-layer body became `buildLayerNode` (one throwing layer
+    // is skipped, not the frame), so its bail is a `return` — same skip.
+    const skip = /if \(kind === 'group'[^)]*\) (?:continue|return);/.exec(src)?.[0];
     expect(skip).toBeTruthy();
     const skipped = [...(skip as string).matchAll(/kind === '(\w+)'/g)].map((m) => m[1]);
     expect(skipped.sort()).toEqual(['audio', 'camera', 'group', 'null']);

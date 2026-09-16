@@ -129,6 +129,15 @@ export interface RenderBackend {
    * unattributable and the frame is already lost.
    */
   shaderDiagnostics?(label: string, wgsl: string): Promise<string[]>;
+  /**
+   * The GLSL twin of {@link shaderDiagnostics}, for a plugin effect's GLSL ES
+   * 3.0 kernel on the WebGL2 tier.
+   *
+   * Takes both stages because it LINKS them: a fragment stage reading a varying
+   * the vertex stage does not write is two sources that each compile and one
+   * program that does not.
+   */
+  glslDiagnostics?(label: string, vertex: string, fragment: string): Promise<string[]>;
 
   createPipeline(desc: PipelineDescriptor): PipelineHandle;
   destroyPipeline(pipeline: PipelineHandle): void;
@@ -163,6 +172,17 @@ export interface RenderBackend {
   setFrameClip?(rect: { x: number; y: number; width: number; height: number } | null): void;
   /** Present the frame to the surface (no-op for offscreen/null). */
   present(): void;
+  /**
+   * End a render pass that was begun and never ended, because the code drawing
+   * into it threw.
+   *
+   * Optional: only WebGPU needs it. A GPURenderPassEncoder left open makes the
+   * frame's `encoder.finish()` invalid, so ONE throwing pass would otherwise
+   * lose every pass before it too — the per-pass error guard in RenderGraph
+   * would skip the failing pass and still present nothing. WebGL2 has no pass
+   * object to close (the next pass simply rebinds its framebuffer).
+   */
+  abortOpenPass?(): void;
   /**
    * Optional float readback of a render target (linear working-space RGBA).
    * Used by EXR export. Backends without float RT support return null.

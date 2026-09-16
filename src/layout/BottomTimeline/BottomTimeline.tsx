@@ -22,7 +22,10 @@ import { TransitionPalette, TransitionsMenu } from '@layout/Timeline/transitionP
 import { useTransportDemote } from '@layout/Workspace/useTransportDemote';
 import { cn } from '@utils/cn';
 import { useWorkspaceStore } from '@stores/projectStore';
-import { useCurrentTime } from '@stores/playbackClockStore';
+import { useCurrentTime, useThrottledTime, getTime as getPlayheadTime } from '@stores/playbackClockStore';
+import { LiveTimecode } from '@layout/Timeline/LiveTimecode';
+import { useLivePlayhead } from '@layout/Timeline/useLivePlayhead';
+import type { GraphEditorProps } from '@layout/Timeline/GraphEditor';
 import { useLayoutStore } from '@stores/layoutStore';
 import { useSelectionStore } from '@stores/selectionStore';
 import { usePropertySelectionStore } from '@stores/propertySelectionStore';
@@ -128,6 +131,28 @@ function useClientLeft(ref: RefObject<HTMLElement | null>, key: unknown): number
 
 const ROW_HEIGHT_LABEL: Record<number, string> = { 28: 'Compact', 36: 'Normal', 46: 'Tall' };
 
+/** The navigator playhead's CSS `left`, as a percentage of the comp. */
+function navPlayheadLeft(time: number, duration: number): string {
+  return `${Math.min(100, Math.max(0, (time / (duration || 1)) * 100))}%`;
+}
+
+/**
+ * The Graph Editor, fed the LIVE playhead.
+ *
+ * It draws its own playhead line and snaps drags to it, and it is only mounted
+ * while open — so it keeps its per-tick re-render, scoped to itself, rather
+ * than inheriting the panel's throttled display time. `live` is false for an
+ * embed with no tab, which keeps the model's time.
+ */
+function GraphEditorAtPlayhead({
+  live,
+  fallbackTime,
+  ...props
+}: Omit<GraphEditorProps, 'currentTime'> & { live: boolean; fallbackTime: number }): JSX.Element {
+  const liveTime = useCurrentTime();
+  return <GraphEditor {...props} currentTime={live ? liveTime : fallbackTime} />;
+}
+
 export function BottomTimeline(props: BottomTimelineProps): JSX.Element {
   const { className, transport, ...timelineProps } = props;
   const ws = useWorkspaceStore((s) => (s.activeTabId ? s.tabs[s.activeTabId] : null));
@@ -196,10 +221,14 @@ export function BottomTimeline(props: BottomTimelineProps): JSX.Element {
   // project, so it belongs in preferences and not in the document.
   const rowTrackHeight = usePreferenceStore((s) => s.timelineRowHeight);
 
-  // The live clock (playbackClockStore), not the tab record — that record is
-  // only a ≤4Hz mirror while playing. No tab at all falls back to the model.
-  const liveTime = useCurrentTime();
-  const playheadTime = ws ? liveTime : timelineProps.model.currentTime;
+  // The DISPLAY clock, not the live one: exact while paused, ≤10 Hz while
+  // playing. Everything that must move every frame — the playhead line, the
+  // ruler fill, the timecode, the navigator's playhead — follows the live
+  // clock imperatively (`livePlayhead`, `LiveTimecode`, `useLivePlayhead`), so
+  // playback no longer re-renders this panel and the whole row tree 60×/s.
+  // No tab at all falls back to the model.
+  const displayTime = useThrottledTime();
+  const playheadTime = ws ? displayTime : timelineProps.model.currentTime;
   const model = useMemo<TimelineProps['model']>(
     () => ({ ...timelineProps.model, trackHeight: rowTrackHeight }),
     [timelineProps.model, rowTrackHeight],
@@ -208,7 +237,17 @@ export function BottomTimeline(props: BottomTimelineProps): JSX.Element {
     ...timelineProps,
     model,
     playheadTime,
+    livePlayhead: !!ws,
   };
+
+  // The navigator's playhead tick, moved every frame without a render.
+  const navPlayheadRef = useRef<HTMLDivElement | null>(null);
+  const navDurationRef = useRef(props.model.duration);
+  navDurationRef.current = props.model.duration;
+  useLivePlayhead((t) => {
+    const el = navPlayheadRef.current;
+    if (el) el.style.left = navPlayheadLeft(t, navDurationRef.current);
+  }, !!ws);
 
   const proportionalScrub = usePropertySelectionStore((s) => s.proportional);
   const setProportionalScrub = usePropertySelectionStore((s) => s.setProportional);
@@ -615,7 +654,7 @@ export function BottomTimeline(props: BottomTimelineProps): JSX.Element {
                   type="text"
                   className={styles.timecodeInput}
                   aria-label="Go to time"
-                  defaultValue={framesToTimecode(playheadTime, fps, startFrame)}
+                  defaultValue={framesToTimecode(ws ? getPlayheadTime() : playheadTime, fps, startFrame)}
                   onBlur={() => setGoToOpen(false)}
                   onKeyDown={(e) => {
                     if (e.key === 'Escape') {
@@ -626,7 +665,7 @@ export function BottomTimeline(props: BottomTimelineProps): JSX.Element {
                     if (e.key !== 'Enter') return;
                     e.stopPropagation();
                     const sec = parseGoToTime(e.currentTarget.value, {
-                      currentSeconds: playheadTime,
+                      currentSeconds: ws ? getPlayheadTime() : playheadTime,
                       fps,
                       startFrame,
                       durationSeconds: props.model.duration,
@@ -642,11 +681,11 @@ export function BottomTimeline(props: BottomTimelineProps): JSX.Element {
                   title="Current timecode — click to type a time (1:04, 320f, 2.5s, +10)"
                   onClick={() => setGoToOpen(true)}
                 >
-                  {framesToTimecode(playheadTime, fps, startFrame)}
+                  {ws ? <LiveTimecode fps={fps} startFrame={startFrame} /> : framesToTimecode(playheadTime, fps, startFrame)}
                 </button>
               )}
               <span className={styles.timecodeSub}>
-                {String(Math.round(playheadTime * fps)).padStart(5, '0')} ({fps.toFixed(2)} fps)
+                {ws ? <LiveTimecode fps={fps} format="frames" /> : String(Math.round(playheadTime * fps)).padStart(5, '0')} ({fps.toFixed(2)} fps)
               </span>
             </div>
 
@@ -755,10 +794,11 @@ export function BottomTimeline(props: BottomTimelineProps): JSX.Element {
               {/* The playhead is drawn UNDER the window so the window's own
                   edges stay the two things you can aim at. */}
               <div
+                ref={navPlayheadRef}
                 className={styles.timeNavPlayhead}
-                style={{
-                  left: `${Math.min(100, Math.max(0, (playheadTime / (props.model.duration || 1)) * 100))}%`,
-                }}
+                // With a tab, `left` is the live subscription's (below) — a
+                // React-managed value would be the throttled one.
+                style={ws ? undefined : { left: navPlayheadLeft(playheadTime, props.model.duration) }}
               />
               <div
                 className={styles.timeNavigatorWindow}
@@ -796,10 +836,11 @@ export function BottomTimeline(props: BottomTimelineProps): JSX.Element {
 
         {/* Graph Editor panel — full height view replacing track rows below the header toolbar when toggled */}
         {graphEditorOpen && (
-          <GraphEditor
+          <GraphEditorAtPlayhead
+            live={!!ws}
+            fallbackTime={playheadTime}
             selectedNodeIds={selectedIds}
             propertyFilter={searchQuery}
-            currentTime={playheadTime}
             duration={props.model.duration}
             pixelsPerSecond={pps}
             scrollLeft={scrollLeft}

@@ -32,6 +32,7 @@ import {
   Mat,
   Rect,
   OBox,
+  applyPathTopology,
 } from '@motion/workspace';
 import { cutPathsWithLine, runFromPolygon, type CutSubpath, type CutPoint } from '@core/geometry/pathCut';
 import { shapeOutline } from '@core/scene/pathOps';
@@ -60,6 +61,7 @@ import { readGeometry, localBounds, makeHitTestLocal, isDrawableKind as drawable
 import { usePreferenceStore } from '@stores/preferenceStore';
 import { defaultAnimation } from '@motion/animation';
 import { drawToolOptions } from '@motion/workspace';
+import { newShapeFill, newShapeStroke } from '@core/workspace/shapeToolPaint';
 import { gestureAnimEdit, gestureSceneBump } from '@core/workspace/viewportGesture';
 import { useProjectStore } from '@stores/projectStore';
 import { compToKeyframeTime, getRemappedTime, getTimelineController, governingClipsFor } from '@core/timeline/TimelineController';
@@ -68,7 +70,7 @@ import { Matrix4Math, Project3D } from '@motion/scene';
 import { currentViewProjector, currentViewCamera } from '@core/workspace/viewProjection';
 import { orthoViewOf } from '@core/scene/cameraViewMode';
 import { composeNodeWorld3d, parentWorld3d, resolveNode3DTransform } from '@core/scene/nodeMatrix';
-import { addMaskPath, rectangleMask, ellipseMask, readNodeMask, readNodeMaskAt, setMaskPoints, MaskPath, MaskPoint } from '@core/effects/mask';
+import { addMaskPath, rectangleMask, ellipseMask, readNodeMask, readNodeMaskAt, setMaskPoints, editMaskPathTopology, setMaskPathFlags, MaskPath, MaskPoint, type MaskPathEditState } from '@core/effects/mask';
 import { defaultPolystar, POLYSTAR_FX_PROP, type PolystarType } from '@core/scene/polystar';
 
 /** Convex hull (monotone chain) of 2D points, counter-clockwise. */
@@ -332,13 +334,15 @@ function toWorkspaceNode(
     // see WorkspaceNode.device for the full reasoning.
     device: kind === 'camera' || kind === 'light',
     hitTestLocal: hitTestLocalVal,
-    pathPoints: node.components.find((c) => c.type === 'Geometry')?.props.points as import('@motion/workspace').BezierPoint[] | undefined,
+    pathPoints: livePathPoints(node, localTime),
+    pathClosed: pathIsClosed(node),
+    pathRotoBezier: pathIsRotoBezier(node),
     // Masks are editable outlines too — without these the Direct Selection tool
     // can't see them, which is why a mask's shape was frozen once drawn. Read at
     // the layer's keyframe time, as the renderer does: an ANIMATED mask shows
     // its interpolated shape here, not the static one nothing draws — which a
     // drag would otherwise pick up and write back as the new keyframe.
-    maskPaths: (readNodeMaskAt(node, localTime) ?? readNodeMask(node))?.paths.map((p) => ({ id: p.id, points: p.points })),
+    maskPaths: (readNodeMaskAt(node, localTime) ?? readNodeMask(node))?.paths.map((p) => ({ id: p.id, points: p.points, closed: p.closed, rotoBezier: (p as MaskPath & MaskPathEditState).rotoBezier === true })),
     anchor: { x: anchorX, y: anchorY },
   };
 }
@@ -541,6 +545,8 @@ function makeNodeAt(
   points?: import('@motion/workspace').BezierPoint[],
   width?: number,
   height?: number,
+  /** The pen closed the outline: a filled shape, not a stroke (see CreateNodePayload.closed). */
+  closed = false,
 ): SceneNode {
   const id = `${kind}_${(createSeq += 1)}_${Math.random().toString(36).slice(2, 6)}`;
   const displayName = ellipse ? 'Circle' : name;
@@ -550,14 +556,28 @@ function makeNodeAt(
   // Open strokes (line / pencil / pen) enclose no area, so a fill is invisible —
   // give them a visible stroke and a transparent fill instead. Colours/widths
   // come from the tool-options bar (drawToolOptions singleton).
+  // A CLOSED pen outline encloses an area even though its kind is 'path', so it
+  // takes the filled branch (the default fill every closed shape gets, as AE's
+  // Pen does) and no `open` flag — the renderer wraps it back to the start.
   const stroked =
-    STROKED_KINDS.has(nameLower) ||
-    (!CLOSED_POINT_KINDS.has(nameLower) && !!points && points.length > 0 && !ellipse && !isRectOrEllipse);
+    !closed &&
+    (STROKED_KINDS.has(nameLower) ||
+      (!CLOSED_POINT_KINDS.has(nameLower) && !!points && points.length > 0 && !ellipse && !isRectOrEllipse));
+  // AE's toolbar Fill / Stroke (`shapeToolPaint`) for what the shape and pen
+  // tools draw. Its defaults reproduce the old constants exactly — a solid
+  // #2b7eff fill and no stroke — so an untouched toolbar creates the same node.
+  const toolPaint = kind === 'shape' && nameLower !== 'brush';
+  const toolFill = newShapeFill();
+  // An open PEN path takes the toolbar stroke once one is chosen; until then
+  // it keeps the pencil bar's, as it always has.
+  const penStroke = stroked && (nameLower === 'pen' || nameLower === 'path' || nameLower === 'curvature')
+    ? newShapeStroke(undefined, true)
+    : undefined;
   const styleProps = stroked
     ? {
         opacity: 100,
         fill: 'rgba(0,0,0,0)',
-        stroke: {
+        stroke: penStroke ?? {
           color: drawToolOptions.pencilColor || '#38bdf8',
           width: Math.max(1, drawToolOptions.pencilWidth || 2),
           opacity: 1,
@@ -567,7 +587,8 @@ function makeNodeAt(
           dash: [],
         },
       }
-    : { opacity: 100, fill: nameLower === 'brush' ? drawToolOptions.brushColor : '#2b7eff' };
+    : { opacity: 100, fill: nameLower === 'brush' ? drawToolOptions.brushColor : toolPaint ? toolFill.styleFill : '#2b7eff' };
+  const toolStroke = !stroked && toolPaint ? newShapeStroke() : undefined;
 
   const transformProps: Record<string, unknown> = {
     [SCENE_KIND_PROP]: kind,
@@ -601,8 +622,14 @@ function makeNodeAt(
       { id: `${id}_t`, type: 'Transform', props: transformProps },
       { id: `${id}_s`, type: 'Style', props: { opacity: styleProps.opacity, fill: styleProps.fill } },
     );
-    if ('stroke' in styleProps) {
-      components.push({ id: `${id}_fx`, type: 'fx', props: { stroke: (styleProps as any).stroke } });
+    // One `fx` component for whatever paint the node was born with: an open
+    // path's stroke, or the toolbar's stroke / gradient fill on a closed shape.
+    const fxProps: Record<string, unknown> = {};
+    if ('stroke' in styleProps) fxProps.stroke = (styleProps as any).stroke;
+    else if (toolStroke) fxProps.stroke = toolStroke;
+    if (!stroked && toolPaint && toolFill.paint) fxProps.fill = toolFill.paint;
+    if (Object.keys(fxProps).length > 0) {
+      components.push({ id: `${id}_fx`, type: 'fx', props: fxProps });
     }
   }
 
@@ -1130,7 +1157,16 @@ function createNode(payload: CreateNodePayload): void {
     const parentNode = defaultSceneGraph.getNode(parentId as ID);
     if (!parentNode) return;
 
-    const parentWorldMat = worldMatrixOf(parentId, getLocalTransformForPorts, getParentIdForPorts);
+    // The SAME local→world matrix the viewport draws and edits this layer's
+    // outlines through (`toWorkspaceNode`): position · R · S · T(−anchor), and
+    // the projected plane for a 3D layer. `worldMatrixOf` has no anchor term
+    // and no projection, so a mask drawn on a layer with a moved anchor landed
+    // offset by the anchor, and on a 3D layer somewhere else entirely — while
+    // Direct Selection then showed its vertices where the renderer put them,
+    // not where they were clicked.
+    const parentWorldMat =
+      toWorkspaceNode(parentNode, 0)?.worldMatrix ??
+      worldMatrixOf(parentId, getLocalTransformForPorts, getParentIdForPorts);
     const invParentWorldMat = Matrix.invert(parentWorldMat);
 
     let newMask: MaskPath;
@@ -1241,7 +1277,7 @@ function createNode(payload: CreateNodePayload): void {
     }
   }
 
-  const node = makeNodeAt(kind, payload.kind, outX, outY, ellipse, outPoints, outW, outH);
+  const node = makeNodeAt(kind, payload.kind, outX, outY, ellipse, outPoints, outW, outH, payload.closed === true);
   if (payload.kind === 'ParagraphText' || payload.kind === 'VerticalParagraphText') {
     // AE paragraph text: the dragged rectangle IS the box. The layer origin is
     // the rect centre (text content is centred on it), so the box lands exactly
@@ -1598,10 +1634,134 @@ function deleteNodes(payload: DeleteNodesPayload): void {
   bumpScene();
 }
 
+type PathPoint = import('@motion/workspace').BezierPoint;
+
+/** A `path.points` data value as full bezier points (a corner's handles collapse onto it). */
+function toBezierPoints(value: unknown): PathPoint[] | undefined {
+  if (!Array.isArray(value) || value.length < 2) return undefined;
+  const first = value[0] as unknown;
+  if (typeof first !== 'object' || first === null || !('x' in first)) return undefined;
+  return (value as Array<{ x: number; y: number; inX?: number; inY?: number; outX?: number; outY?: number; broken?: boolean; tension?: number }>).map(
+    (p) => ({
+      x: p.x, y: p.y, inX: p.inX ?? p.x, inY: p.inY ?? p.y, outX: p.outX ?? p.x, outY: p.outY ?? p.y,
+      // The editing flags ride along — dropping them here would un-break
+      // every Alt-split handle of an animated path on its next edit.
+      ...(p.broken ? { broken: true } : {}),
+      ...(typeof p.tension === 'number' ? { tension: p.tension } : {}),
+    }),
+  );
+}
+
+/**
+ * Carry `broken` / `tension` onto sampled points from the keyframe at or before
+ * `t`. The data-track sampler interpolates geometry only, so a sampled vertex
+ * has lost its editing state; it is the same vertex as that keyframe's (same
+ * index — topology edits keep every keyframe's count equal).
+ */
+function withKeyframeFlags(nodeId: string, points: PathPoint[], t: number): PathPoint[] {
+  const track = defaultAnimation.dataTracksFor(nodeId).find((d) => d.prop === 'path.points');
+  if (!track || track.keyframes.length === 0) return points;
+  let key = track.keyframes[0]!;
+  for (const k of track.keyframes) if (k.t <= t + 1e-9) key = k;
+  const src = key.value as Array<{ broken?: boolean; tension?: number }>;
+  if (!Array.isArray(src) || src.length !== points.length) return points;
+  return points.map((p, i) => {
+    const s = src[i];
+    if (!s || (!s.broken && typeof s.tension !== 'number')) return p;
+    return { ...p, ...(s.broken ? { broken: true } : {}), ...(typeof s.tension === 'number' ? { tension: s.tension } : {}) };
+  });
+}
+
+/**
+ * The outline the renderer DRAWS at `localTime`: an animated `path.points`
+ * track wins over the static Geometry points, exactly as in `buildSnapshot`.
+ *
+ * This read the static points only, so on an animated shape Direct Selection
+ * showed vertices where the path had been at creation and every drag wrote
+ * the static prop — which nothing renders once the track exists. The edit
+ * never appeared.
+ */
+function livePathPoints(node: SceneNode, localTime: number): PathPoint[] | undefined {
+  const live = toBezierPoints(defaultAnimation.sampleData(node.id as string, 'path.points', localTime));
+  if (live) return withKeyframeFlags(node.id as string, live, localTime);
+  return node.components.find((c) => c.type === 'Geometry')?.props.points as PathPoint[] | undefined;
+}
+
+/** `Geometry.open` marks a stroke; everything else wraps, as the renderer reads it. */
+function pathIsClosed(node: SceneNode): boolean | undefined {
+  const geom = node.components.find((c) => c.type === 'Geometry');
+  return geom ? geom.props.open !== true : undefined;
+}
+
+/** `Geometry.rotoBezier` — the layer's own outline has computed handles. */
+function pathIsRotoBezier(node: SceneNode): boolean {
+  return node.components.find((c) => c.type === 'Geometry')?.props.rotoBezier === true;
+}
+
+/** History labels for the structural path edits, as AE names them. */
+const TOPOLOGY_LABEL: Record<string, string> = {
+  insert: 'Add Vertex',
+  delete: 'Delete Vertex',
+  deleteMany: 'Delete Vertices',
+  firstVertex: 'Set First Vertex',
+  reverse: 'Reverse Path Direction',
+  extend: 'Continue Path',
+};
+
+/** Write the outline-level switches a path payload carries (Closed, RotoBezier). */
+function writeGeometryFlags(node: SceneNode, flags: { closed?: boolean; rotoBezier?: boolean }): void {
+  const geom = node.components.find((c) => c.type === 'Geometry');
+  if (!geom) return;
+  // `open: true` marks a stroke; a closed path stores NO key, which is how a
+  // Pen-closed path and every primitive already read.
+  if (flags.closed !== undefined) defaultSceneGraph.writeProp(node.id, geom.id, 'open', flags.closed ? undefined : true);
+  if (flags.rotoBezier !== undefined) defaultSceneGraph.writeProp(node.id, geom.id, 'rotoBezier', flags.rotoBezier ? true : undefined);
+}
+
 function updateNodePath(payload: UpdateNodePathPayload): void {
   const node = defaultSceneGraph.getNode(payload.id as ID);
   if (!node || node.locked) return;
+  const id = node.id as string;
   const geomComponent = node.components.find((c) => c.type === 'Geometry');
+  const topology = payload.topology;
+
+  // An ANIMATED outline: write the track the renderer reads, like a mask edit.
+  // A reshape keys the playhead (on the layer's keyframe axis, see
+  // `updateMaskPathCmd`); a vertex added or removed is replayed on EVERY
+  // keyframe, or the keyframes disagree on their vertex count and the path
+  // stops morphing. Through the gesture's anim transaction, so the drag is one
+  // undo step.
+  // The closed state BEFORE this edit's flags: a Continue that closes the path
+  // appended its run to the outline as it was, open.
+  const wasClosed = geomComponent?.props.open !== true;
+  writeGeometryFlags(node, payload);
+  if (defaultAnimation.isDataAnimated(id, 'path.points')) {
+    if (topology) {
+      const closed = wasClosed;
+      gestureAnimEdit(TOPOLOGY_LABEL[topology.op] ?? 'Edit Path', () => {
+        const track = defaultAnimation.getDataTrack(id, 'path.points');
+        if (!track) return;
+        defaultAnimation.setDataTrack(id, 'path.points', {
+          ...track,
+          keyframes: track.keyframes.map((k) => {
+            const pts = toBezierPoints(k.value);
+            const next = pts ? applyPathTopology(pts, topology, closed) : null;
+            return next ? { ...k, value: next } : k;
+          }),
+        });
+      });
+    } else {
+      const t = compToKeyframeTime(id, getTimelineController().currentSeconds);
+      gestureAnimEdit(
+        'Edit Path',
+        () => defaultAnimation.setDataKeyframe(id, 'path.points', 'points', t, payload.points),
+        `drag:path:${t}:${id}`,
+      );
+    }
+    gestureSceneBump();
+    return;
+  }
+
   if (geomComponent) {
     defaultSceneGraph.writeProp(node.id, geomComponent.id, 'points', payload.points);
     gestureSceneBump();
@@ -1623,7 +1783,20 @@ function updateMaskPathCmd(payload: UpdateMaskPathPayload): void {
   // panel write. Raw comp time is the same number only for an untrimmed bar at
   // 0; on a moved or trimmed layer it put the keyframe where the shape is not.
   const t = compToKeyframeTime(payload.id as string, getTimelineController().currentSeconds);
-  setMaskPoints(payload.id as string, payload.maskId, payload.points as MaskPoint[], t);
+  const topology = payload.topology;
+  if (payload.closed !== undefined || payload.rotoBezier !== undefined) {
+    setMaskPathFlags(payload.id as string, payload.maskId, { closed: payload.closed, rotoBezier: payload.rotoBezier });
+  }
+  if (topology) {
+    // Adding or deleting a vertex changes every keyframe, not the one at the
+    // playhead — see `editMaskPathTopology`. Splitting is linear in the control
+    // points, so the shape at the playhead comes out as `payload.points`.
+    editMaskPathTopology(payload.id as string, payload.maskId, (points, closed) =>
+      applyPathTopology(points, topology, closed) as MaskPoint[] | null,
+    );
+  } else {
+    setMaskPoints(payload.id as string, payload.maskId, payload.points as MaskPoint[], t);
+  }
   gestureSceneBump();
 }
 

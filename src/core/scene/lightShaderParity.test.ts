@@ -253,7 +253,9 @@ describe('one-sided shading: CPU and GPU agree on what the flag means', () => {
     // per-glyph extruded text body mesh.
     const build = readSource('core/rendering/buildSnapshot.ts');
     expect((build.match(/oneSided: true/g) ?? []).length).toBe(4);
-    expect((build.match(/sceneLights, undefined, true\)/g) ?? []).length).toBe(1);
+    // The one-sided CPU call also carries the material's Ambient/Diffuse, as
+    // the GPU path does — still exactly one site.
+    expect((build.match(/sceneLights, \{ ambient: extMat\.ambient, diffuse: extMat\.diffuse \}, true\)/g) ?? []).length).toBe(1);
   });
 });
 

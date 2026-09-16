@@ -28,10 +28,42 @@ const COVERAGE_SAMPLES = 64;
 /** Alpha (0-255) at/above which a pixel counts as artwork rather than background. */
 const ALPHA_THRESHOLD = 12;
 
+/**
+ * Decoded masks by key, in recency order (a hit re-inserts).
+ *
+ * Bounded. It was an unbounded Map keyed by asset id OR src — and an image
+ * sequence or a relinked asset produces a new src per frame/relink — so every
+ * image ever puppeted kept its mask for the session. A mask is small, but the
+ * set of keys is not. Evicting one only costs a cheap 64² re-decode the next
+ * time that layer is meshed (the frame falls back to the bbox grid meanwhile,
+ * exactly as on first sight).
+ */
+const MAX_CACHED_MASKS = 256;
+/** Failed keys are remembered (so a broken URL cannot thrash) — boundedly. */
+const MAX_FAILED_KEYS = 512;
 const cache = new Map<string, PuppetCoverageMask>();
 const inFlight = new Set<string>();
 /** Sources whose decode failed — never retried, so a broken URL can't thrash. */
 const failed = new Set<string>();
+
+function cacheMask(key: string, mask: PuppetCoverageMask): void {
+  cache.delete(key);
+  cache.set(key, mask);
+  while (cache.size > MAX_CACHED_MASKS) {
+    const oldest = cache.keys().next();
+    if (oldest.done) break;
+    cache.delete(oldest.value);
+  }
+}
+
+function markFailed(key: string): void {
+  failed.add(key);
+  while (failed.size > MAX_FAILED_KEYS) {
+    const oldest = failed.values().next();
+    if (oldest.done) break;
+    failed.delete(oldest.value);
+  }
+}
 
 /**
  * Coverage mask for an image source, or undefined until its bitmap has decoded.
@@ -39,7 +71,10 @@ const failed = new Set<string>();
  */
 export function getImageCoverageMask(key: string, src: string): PuppetCoverageMask | undefined {
   const cached = cache.get(key);
-  if (cached) return cached;
+  if (cached) {
+    cacheMask(key, cached); // refresh recency
+    return cached;
+  }
   if (!src || failed.has(key) || inFlight.has(key)) return undefined;
   // No DOM to decode in (SSR / tests) — stay on the bbox grid.
   if (typeof document === 'undefined' || typeof Image === 'undefined') return undefined;
@@ -58,7 +93,7 @@ async function decode(key: string, src: string): Promise<void> {
     canvas.height = h;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) {
-      failed.add(key);
+      markFailed(key);
       return;
     }
     ctx.clearRect(0, 0, w, h);
@@ -68,7 +103,7 @@ async function decode(key: string, src: string): Promise<void> {
       { data: data.data, width: w, height: h },
       { maxSamples: COVERAGE_SAMPLES, alphaThreshold: ALPHA_THRESHOLD },
     );
-    cache.set(key, mask);
+    cacheMask(key, mask);
     // A tighter mesh is now available — nudge the surface to re-render.
     try {
       getEventBus().emit('AnimationChanged', { nodeId: '__puppet_coverage__' });
@@ -76,7 +111,7 @@ async function decode(key: string, src: string): Promise<void> {
       /* no bus (tests) — the mask is cached; the next render picks it up */
     }
   } catch {
-    failed.add(key);
+    markFailed(key);
   } finally {
     inFlight.delete(key);
   }
@@ -106,5 +141,10 @@ export function clearImageCoverageCache(): void {
  * DOM. Production code never calls this.
  */
 export function primeImageCoverageCache(key: string, mask: PuppetCoverageMask): void {
-  cache.set(key, mask);
+  cacheMask(key, mask);
+}
+
+/** Test seam: how many masks are held. */
+export function imageCoverageCacheSize(): number {
+  return cache.size;
 }

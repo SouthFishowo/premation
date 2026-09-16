@@ -46,6 +46,19 @@ export interface ExtrudeOptions {
   smoothAngleDeg?: number;
   /** Emit the front cap (off by default — the layer's own quad draws it). */
   frontCap?: boolean;
+  /**
+   * Chamfer the FRONT rim (default on). Off, the walls run all the way to
+   * z = 0 at the full outline and only the back is bevelled — for a front
+   * drawn by a full-size layer quad (a styled text front), which would
+   * otherwise hide the front chamfer ring and leave a notch behind its edge.
+   */
+  frontBevel?: boolean;
+  /**
+   * AE's Hole Bevel Depth, as a fraction of `bevel` (default 1): the chamfer
+   * on the counters of a glyph (the hole of an O, the eye of an e) relative to
+   * the outer rim's. 0 = square-edged holes.
+   */
+  holeBevelScale?: number;
   /** Emit the back cap (default on). */
   backCap?: boolean;
   /** Box the cap UVs are normalised against (layer width/height). Defaults
@@ -377,20 +390,27 @@ export function extrudeOutline(rings: ReadonlyArray<Ring>, opts: ExtrudeOptions)
   const smoothCos = Math.cos((opts.smoothAngleDeg ?? 35) * DEG);
   const uvBox = opts.uvBox ?? bounds(rings);
 
-  const prepared: PreparedRing[] = [];
+  const frontBevel = opts.frontBevel !== false;
+  const holeScale = Math.max(0, Math.min(1, opts.holeBevelScale ?? 1));
+
+  // Each ring carries its own chamfer: holes take `holeBevelScale` of the
+  // rim's (AE Hole Bevel Depth). At the defaults every ring gets `bevel`, so
+  // the mesh is byte-identical to the single-bevel build.
+  const prepared: Array<PreparedRing & { bevel: number }> = [];
   for (const r of rings) {
-    const p = prepareRing(r.points, r.hole, bevel, smoothCos);
-    if (p) prepared.push(p);
+    const rb = r.hole ? bevel * holeScale : bevel;
+    const p = prepareRing(r.points, r.hole, rb, smoothCos);
+    if (p) prepared.push({ ...p, bevel: rb });
   }
   if (prepared.length === 0) return null;
 
   const mb = new MeshBuilder(uvBox);
-  const zWall0 = bevel;
-  const zWall1 = depth - bevel;
 
   // ── Walls ──
-  if (zWall1 - zWall0 > 1e-6) {
-    for (const ring of prepared) {
+  for (const ring of prepared) {
+    const zWall0 = frontBevel ? ring.bevel : 0;
+    const zWall1 = depth - ring.bevel;
+    if (zWall1 - zWall0 > 1e-6) {
       const base0 = mb.count;
       for (const c of ring.corners) mb.vertex(c.x, c.y, zWall0, c.nx, c.ny, 0);
       const base1 = mb.count;
@@ -406,8 +426,10 @@ export function extrudeOutline(rings: ReadonlyArray<Ring>, opts: ExtrudeOptions)
 
   // ── Bevels (front: z 0 → bevel, back: z depth → depth − bevel) ──
   if (bevel > 0) {
-    for (const front of [true, false]) {
+    for (const front of frontBevel ? [true, false] : [false]) {
       for (const ring of prepared) {
+        const bevel = ring.bevel;
+        if (!(bevel > 0)) continue;
         // Rows of vertices across the profile, t = 0 at the cap edge.
         const rows: number[] = [];
         for (let k = 0; k <= segs; k++) {
@@ -441,12 +463,12 @@ export function extrudeOutline(rings: ReadonlyArray<Ring>, opts: ExtrudeOptions)
   }
 
   // ── Caps ──
-  const capRings: Ring[] = prepared.map((r) => ({ points: bevel > 0 ? r.inset : r.outline, hole: r.hole }));
-  const groups = groupRings(capRings);
+  const capGroups = (bevelled: boolean): ReturnType<typeof groupRings> =>
+    groupRings(prepared.map((r) => ({ points: bevelled && r.bevel > 0 ? r.inset : r.outline, hole: r.hole })));
   const emitCap = (role: 'front' | 'back'): void => {
     const z = role === 'front' ? 0 : depth;
     const nz = role === 'front' ? -1 : 1;
-    for (const g of groups) {
+    for (const g of capGroups(role === 'back' || frontBevel)) {
       const { vertices, triangles } = triangulateRings(g.outer, g.holes);
       if (triangles.length === 0) continue;
       const base = mb.count;
@@ -460,7 +482,8 @@ export function extrudeOutline(rings: ReadonlyArray<Ring>, opts: ExtrudeOptions)
   if (opts.frontCap) emitCap('front');
 
   if (mb.count === 0) return null;
-  return mb.finish(bevel);
+  // No front chamfer ⇒ nothing for the front quad to inset to.
+  return mb.finish(frontBevel ? bevel : 0);
 }
 
 // ── Outline helpers for the primitive shapes ─────────────────────────

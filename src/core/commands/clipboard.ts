@@ -30,6 +30,7 @@ import { bumpScene } from '@stores/sceneStore';
 import { snapshotNodeAnimation, applyNodeAnimation, type NodeAnimationSnapshot } from '@core/animation/cloneNodeAnimation';
 import { insertSvgDocument } from '@core/scene/sceneInsert';
 import type { SceneNode } from '@core/types';
+import { copyPathFromSelection, pastePathOntoSelection } from '@core/workspace/pathCommands';
 
 /** Float times never compare exactly; match the engine's own tolerance. */
 const T_EPSILON = 1e-6;
@@ -192,8 +193,12 @@ const clipboardState: ClipboardState = {
 };
 
 export function copySelection(): void {
+  // Path vertices selected with Direct Selection: copy the PATH (AE's Mask
+  // Path / shape Path value), not the layer. Otherwise the stale path
+  // clipboard is dropped so it cannot shadow the paste of what is copied now.
+  if (copyPathFromSelection()) return;
   const kfIds = useKeyframeSelectionStore.getState().ids;
-  
+
   if (kfIds.size > 0) {
     const copiedKfs: ClipboardState['copiedKeyframes'] = [];
 
@@ -305,13 +310,15 @@ export function cutSelection(): void {
   bumpScene();
 }
 
-export type PasteResult = 'keyframes' | 'layers' | 'svg' | null;
+export type PasteResult = 'keyframes' | 'layers' | 'svg' | 'path' | null;
 
 /**
- * Paste internal clipboard first (keyframes → layers). If empty, try OS
- * clipboard SVG → editable shape group (AE 26.3 paste Illustrator/SVG).
+ * Paste internal clipboard first (a copied path onto the selected path →
+ * keyframes → layers). If empty, try OS clipboard SVG → editable shape group
+ * (AE 26.3 paste Illustrator/SVG).
  */
 export async function pasteSelection(): Promise<PasteResult> {
+  if (pastePathOntoSelection()) return 'path';
   if (clipboardState.copiedKeyframes && clipboardState.copiedKeyframes.length > 0) {
     const keyframes = clipboardState.copiedKeyframes;
     const controller = getTimelineController();

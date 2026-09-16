@@ -82,6 +82,29 @@ export interface MaskPath {
   inverted: boolean;
 }
 
+/**
+ * Path-EDITING state a stored mask may carry beside its geometry.
+ *
+ * Deliberately outside `MaskPoint` / `MaskPath`: those two interfaces are the
+ * pixel contract the matte cache signature is checked against
+ * (`maskSignatureParity.test.ts`), and none of this changes a pixel. A broken
+ * handle pair is still two handles; RotoBezier's handles are computed by the
+ * tools and STORED in `points`. What these flags change is how the next edit
+ * behaves, so they ride along on the same objects without entering the hash.
+ */
+export interface MaskPointEditState {
+  /** The two handles move independently (split with Alt / Convert Vertex). Absent = smooth. */
+  broken?: boolean;
+  /** RotoBezier tension 0..1, read only while the path's `rotoBezier` is on. Absent = 1/3. */
+  tension?: number;
+}
+
+/** A mask path's editing switches — see `MaskPointEditState`. */
+export interface MaskPathEditState {
+  /** AE RotoBezier: the tools derive every handle from the vertices. */
+  rotoBezier?: boolean;
+}
+
 export interface LayerMask {
   paths: MaskPath[];
 }
@@ -455,6 +478,21 @@ function lerpPoint(p: MaskPoint, q: MaskPoint, f: number): MaskPoint {
     ...(typeof p.feather === 'number' || typeof q.feather === 'number'
       ? { feather: lerp(p.feather ?? q.feather ?? 0, q.feather ?? p.feather ?? 0, f) }
       : {}),
+    ...lerpEditState(p as MaskPoint & MaskPointEditState, q as MaskPoint & MaskPointEditState, f),
+  };
+}
+
+/**
+ * Editing state, not geometry (`MaskPointEditState`): `broken` holds from the
+ * nearer keyframe, so a vertex broken at one key stays broken while the tween
+ * is edited; tension blends like any other per-vertex number.
+ */
+function lerpEditState(p: MaskPointEditState, q: MaskPointEditState, f: number): MaskPointEditState {
+  return {
+    ...((f < 0.5 ? p.broken : q.broken) ? { broken: true } : {}),
+    ...(typeof p.tension === 'number' || typeof q.tension === 'number'
+      ? { tension: lerp(p.tension ?? q.tension ?? 1 / 3, q.tension ?? p.tension ?? 1 / 3, f) }
+      : {}),
   };
 }
 
@@ -713,6 +751,60 @@ export function removeMaskPath(nodeId: string, pathId: string): void {
  */
 export function setMaskPoints(nodeId: string, pathId: string, points: MaskPoint[], t?: number): void {
   updateMaskPath(nodeId, pathId, { points }, t);
+}
+
+/**
+ * Add or remove a vertex on one mask path — in EVERY state, not at a time.
+ *
+ * `setMaskPoints` edits the keyframe at the playhead, which is right for a
+ * reshape and wrong for a topology change: the other keyframes keep the old
+ * vertex count, and `interpolateMask` can only hold between paths whose counts
+ * differ, so an animated mask stopped morphing the moment a vertex was added.
+ * `fn` gets each state's points (and whether the path is closed) and returns
+ * the edited points, or null to leave a state it does not apply to alone.
+ */
+export function editMaskPathTopology(
+  nodeId: string,
+  pathId: string,
+  fn: (points: MaskPoint[], closed: boolean) => MaskPoint[] | null,
+): void {
+  editEveryMaskState(nodeId, (mask) => ({
+    paths: mask.paths.map((p) => {
+      if (p.id !== pathId) return p;
+      const next = fn(p.points, p.closed);
+      return next ? { ...p, points: next } : p;
+    }),
+  }));
+}
+
+/**
+ * Flip a path's structural switches — Closed, RotoBezier — in EVERY state.
+ *
+ * Neither is a value that can differ between keyframes (an outline cannot be
+ * closed at one moment and open the next without the interpolator snapping),
+ * so like a topology change this edits the static mask and every keyframe.
+ * `points`, when given, replaces the points of every state through `fn` — the
+ * RotoBezier toggle recomputes each keyframe's handles that way.
+ */
+export function setMaskPathFlags(
+  nodeId: string,
+  pathId: string,
+  flags: { closed?: boolean; rotoBezier?: boolean },
+  fn?: (points: MaskPoint[], closed: boolean) => MaskPoint[],
+): void {
+  editEveryMaskState(nodeId, (mask) => ({
+    paths: mask.paths.map((p) => {
+      if (p.id !== pathId) return p;
+      const closed = flags.closed ?? p.closed;
+      const next: MaskPath & MaskPathEditState = { ...p, closed };
+      if (flags.rotoBezier !== undefined) {
+        if (flags.rotoBezier) next.rotoBezier = true;
+        else delete next.rotoBezier;
+      }
+      if (fn) next.points = fn(p.points, closed);
+      return next;
+    }),
+  }));
 }
 
 /**

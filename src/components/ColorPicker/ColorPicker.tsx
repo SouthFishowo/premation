@@ -305,7 +305,7 @@ export function ColorPicker({
             {/* ── Project palette ────────────────────────────────────── */}
             <div className={styles.section}>
               <div className={styles.sectionHead}>
-                <span className={styles.sectionLabel}>Swatches</span>
+                <span className={styles.sectionLabel}>Project swatches</span>
                 <button
                   type="button"
                   className={styles.sectionAdd}

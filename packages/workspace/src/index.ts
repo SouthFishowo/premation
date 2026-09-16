@@ -24,6 +24,22 @@ export type { Rect as RectType, Size } from './math';
 export type { Corners } from './math/OrientedBox';
 export type { BezierPoint } from './math/BezierPoint';
 export { corner as bezierCorner, smooth as bezierSmooth } from './math/BezierPoint';
+export {
+  splitSegment,
+  deleteVertex,
+  applyPathTopology,
+  nearestSegmentParam,
+  segmentCount,
+  deleteVertices,
+  reversePath,
+  setFirstVertex,
+  bendSegment,
+  rotoBezierPoints,
+  transformVertices,
+  isSmoothVertex,
+  ROTO_DEFAULT_TENSION,
+  type PathTopologyEdit,
+} from './math/pathTopology';
 
 // ── Events ────────────────────────────────────────────────────────
 export { TypedEmitter, type Disposable, type Handler } from './events/Emitter';
@@ -166,6 +182,16 @@ export {
   TextTool,
   VerticalTextTool,
   createBuiltinTools,
+  AddVertexTool,
+  DeleteVertexTool,
+  ConvertVertexTool,
+  MaskFeatherTool,
+  outlinesOfNode,
+  selectedOutlines,
+  commitOutline,
+  outlineKey,
+  type Outline,
+  type OutlineId,
   type Tool,
   type ToolContext,
   type ToolPointerEvent,
@@ -189,6 +215,7 @@ export {
   type MoveAnchorPayload,
   type CreateNodePayload,
   type DeleteNodesPayload,
+  type PathEditFlags,
   type UpdateNodePathPayload,
   type UpdateMaskPathPayload,
   type CutPathsPayload,

@@ -28,16 +28,19 @@ import type {
   TextureProvider,
   TextureHandle,
   SamplerHandle,
+  TextureDescriptor,
 } from '@motion/renderer';
 import { displayReferredUploadFormat } from '@motion/renderer';
 import type { RenderLayer } from './RenderBackend';
 import { makeCanvasGradient, type LinearFill, type RadialFill } from '@core/paint/fill';
+import { drawPaint, hasPaintStrokes, paintSignature, type PaintEnv } from '@core/paint/paintRaster';
+import type { PaintConfig } from '@core/paint/paintStrokes';
 
 /** A light layer's wash parameters — the shape `RenderLayer.light` carries. */
 type LightWash = NonNullable<RenderLayer['light']>;
 import { rasterPadding } from './raster/vectorDraw';
 import { layerSubpaths } from './raster/subpaths';
-import { resolutionTier, paddingClass, continuousResolutionTier, RESOLUTION_TIERS, DEFAULT_MAX_RASTER_DIMENSION } from '@motion/renderer';
+import { resolutionTier, paddingClass, continuousResolutionTier, RESOLUTION_TIERS, DEFAULT_MAX_RASTER_DIMENSION, rasterCacheKey } from '@motion/renderer';
 
 /**
  * Top rung of the clamped ladder — the scale past which `resolutionTier` stops
@@ -47,10 +50,14 @@ import { resolutionTier, paddingClass, continuousResolutionTier, RESOLUTION_TIER
 const CLAMPED_TIER_CEILING = RESOLUTION_TIERS[RESOLUTION_TIERS.length - 1]!;
 import { Canvas2DVectorRasterizer } from './raster/Canvas2DVectorRasterizer';
 import { type RichRun } from '@core/text/textLayout';
-import { effectsNeedCpuBake, applyEffectChain } from '@core/effects/effectBake';
+import { effectsNeedCpuBake, applyEffectChain, layerIsBaked } from '@core/effects/effectBake';
+import { bakeJobWorkerSafe } from '@core/effects/bakeWorkerCore';
+import { bakeScheduler, type BakeScheduler } from '@core/effects/bakeWorkerPool';
+import { perfBegin, perfEnd, PerfStage } from '@core/perf/framePerf';
 import { scaleEffectLengths, type Effect } from '@core/effects/effects';
 import { deinterlaceData, deinterlaceInto, type FieldOrder } from './deinterlace';
 import { videoDiag } from './videoPlaybackDiag';
+import { videoDecodeStats } from '@core/video/decodeStats';
 import { paintMaskMatte, type LayerMask } from '@core/effects/mask';
 import { drawParticleField, particleFieldSignature, type ParticleSpriteImage } from '@core/particles/particleRender';
 import type { ParticleConfig } from '@core/particles/particleSim';
@@ -75,7 +82,31 @@ interface PathEntry {
   kind: 'path';
   signature: string;
   texture: TextureHandle;
+  /** See `RasterReuse` — the unchanged-input fast path. */
+  reuse?: RasterReuse<PathReuseScalars>;
 }
+
+/**
+ * The scalar inputs of a path raster's signature. `contentHash` itself signs
+ * the geometry, paints and strokes (it is the key's first term), but a derived
+ * layer — an extrusion's inset front face — inherits its source's hash with a
+ * different box, and fill opacity is not hashed at all, so these are compared
+ * individually.
+ */
+interface PathReuseScalars {
+  width: number;
+  height: number;
+  primitive: string;
+  cornerRadius: number;
+  cornerRadii: string;
+  fill: string | undefined;
+  stroke: string;
+  pathOpen: boolean;
+  fillOpacity: number | undefined;
+}
+const PATH_REUSE_SCALARS: ReadonlyArray<keyof PathReuseScalars> = [
+  'width', 'height', 'primitive', 'cornerRadius', 'cornerRadii', 'fill', 'stroke', 'pathOpen', 'fillOpacity',
+];
 
 interface MaskEntry {
   kind: 'mask';
@@ -99,6 +130,30 @@ const RASTER_MAX = 4096;
  * rather than a leak.
  */
 const MAX_PARKED_IMAGES = 32;
+
+/**
+ * Close a decoded bitmap this provider no longer references.
+ *
+ * Every bitmap that reaches an image entry is the provider's own: the default
+ * loader decodes a fresh one per call, bakes and downscales create new ones,
+ * and the live-SVG rasterizer hands out "a FRESH bitmap per call" precisely so
+ * the provider can close them. An ImageBitmap's pixels are off-heap and are
+ * not reclaimed by GC in any timely way — a bitmap that is merely dropped
+ * holds its full decoded size until the page unloads.
+ *
+ * The callers carry the other half of the rule: a bitmap is closed only when
+ * no live entry still points at it (an entry that replaced another inherits
+ * its `bitmap` / `unbaked` to keep the old picture on screen). Tolerates test
+ * stubs without `close` and bitmaps already closed.
+ */
+function closeBitmap(bitmap: ImageBitmap | null | undefined): void {
+  if (!bitmap || typeof bitmap.close !== 'function') return;
+  try {
+    bitmap.close();
+  } catch {
+    /* already closed */
+  }
+}
 
 /**
  * Decode options for EVERY bitmap that becomes a GPU texture.
@@ -325,6 +380,13 @@ export interface ImageBakeSpec {
    * native. Absent → native, the old behaviour.
    */
   targetScale?: number;
+  /**
+   * The layer's Brush / Eraser / Clone Stamp strokes, drawn over the source
+   * pixels BEFORE the mask and the chain (the vector raster's order). A painted
+   * layer that needs no other bake carries this alone with an empty `effects`,
+   * and the GPU keeps applying its mask and effects to the painted texture.
+   */
+  paint?: PaintConfig;
 }
 
 /**
@@ -477,6 +539,9 @@ export interface TextSpec {
   effects?: ReadonlyArray<import('@core/effects/effects').Effect>;
   /** The layer's mask, baked before the effects (AE order) when baking. */
   mask?: import('@core/effects/mask').LayerMask;
+  /** Brush / Eraser / Clone strokes, drawn over the glyphs in the text raster.
+   *  Absent for unpainted text, which leaves its signature untouched. */
+  paint?: PaintConfig;
 }
 
 /** The CSS `font` shorthand for a text spec — identical to the string
@@ -522,6 +587,65 @@ interface TextEntry {
   kind: 'text';
   signature: string;
   texture: TextureHandle;
+  /** How to re-serve this entry without rebuilding its signature — see `RasterReuse`. */
+  reuse?: RasterReuse<TextSpec>;
+}
+
+/**
+ * Everything needed to prove a vector raster's key unchanged WITHOUT
+ * rebuilding it, and to re-serve the texture if so.
+ *
+ * The signatures `setText` / `setPath` build are long strings — every scalar
+ * plus JSON of runs, glyphs, text path, extras, gradients, path points — rebuilt
+ * for every layer on every frame even when nothing moved (a paused comp being
+ * redrawn for a selection change or an overlay). The layer's `contentHash`
+ * (contentHash.ts) already digests every OBJECT-valued input of those
+ * signatures, so a call is provably identical to the one that produced this
+ * record when:
+ *
+ *   • its contentHash, resolution tier, upload format and (when the face needs
+ *     alias variants) font-variant epoch are equal;
+ *   • every SCALAR input of the signature is equal — compared field by field,
+ *     because several (fill opacity, the Character-panel extras, the box a
+ *     derived plane is given) are not in the content hash;
+ *   • the layer is not CPU-baked: a baked key also signs the effect stack and
+ *     mask, which carry post-hash entries (depth of field, cast shadow), so a
+ *     baked layer always takes the full path.
+ *
+ * Invalidation is therefore exactly the full signature's: any input that would
+ * have changed the string fails one of the checks above. The raster itself is
+ * re-validated through `Canvas2DVectorRasterizer.touch` (an evicted texture
+ * falls back to the full path) and re-acquired from the pool every call, so
+ * pool liveness is untouched.
+ */
+interface RasterReuse<S> {
+  contentHash: string;
+  tier: number;
+  /** `fontVariantEpoch()` when the key carries it, else -1. */
+  fontEpoch: number;
+  /** The call's scalar inputs, compared field by field. */
+  scalars: S;
+  /** The rasterizer's cache key and the pool key + descriptor for the texture. */
+  cacheKey: string;
+  texKey: string;
+  desc: TextureDescriptor;
+}
+
+/** TextSpec fields that are plain values and sign the text raster. The object
+ *  fields (extras, runs, glyphs, text path, axes, paints, paint) are covered by
+ *  the content hash; effects/mask only sign a CPU-baked key, which never reuses. */
+const TEXT_REUSE_SCALARS = [
+  'text', 'fillOpacity', 'fontSize', 'color', 'width', 'height', 'fontFamily', 'fontWeight',
+  'fontWidth', 'fontSlant', 'fontStyle', 'align', 'letterSpacing', 'lineHeight', 'paragraphSpacing',
+  'strokeOverFill', 'textTransform', 'fontVariant', 'verticalAlign', 'verticalScale',
+  'horizontalScale', 'baselineShift', 'textStroke', 'textStrokeWidth',
+] as const satisfies ReadonlyArray<keyof TextSpec>;
+
+function sameScalars<S extends object>(a: S, b: S, keys: ReadonlyArray<keyof S>): boolean {
+  for (const k of keys) {
+    if (!Object.is(a[k], b[k])) return false;
+  }
+  return true;
 }
 
 interface LightEntry {
@@ -815,6 +939,13 @@ export class AppTextureProvider implements TextureProvider {
   private bakeWork: HTMLCanvasElement | null = null;
   /** The baked-video upload surface, reused frame to frame (see setVideoBaked). */
   private videoBakeOut: HTMLCanvasElement | null = null;
+  /** Video bakes in the worker pool, per key: the signature and its submit order. */
+  private videoBakeInFlight = new Map<string, { sig: string; seq: number; landed: Promise<void> }>();
+  /** Submit order of the bake currently on screen, per key — an older job landing late never replaces it. */
+  private videoBakeShown = new Map<string, number>();
+  /** A signature the pool failed to bake: that frame is baked on this thread instead. */
+  private videoBakeFailedSig = new Map<string, string>();
+  private videoBakeSeq = 0;
   private bakeScratchA: HTMLCanvasElement | null = null;
   private bakeScratchB: HTMLCanvasElement | null = null;
   private bakeScratchToggle = 0;
@@ -972,7 +1103,12 @@ export class AppTextureProvider implements TextureProvider {
     // The chosen bake RESOLUTION tier belongs in the key: zooming in must
     // re-bake sharper, and without this the first (possibly low-res) bake
     // would be served forever. Quantized so panning/zooming does not thrash.
-    const bakeSig = bake ? `#bake=${JSON.stringify(bake)}#rq=${this.bakeResolutionTier()}` : '';
+    // Paint signs by its compact per-stroke digest, not by value: a long stroke
+    // is thousands of points and this key is rebuilt every frame. A bake with
+    // no paint stringifies exactly as before, so no existing key moves.
+    const bakeSig = bake
+      ? `#bake=${JSON.stringify(bake.paint ? { ...bake, paint: paintSignature(bake.paint) } : bake)}#rq=${this.bakeResolutionTier()}`
+      : '';
     // Live SVG scrubbing: quantize to centiseconds so adjacent frames share a
     // decode when the playhead barely moves, while still invalidating on scrub.
     const timeSig = mediaTime !== undefined && Number.isFinite(mediaTime)
@@ -1089,10 +1225,35 @@ export class AppTextureProvider implements TextureProvider {
   /**
    * Register/refresh the text behind a renderable key.
    */
-  setText(key: string, spec: TextSpec): void {
+  setText(
+    key: string,
+    spec: TextSpec,
+    /** The source layer's `contentHash`, when the spec was built from one —
+     *  enables the unchanged-input fast path (`RasterReuse`). */
+    contentHash?: string,
+  ): void {
     const layerScale = Math.max(1, Math.abs(spec.scaleX || 1), Math.abs(spec.scaleY || 1));
     const effectiveScale = this.rasterScale * layerScale;
     const tier = this.tierFor(effectiveScale, spec.continuousRaster, spec.width ?? 1, spec.height ?? 1);
+    const fontEpoch = textNeedsFontVariants(spec) ? fontVariantEpoch() : -1;
+    // A baked key also signs effects + mask (post-hash entries included), so a
+    // baked text never takes or records the fast path.
+    const bakedText = layerIsBaked({ kind: 'text', effects: spec.effects, fillOpacity: spec.fillOpacity } as RenderLayer)
+      || effectsNeedCpuBake(spec.effects);
+    const prevText = this.textEntries.get(key);
+    const reuse = prevText?.reuse;
+    if (
+      reuse && contentHash !== undefined && !bakedText
+      && reuse.contentHash === contentHash && reuse.tier === tier && reuse.fontEpoch === fontEpoch
+      && reuse.desc.format === displayReferredUploadFormat()
+      && sameScalars(reuse.scalars, spec, TEXT_REUSE_SCALARS)
+      && this.rasterizer.touch(reuse.cacheKey)
+    ) {
+      perfBegin(PerfStage.raster);
+      prevText.texture = this.resources.texture(reuse.texKey, reuse.desc);
+      perfEnd(PerfStage.raster);
+      return;
+    }
     // Fill opacity changes the baked pixels, so it belongs in the cache key.
     const fillSig = spec.fillOpacity !== undefined && spec.fillOpacity < 1 ? `|fo${spec.fillOpacity}` : '';
     const fxSig = effectsNeedCpuBake(spec.effects)
@@ -1115,6 +1276,9 @@ export class AppTextureProvider implements TextureProvider {
       `${spec.fontAxes ? `|ax${JSON.stringify(spec.fontAxes)}` : ''}` +
       `${spec.fillPaint ? `|fp${JSON.stringify(spec.fillPaint)}` : ''}` +
       `${spec.strokePaint ? `|sp${JSON.stringify(spec.strokePaint)}` : ''}` +
+      // Paint strokes are drawn into this raster, so they sign it — by digest,
+      // not by value (a long stroke is thousands of points, keyed every frame).
+      `${hasPaintStrokes(spec.paint) ? `|pt${paintSignature(spec.paint)}` : ''}` +
       // An alias face that finishes loading changes the pixels without changing
       // the spec — the epoch is what turns the key over when it does.
       `${textNeedsFontVariants(spec) ? `|fv${fontVariantEpoch()}` : ''}` +
@@ -1124,6 +1288,7 @@ export class AppTextureProvider implements TextureProvider {
     // Non-zero only when a CPU-baked chain would bleed outside the text box
     // (see rasterPadding) — otherwise this stays 0 exactly as before.
     const pad = rasterPadding({ ...spec, kind: 'text' } as unknown as RenderLayer);
+    perfBegin(PerfStage.raster);
     const result = this.rasterizer.rasterize({
       drawable: {
         ...spec,
@@ -1135,14 +1300,29 @@ export class AppTextureProvider implements TextureProvider {
     });
 
     const texKey = `raster:${signature}@${tier}~${paddingClass(pad)}`;
-    const texture = this.resources.texture(texKey, {
+    const desc: TextureDescriptor = {
       label: `raster:${signature}`,
       width: result.texture.width,
       height: result.texture.height,
       format: displayReferredUploadFormat(),
       displayReferred: true,
+    };
+    const texture = this.resources.texture(texKey, desc);
+    perfEnd(PerfStage.raster);
+    this.textEntries.set(key, {
+      kind: 'text',
+      signature,
+      texture,
+      ...(contentHash !== undefined && !bakedText
+        ? {
+            reuse: {
+              contentHash, tier, fontEpoch, scalars: spec, desc, texKey,
+              // The key `rasterize` filed the raster under (same inputs).
+              cacheKey: rasterCacheKey(signature, this.drawScaleFor(effectiveScale, spec.continuousRaster, tier), pad),
+            },
+          }
+        : {}),
     });
-    this.textEntries.set(key, { kind: 'text', signature, texture });
   }
 
   /**
@@ -1332,6 +1512,38 @@ export class AppTextureProvider implements TextureProvider {
   setPath(key: string, layer: RenderLayer): void {
     const layerScale = Math.max(1, Math.abs(layer.scaleX || 1), Math.abs(layer.scaleY || 1));
     const effectiveScale = this.rasterScale * layerScale;
+    // Unchanged-input fast path (`RasterReuse`). Only for a layer carrying a
+    // content hash — the extrusion plate passes a synthetic layer without one.
+    const contentHash = layer.contentHash;
+    const bakedPath = layerIsBaked(layer) || effectsNeedCpuBake(layer.effects);
+    const prevPath = this.pathEntries.get(key);
+    let scalars: PathReuseScalars | null = null;
+    if (contentHash !== undefined && !bakedPath) {
+      scalars = {
+        width: layer.width,
+        height: layer.height,
+        primitive: layer.primitive ?? 'path',
+        cornerRadius: layer.cornerRadius ?? 0,
+        cornerRadii: layer.cornerRadii ? layer.cornerRadii.join(',') : '',
+        fill: layer.fill,
+        stroke: layer.stroke ? `${layer.stroke.width},${layer.stroke.color},${layer.stroke.align}` : 'no-stroke',
+        pathOpen: layer.pathOpen === true,
+        fillOpacity: layer.fillOpacity,
+      };
+      const reuse = prevPath?.reuse;
+      if (
+        reuse && reuse.contentHash === contentHash
+        && reuse.tier === this.tierFor(effectiveScale, layer.continuousRaster, layer.width ?? 1, layer.height ?? 1)
+        && reuse.desc.format === displayReferredUploadFormat()
+        && sameScalars(reuse.scalars, scalars, PATH_REUSE_SCALARS)
+        && this.rasterizer.touch(reuse.cacheKey)
+      ) {
+        perfBegin(PerfStage.raster);
+        prevPath.texture = this.resources.texture(reuse.texKey, reuse.desc);
+        perfEnd(PerfStage.raster);
+        return;
+      }
+    }
     // Runs are joined by a separator that cannot appear inside a run, so two
     // different splits of the same points are two different signatures. Without
     // the boundary marker a path cut into 2+2 points and one cut into 1+3 sign
@@ -1353,6 +1565,7 @@ export class AppTextureProvider implements TextureProvider {
       const signature = `h:${layer.contentHash ?? ''}|${layer.width}x${layer.height}|${layer.primitive ?? 'path'}|r:${layer.cornerRadius ?? 0}|cr:${layer.cornerRadii ? layer.cornerRadii.join(',') : ''}|${ptsSig}|${layer.fill}|${paintSig}|${strokeSig}|${layer.pathOpen ? 'open' : 'closed'}${fxSig}${fillSig}|t${tier}`;
 
     const pad = rasterPadding(layer);
+    perfBegin(PerfStage.raster);
     const result = this.rasterizer.rasterize({
       drawable: {
         ...layer,
@@ -1364,14 +1577,28 @@ export class AppTextureProvider implements TextureProvider {
     });
 
     const texKey = `raster:${signature}@${tier}~${paddingClass(pad)}`;
-    const texture = this.resources.texture(texKey, {
+    const desc: TextureDescriptor = {
       label: `raster:${signature}`,
       width: result.texture.width,
       height: result.texture.height,
       format: displayReferredUploadFormat(),
       displayReferred: true,
+    };
+    const texture = this.resources.texture(texKey, desc);
+    perfEnd(PerfStage.raster);
+    this.pathEntries.set(key, {
+      kind: 'path',
+      signature,
+      texture,
+      ...(scalars && contentHash !== undefined
+        ? {
+            reuse: {
+              contentHash, tier, fontEpoch: -1, scalars, desc, texKey,
+              cacheKey: rasterCacheKey(signature, this.drawScaleFor(effectiveScale, layer.continuousRaster, tier), pad),
+            },
+          }
+        : {}),
     });
-    this.pathEntries.set(key, { kind: 'path', signature, texture });
   }
 
   /**
@@ -1783,18 +2010,21 @@ export class AppTextureProvider implements TextureProvider {
    * `setFrame`. Signature includes source time so paused scrubbing caches;
    * playback pays per unique frame only when styles need the bake.
    */
-  setVideoBaked(key: string, src: string, timeSec: number, bake: ImageBakeSpec, fields?: FieldOrder): void {
+  setVideoBaked(key: string, src: string, timeSec: number, bake: ImageBakeSpec, fields?: FieldOrder): boolean {
     // Ensure the element is seeked via the normal path (creates entry, seeks)
     // WITHOUT the raw upload: frame entries shadow video entries in get(), so
     // a full-res upload here was paid on every baked frame and never sampled.
     // The fallback upload happens explicitly in the catch below.
-    this.setVideo(key, src, timeSec, undefined, /* upload */ false);
+    //
+    // Returns whether the texture now holds the bake of the frame ASKED FOR —
+    // the `setVideo` contract, folded by the backend into `frameMediaExact`.
+    const seekSettled = this.setVideo(key, src, timeSec, undefined, /* upload */ false);
     const entry = this.videoEntries.get(key);
-    if (!entry || entry.video.readyState < HAVE_CURRENT_DATA || !entry.hasSeeked) return;
+    if (!entry || entry.video.readyState < HAVE_CURRENT_DATA || !entry.hasSeeked) return false;
     const v = entry.video;
     const nativeW = v.videoWidth || 0;
     const nativeH = v.videoHeight || 0;
-    if (!(nativeW > 0) || !(nativeH > 0)) return;
+    if (!(nativeW > 0) || !(nativeH > 0)) return false;
     // Bake at the displayed size, never above native. See `ImageBakeSpec.targetScale`.
     const { w, h } = bakeSize(nativeW, nativeH, bake);
     // Full change-signature BEFORE any pixel work. When the GPU already holds
@@ -1805,12 +2035,31 @@ export class AppTextureProvider implements TextureProvider {
     // path count: an animated mask must re-bake even when its count is stable.
     const fxSig = bake.effects.map((e) => `${e.type}:${e.enabled !== false ? 1 : 0}:${JSON.stringify(e.params ?? {})}`).join('|');
     const maskSig = bake.mask && bake.mask.paths.length > 0 ? `:m${JSON.stringify(bake.mask)}` : '';
-    const frameSig = `vb:${timeSec.toFixed(4)}:${w}x${h}:${fxSig}${maskSig}:fo${bake.fillOpacity ?? 1}:f${fields ?? ''}`;
-    if (this.frameEntries.get(key)?.signature === frameSig) return;
+    // Appended LAST and empty when unpainted, so no existing frame key moves.
+    const paintSig = hasPaintStrokes(bake.paint) ? `:p${paintSignature(bake.paint)}` : '';
+    const frameSig = `vb:${timeSec.toFixed(4)}:${w}x${h}:${fxSig}${maskSig}:fo${bake.fillOpacity ?? 1}:f${fields ?? ''}${paintSig}`;
+    // A frame drawn while the element is still SEEKING is the PRE-seek picture.
+    // It is the right thing to show and the wrong thing to file under this
+    // time: stored under `frameSig` it satisfied the check below forever, so
+    // once `seeked` repainted, the bake was skipped and the previous frame
+    // stayed up — in export, every baked frame one frame late. Signed apart,
+    // the settled pass re-bakes.
+    const sig = seekSettled ? frameSig : `${frameSig}:seeking`;
+    if (this.frameEntries.get(key)?.signature === sig) return seekSettled;
+    // Exact timing has already queued the seek wait; a pre-seek bake would be
+    // thrown away by the pass that follows it.
+    if (this.exactMediaTiming && !seekSettled) return false;
+    const pool = bakeJobWorkerSafe(bake.effects) && this.videoBakeFailedSig.get(key) !== sig ? bakeScheduler() : null;
+    const inFlight = this.videoBakeInFlight.get(key);
+    if (pool && inFlight?.sig === sig) {
+      // This exact frame is already baking; the previous bake stays up.
+      if (this.exactMediaTiming) this.mediaWaits.push(inFlight.landed);
+      return false;
+    }
     try {
       const canvas = this.ensureCanvas('work', w, h);
       const ctx = canvas.getContext('2d');
-      if (!ctx) return;
+      if (!ctx) return false;
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.globalCompositeOperation = 'source-over';
       ctx.globalAlpha = 1;
@@ -1827,6 +2076,15 @@ export class AppTextureProvider implements TextureProvider {
         ctx.putImageData(image, 0, 0);
       }
       const k = bake.width > 0 ? w / bake.width : 1;
+      // Paint on the (deinterlaced) frame, before mask and chain — the same
+      // order and centred-space mapping as the image bake. Clone strokes
+      // sample THIS frame, so a clone patch follows the footage.
+      if (hasPaintStrokes(bake.paint)) {
+        ctx.save();
+        ctx.setTransform(k, 0, 0, bake.height > 0 ? h / bake.height : 1, w / 2, h / 2);
+        drawPaint(ctx, bake.paint, this.paintEnv());
+        ctx.restore();
+      }
       if (bake.mask && bake.mask.paths.length > 0) {
         const matte = this.nextBakeScratch(w, h);
         const mc = matte.getContext('2d');
@@ -1843,15 +2101,22 @@ export class AppTextureProvider implements TextureProvider {
           ctx.globalCompositeOperation = 'source-over';
         }
       }
+      const effects = scaleEffectLengths(bake.effects, k);
+      if (pool) {
+        this.submitVideoBake(pool, key, sig, ctx.getImageData(0, 0, w, h), effects ?? [], bake);
+        return false;
+      }
+      perfBegin(PerfStage.bake);
       applyEffectChain(
         ctx,
         w,
         h,
-        scaleEffectLengths(bake.effects, k),
+        effects,
         (sw, sh) => this.nextBakeScratch(sw, sh),
         bake.fillOpacity ?? 1,
         bake.mask,
       );
+      perfEnd(PerfStage.bake);
       // Frame entries win over video entries in get(), so the baked canvas is
       // what the compositor samples while the video element stays alive for the
       // next seek. Copy out of the pooled work surface before upload — into a
@@ -1860,52 +2125,163 @@ export class AppTextureProvider implements TextureProvider {
       // frame budget cannot afford.
       const out = this.ensureCanvas('videoBakeOut', w, h);
       const oc = out.getContext('2d');
-      if (!oc) return;
+      if (!oc) return false;
       oc.setTransform(1, 0, 0, 1, 0, 0);
       oc.globalCompositeOperation = 'copy';
       oc.drawImage(canvas, 0, 0);
       oc.globalCompositeOperation = 'source-over';
-      this.setFrame(key, out, frameSig);
+      this.setFrame(key, out, sig);
+      return seekSettled;
     } catch {
       // Bake failed — fall back to the raw element frame so the layer still
       // shows pixels (the bake path skipped the normal upload).
       this.uploadVideoTexture(entry, key, fields);
+      return false;
     }
   }
 
   /**
-   * Upload an externally-rasterized canvas under `key` (decoded video frames
-   * for Frame Mix). The signature dedupes uploads — pass the source time so a
-   * new frame re-uploads and a repeat render doesn't.
+   * Bake a prepared video frame's effect chain in the worker pool and put the
+   * result up when it lands.
+   *
+   * PREVIEW: the previous bake stays on screen until then — the frame entry is
+   * only ever replaced, never cleared — and `onChange` repaints. A job that ran
+   * while a newer frame was submitted is still SHOWN when nothing newer has
+   * landed (under playback slower than the bake every job is superseded by the
+   * time it finishes, and discarding them all would freeze the picture); an
+   * older job landing after a newer one never is.
+   *
+   * EXPORT: the landing promise joins the media waits, so the offline render's
+   * convergence loop awaits exactly this bake and re-renders; that pass finds
+   * the signature in place and reports the frame settled. No new wait path.
    */
-  setFrame(key: string, canvas: HTMLCanvasElement, signature: string, fields?: FieldOrder): void {
-    if (canvas.width < 1 || canvas.height < 1) return;
+  private submitVideoBake(
+    pool: BakeScheduler,
+    key: string,
+    sig: string,
+    input: ImageData,
+    effects: ReadonlyArray<Effect>,
+    bake: ImageBakeSpec,
+  ): void {
+    const w = input.width;
+    const h = input.height;
+    const seq = ++this.videoBakeSeq;
+    const settle = (): void => {
+      if (this.videoBakeInFlight.get(key)?.seq === seq) this.videoBakeInFlight.delete(key);
+    };
+    const landed = pool.submit(key, {
+      w, h, pixels: input.data, effects, fillOpacity: bake.fillOpacity ?? 1,
+      ...(bake.mask ? { mask: bake.mask } : {}),
+    }).then(
+      (res) => {
+        settle();
+        // Released while baking (layer removed, provider disposed).
+        if (!this.videoEntries.has(key)) {
+          this.videoBakeShown.delete(key);
+          this.videoBakeFailedSig.delete(key);
+          return;
+        }
+        if (!res || (this.videoBakeShown.get(key) ?? 0) > seq) return;
+        const out = this.ensureCanvas('videoBakeOut', w, h);
+        const oc = out.getContext('2d');
+        if (!oc) return;
+        const img = oc.createImageData(w, h);
+        img.data.set(res.pixels);
+        oc.putImageData(img, 0, 0);
+        this.videoBakeShown.set(key, seq);
+        this.setFrame(key, out, sig);
+        this.onChange?.();
+      },
+      () => {
+        // The job's input went to the worker with it; the next pass bakes this
+        // frame on this thread from the element instead.
+        settle();
+        this.videoBakeFailedSig.set(key, sig);
+        this.onChange?.();
+      },
+    );
+    this.videoBakeInFlight.set(key, { sig, seq, landed });
+    if (this.exactMediaTiming) this.mediaWaits.push(landed);
+  }
+
+  /** Set once a direct VideoFrame upload has thrown; later frames go through a canvas. */
+  private directVideoFrameUploadFailed = false;
+  /** Draw surface for VideoFrames that must reach the GPU through a canvas. */
+  private frameUploadScratch: HTMLCanvasElement | null = null;
+
+  /**
+   * Upload an externally decoded or rasterized frame under `key` (exact video
+   * frames, Frame Mix, bakes). The signature dedupes uploads — pass the source
+   * time so a new frame re-uploads and a repeat render doesn't.
+   *
+   * `frame` may be a canvas, an ImageBitmap or a WebCodecs VideoFrame, and each
+   * is uploaded as itself: an exact video frame the decoder handed over as a
+   * VideoFrame goes to the GPU with no CPU-side copy at all. The CALLER owns
+   * the frame — nothing here closes it or holds it past this call.
+   *
+   * A VideoFrame is still drawn to a canvas first when (a) media timing is
+   * exact — export and the golden harness keep the pixels the canvas route
+   * has always produced, until the direct route has been through the render
+   * gate — or (b) a direct upload has already thrown this session.
+   */
+  setFrame(key: string, frame: HTMLCanvasElement | ImageBitmap | VideoFrame, signature: string, fields?: FieldOrder): void {
+    const isVideoFrame = typeof VideoFrame === 'function' && frame instanceof VideoFrame;
+    const dims = (f: HTMLCanvasElement | ImageBitmap | VideoFrame): { w: number; h: number } =>
+      typeof VideoFrame === 'function' && f instanceof VideoFrame
+        ? { w: f.displayWidth, h: f.displayHeight }
+        : { w: (f as HTMLCanvasElement | ImageBitmap).width, h: (f as HTMLCanvasElement | ImageBitmap).height };
+    // A closed ImageBitmap reports 0×0 — never upload one.
+    if (dims(frame).w < 1 || dims(frame).h < 1) return;
     const existing = this.frameEntries.get(key);
     if (existing && existing.signature === signature) return;
+    let image: HTMLCanvasElement | ImageBitmap | VideoFrame = frame;
     if (fields) {
       // Interpret Footage ▸ Fields: rebuild the discarded field before the
       // frame reaches the GPU. On failure (no 2d context) the raw frame
       // uploads — combing, not a missing layer. The caller's signature already
       // carries the field order, so toggling it re-uploads.
-      const clean = deinterlaceInto(this.fieldsWork, canvas, canvas.width, canvas.height, fields);
-      if (clean) canvas = clean;
+      const { w, h } = dims(image);
+      const clean = deinterlaceInto(this.fieldsWork, image, w, h, fields);
+      if (clean) image = clean;
     }
     const maxDim = this.maxRasterDimension;
-    if ((canvas.width > maxDim || canvas.height > maxDim) && canvas.width > 0 && canvas.height > 0) {
-      const scale = Math.min(maxDim / canvas.width, maxDim / canvas.height);
-      const targetW = Math.max(1, Math.round(canvas.width * scale));
-      const targetH = Math.max(1, Math.round(canvas.height * scale));
-      const scaled = document.createElement('canvas');
-      scaled.width = targetW;
-      scaled.height = targetH;
-      const ctx = scaled.getContext('2d');
-      if (ctx) {
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'high';
-        ctx.drawImage(canvas, 0, 0, targetW, targetH);
-        canvas = scaled;
+    {
+      const { w, h } = dims(image);
+      if ((w > maxDim || h > maxDim) && w > 0 && h > 0) {
+        const scale = Math.min(maxDim / w, maxDim / h);
+        const targetW = Math.max(1, Math.round(w * scale));
+        const targetH = Math.max(1, Math.round(h * scale));
+        const scaled = document.createElement('canvas');
+        scaled.width = targetW;
+        scaled.height = targetH;
+        const ctx = scaled.getContext('2d');
+        if (ctx) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+          ctx.drawImage(image, 0, 0, targetW, targetH);
+          image = scaled;
+        }
       }
     }
+    const viaCanvas = (vf: VideoFrame): HTMLCanvasElement | null => {
+      const w = vf.displayWidth;
+      const h = vf.displayHeight;
+      const c = this.frameUploadScratch ?? document.createElement('canvas');
+      this.frameUploadScratch = c;
+      if (c.width !== w) c.width = w;
+      if (c.height !== h) c.height = h;
+      const ctx = c.getContext('2d');
+      if (!ctx) return null;
+      ctx.drawImage(vf, 0, 0, w, h);
+      return c;
+    };
+    if (isVideoFrame && image === frame && (this.exactMediaTiming || this.directVideoFrameUploadFailed)) {
+      const c = viaCanvas(frame as VideoFrame);
+      if (!c) return;
+      image = c;
+    }
+    const size = dims(image);
+    const canvas = { width: size.w, height: size.h };
     // ONE texture per key, rewritten in place — the setVideo/setParticles pattern.
     //
     // This used to include `signature` (the source TIME) in the pool key, so every
@@ -1924,7 +2300,29 @@ export class AppTextureProvider implements TextureProvider {
         /* pinned */ true,
       );
     }
-    this.resources.writeTexture(tex, { type: 'canvas', canvas });
+    if (typeof VideoFrame === 'function' && image instanceof VideoFrame) {
+      try {
+        this.resources.writeTexture(tex, { type: 'videoFrame', frame: image });
+        videoDecodeStats.uploadsVideoFrame += 1;
+      } catch {
+        // The platform refused a VideoFrame source (older Chromium, a backend
+        // without external-image support). Stop trying for the session and
+        // take the canvas route, which every backend has always accepted.
+        this.directVideoFrameUploadFailed = true;
+        const c = viaCanvas(image);
+        if (!c) return;
+        this.resources.writeTexture(tex, { type: 'canvas', canvas: c });
+        videoDecodeStats.uploadsCanvas += 1;
+      }
+    } else if (typeof ImageBitmap === 'function' && image instanceof ImageBitmap) {
+      // Decoded video is opaque, so WebGL2 ignoring the premultiply flag for
+      // bitmaps changes nothing; the pixels are the canvas route's pixels.
+      this.resources.writeTexture(tex, { type: 'bitmap', bitmap: image });
+      videoDecodeStats.uploadsBitmap += 1;
+    } else {
+      this.resources.writeTexture(tex, { type: 'canvas', canvas: image as HTMLCanvasElement });
+      videoDecodeStats.uploadsCanvas += 1;
+    }
     this.frameEntries.set(key, { signature, texture: tex, poolKey });
   }
 
@@ -2087,7 +2485,10 @@ export class AppTextureProvider implements TextureProvider {
       // Only free if it has not come back into use since being parked.
       if (!activeKeys.has(key)) {
         this.resources.freeTexture(`img:${entry.src}`);
-        entry.bitmap?.close();
+        // `unbaked` too: a baked image holds TWO bitmaps (the decode and the
+        // bake), and only the baked one used to be closed.
+        closeBitmap(entry.bitmap);
+        if (entry.unbaked !== entry.bitmap) closeBitmap(entry.unbaked);
         this.entries.delete(key);
       }
     }
@@ -2182,6 +2583,10 @@ export class AppTextureProvider implements TextureProvider {
    */
   dispose(): void {
     this.retain(new Set(), { releaseParked: true });
+    // Particle sprite images are decoded once per source and never evicted
+    // while the provider lives; on teardown nothing else can reach them.
+    for (const sprite of this.spriteBitmaps.values()) closeBitmap(sprite);
+    this.spriteBitmaps.clear();
   }
 
   /**
@@ -2210,6 +2615,32 @@ export class AppTextureProvider implements TextureProvider {
     else if (slot === 'b') this.bakeScratchB = c;
     else this.videoBakeOut = c;
     return c;
+  }
+
+  /**
+   * Where a clone stroke naming ANOTHER layer finds its pixels: that layer's
+   * decoded image (pre-bake), or its video element's current frame. Keyed the
+   * way `snapshotToFrameScene` keys footage (`asset:<layerId>`).
+   *
+   * Only what this provider already holds: a source layer that is not footage
+   * (a shape, text) or not decoded yet yields null, and the stroke draws
+   * nothing rather than guessing. A request for this layer at another time
+   * (Source Time Shift) also yields null — a video element holds one frame —
+   * and the pass falls back to the layer's current pixels.
+   */
+  private paintEnv(): PaintEnv {
+    return {
+      cloneSource: (layerId) => {
+        if (!layerId) return null;
+        const key = `asset:${layerId}`;
+        const img = this.entries.get(key);
+        const bmp = img?.unbaked ?? img?.bitmap ?? null;
+        if (bmp && bmp.width > 0) return { image: bmp, width: bmp.width, height: bmp.height };
+        const v = this.videoEntries.get(key)?.video;
+        if (v && v.readyState >= 2 && v.videoWidth > 0) return { image: v, width: v.videoWidth, height: v.videoHeight };
+        return null;
+      },
+    };
   }
 
   /** Alternating scratch so consecutive acquire calls never share a canvas. */
@@ -2242,6 +2673,8 @@ export class AppTextureProvider implements TextureProvider {
     bitmap: ImageBitmap,
     bake: ImageBakeSpec,
     premultipliedFile: boolean | undefined,
+    /** The texture key — the worker pool's coalescing lane. Absent = bake here. */
+    lane?: string,
   ): Promise<ImageBitmap | null> {
     const srcW = bitmap.width;
     const srcH = bitmap.height;
@@ -2276,6 +2709,15 @@ export class AppTextureProvider implements TextureProvider {
       ctx.imageSmoothingQuality = 'high';
       ctx.drawImage(bitmap, 0, 0, w, h);
       const k = bake.width > 0 ? w / bake.width : 1;
+      // PAINT before the mask, in the vector raster's order: strokes are
+      // content, and the mask shapes content. Drawn in the layer's centred
+      // space scaled onto the bitmap — the same mapping as the matte below.
+      if (hasPaintStrokes(bake.paint)) {
+        ctx.save();
+        ctx.setTransform(k, 0, 0, bake.height > 0 ? h / bake.height : 1, w / 2, h / 2);
+        drawPaint(ctx, bake.paint, this.paintEnv());
+        ctx.restore();
+      }
       // MASK FIRST, matching the vector path. An interior style is generated
       // from the layer's silhouette, and for a masked layer that silhouette is
       // the masked one — run the chain first and an inner shadow hangs off the
@@ -2298,15 +2740,48 @@ export class AppTextureProvider implements TextureProvider {
           ctx.globalCompositeOperation = 'source-over';
         }
       }
+      const effects = scaleEffectLengths(bake.effects, k);
+      const pool = lane ? bakeScheduler() : null;
+      if (pool && lane && bakeJobWorkerSafe(effects)) {
+        // OFF the main thread (bakeWorkerPool.ts). Everything above stays here
+        // — the decoded bitmap, paint clone sources and the mask raster belong
+        // to this realm — and only the chain crosses, as pixels. The picture on
+        // screen meanwhile is the entry's previous texture (setImage keeps it),
+        // and under exact media timing this promise is already one of the
+        // media waits, so an export frame cannot be taken before it lands.
+        const input = ctx.getImageData(0, 0, w, h);
+        let landed: Awaited<ReturnType<BakeScheduler['submit']>>;
+        try {
+          landed = await pool.submit(lane, {
+            w, h, pixels: input.data, effects: effects ?? [], fillOpacity: bake.fillOpacity ?? 1,
+            ...(bake.mask ? { mask: bake.mask } : {}),
+          });
+        } catch {
+          // The worker failed this job (its input went with it): bake here from
+          // the source bitmap instead. The pooled canvases may have been reused
+          // while this waited, so the layer is prepared again from scratch.
+          return this.bakeImageBitmap(bitmap, bake, premultipliedFile);
+        }
+        // Coalesced away — only a newer entry for this key can do that, and
+        // decode() discards this result against it.
+        if (!landed) return null;
+        // ImageData is straight alpha, like the canvas it replaces here, so the
+        // same 'premultiply' decode brings it into the invariant.
+        const result = ctx.createImageData(w, h);
+        result.data.set(landed.pixels);
+        return await createImageBitmap(result, decodeOptions(false));
+      }
+      perfBegin(PerfStage.bake);
       applyEffectChain(
         ctx,
         w,
         h,
-        scaleEffectLengths(bake.effects, k),
+        effects,
         (sw, sh) => this.nextBakeScratch(sw, sh),
         bake.fillOpacity ?? 1,
         bake.mask,
       );
+      perfEnd(PerfStage.bake);
       void premultipliedFile;
       // A canvas is straight alpha; 'premultiply' brings it into the invariant.
       // Copy into a dedicated canvas so the pooled work surface can be reused
@@ -2356,7 +2831,13 @@ export class AppTextureProvider implements TextureProvider {
         return;
       }
       // A newer setImage for this key (different src) supersedes this decode.
-      if (this.entries.get(key) !== entry) return;
+      // The bitmap just decoded is referenced by nothing — close it rather than
+      // strand its pixels (a fast scrub through an image sequence superseded
+      // almost every decode).
+      if (this.entries.get(key) !== entry) {
+        closeBitmap(bitmap);
+        return;
+      }
       // Live SVG frames must NOT park as unbaked — each time needs a fresh draw.
       if (mediaTime === undefined) entry.unbaked = bitmap;
     }
@@ -2368,9 +2849,19 @@ export class AppTextureProvider implements TextureProvider {
     // round-trip the vector rasterizer does, and the only way they render on a
     // photo at all. Gated by imageNeedsCpuBake; see there for what is excluded.
     if (entry.bake) {
-      const baked = await this.bakeImageBitmap(bitmap, entry.bake, entry.premultipliedFile);
-      if (this.entries.get(key) !== entry) return; // superseded while baking
+      const baked = await this.bakeImageBitmap(bitmap, entry.bake, entry.premultipliedFile, key);
+      if (this.entries.get(key) !== entry) {
+        // Superseded while baking. The bake result is referenced by nothing.
+        // The source is garbage too UNLESS it is `unbaked`, which the entry
+        // that replaced this one may have inherited to re-bake from.
+        if (baked && baked !== bitmap) closeBitmap(baked);
+        if (bitmap !== entry.unbaked) closeBitmap(bitmap);
+        return;
+      }
       if (baked) {
+        // A source that is not kept as `unbaked` (a live-SVG frame) has no
+        // further use once baked.
+        if (baked !== bitmap && bitmap !== entry.unbaked) closeBitmap(bitmap);
         bitmap = baked;
         // The bake produced its bitmap from a CANVAS, whose pixels are straight
         // alpha, decoded with 'premultiply'. So whatever the FILE was, what we
@@ -2462,9 +2953,16 @@ export class AppTextureProvider implements TextureProvider {
     // round, the premultiplied-declared-straight ramp read linear rms 0.70 where
     // the double multiply predicts 53.77.
     this.resources.writeTexture(tex, { type: 'bitmap', bitmap, alreadyPremultiplied: entry.premultipliedFile });
+    const previous = entry.bitmap;
     entry.texture = tex;
     entry.bitmap = bitmap;
     entry.ready = true;
+    // The picture this entry showed until now — inherited from the entry it
+    // replaced (kept on screen while this decode ran) or its own earlier bake.
+    // Every Inner Glow tweak on a photo re-bakes, and each re-bake used to
+    // strand the previous baked bitmap. Closed only AFTER the new upload, and
+    // never when it is the `unbaked` source a later re-bake reads.
+    if (previous && previous !== bitmap && previous !== entry.unbaked) closeBitmap(previous);
     this.onChange?.();
   }
 
@@ -2553,6 +3051,10 @@ export class AppTextureProvider implements TextureProvider {
     entry.ready = true;
     entry.offline = true;
     entry.offlineSrc = src;
+    // Whatever this entry inherited to keep on screen is replaced by the bars
+    // and referenced by nothing else.
+    closeBitmap(entry.bitmap);
+    if (entry.unbaked !== entry.bitmap) closeBitmap(entry.unbaked);
     entry.bitmap = null;
     entry.unbaked = null;
   }
@@ -2638,6 +3140,7 @@ export class AppTextureProvider implements TextureProvider {
 
     const existing = this.maskEntries.get(key);
     if (existing && existing.signature === signature) return;
+    perfBegin(PerfStage.raster);
 
     const result = this.rasterizer.rasterize({
       drawable: {
@@ -2657,6 +3160,7 @@ export class AppTextureProvider implements TextureProvider {
       format: displayReferredUploadFormat(),
       displayReferred: true,
     });
+    perfEnd(PerfStage.raster);
     this.maskEntries.set(key, { kind: 'mask', signature, texture });
   }
 

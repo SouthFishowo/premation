@@ -29,6 +29,7 @@
  */
 
 import { BUILTIN_SHADERS } from '../shaders/builtin';
+import { packGenerator } from '../rendergraph/passes/generatorField';
 import {
   packBend, packPerspective, packSpotlight, packMotionTile, packFill,
   packSharpen, packSetMatte, packStroke, packTextured, packDeformedMesh, packTextured3D, packShadowDepth,
@@ -236,6 +237,7 @@ const PACKERS: ReadonlyArray<{ shader: string; pack: () => Float32Array }> = [
   { shader: 'deep-glow-blur', pack: () => packFxBlock(MVP, RECT, [[0, 0, 0, 0], [0, 0, 0, 0]], RECT) },
   { shader: 'deep-glow-acc', pack: () => packFxBlock(MVP, RECT, [[0, 0, 0, 0]], RECT) },
   { shader: 'deep-glow-composite', pack: () => packFxBlock(MVP, RECT, [[0, 0, 0, 0], [0, 0, 0, 0]], RECT) },
+  { shader: 'fx-effect-opacity', pack: () => packFxBlock(MVP, RECT, [[0, 0, 0, 0]], RECT) },
   { shader: 'beam-path', pack: () => packFxBlock(MVP, RECT, Array.from({ length: 39 }, () => [0, 0, 0, 0] as [number, number, number, number]), RECT) },
   { shader: 'cartoon', pack: () => packFxBlock(MVP, RECT, [[0, 0, 0, 0], [0, 0, 0, 0]], RECT) },
   { shader: 'interior-style', pack: () => packFxBlock(MVP, RECT, [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], RECT) },
@@ -315,6 +317,15 @@ const PACKERS: ReadonlyArray<{ shader: string; pack: () => Float32Array }> = [
     shader: 'scene-blit-lut',
     pack: () => packSceneBlitLut(MVP, RECT, COLOR, 1, { size: 33, is1d: false, intensity: 1, domainMin: 0, domainMax: 1 }),
   },
+  /*
+    The three generator shaders share ONE uniform block — they differ in their
+    vertex layout, not in what the fragment stage reads — so all three are
+    listed against the same packer. Listed rather than added to the tolerated
+    count above, which is what the rule at the bottom of this file asks for.
+  */
+  { shader: 'generator-point', pack: () => packGenerator(MVP, 0, 0, [1, 1]) },
+  { shader: 'generator-sprite', pack: () => packGenerator(MVP, 2, 800, [0.5, 0.5]) },
+  { shader: 'generator-mesh', pack: () => packGenerator(MVP, 2, 800, [1, 1]) },
 ];
 
 const byName = new Map(BUILTIN_SHADERS.map((s) => [s.name, s]));

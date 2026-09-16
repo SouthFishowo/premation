@@ -217,6 +217,81 @@
   color: #ffffff !important;
 }
 
+/*
+ * Windows / Linux with the OS's own caption buttons (Window Controls Overlay):
+ * keep our content out from under them. The `titlebar-area-*` variables exist
+ * only while the overlay is on, and the fallbacks make this 0 everywhere else.
+ */
+.titleBar[data-controls='native'] {
+  padding-right: calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw));
+}
+
+/* ── macOS ────────────────────────────────────────────────────────────────
+   44px on every route so the traffic lights main places at y=15 are centred
+   whether this bar or TopNav's unified toolbar is on top. */
+.mac {
+  height: 44px;
+}
+
+.mac .left {
+  padding-left: 0;
+}
+
+/* The window title, centred as on every Mac window. Part of the drag area. */
+.macTitle {
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  pointer-events: none;
+  -webkit-app-region: drag;
+}
+
+/* The traffic-light corner. Its width is the inset the real buttons need
+   (x=16 + three 12px buttons + two 8px gaps) plus air before the first tool. */
+.macControls {
+  flex: none;
+  width: 80px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 16px;
+  box-sizing: border-box;
+}
+
+.light {
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border-radius: 50%;
+  border: 0.5px solid rgba(0, 0, 0, 0.18);
+  display: grid;
+  place-items: center;
+  cursor: default;
+  -webkit-app-region: no-drag;
+}
+
+.light svg {
+  width: 8px;
+  height: 8px;
+  fill: none;
+  stroke: rgba(0, 0, 0, 0.6);
+  stroke-width: 1.1;
+  stroke-linecap: round;
+  opacity: 0;
+}
+
+/* As on macOS: the glyphs appear on all three when the group is hovered. */
+.macControls:hover .light svg,
+.light:focus-visible svg {
+  opacity: 1;
+}
+
+/* macOS's own colours — platform convention, fixed in both themes. */
+.lightClose { background: #ff5f57; }
+.lightMinimize { background: #febc2e; }
+.lightZoom { background: #28c840; }
+
 
 /*
  * The pending-update button. Filled primary, because the whole reason it

@@ -92,7 +92,12 @@ function folderIcon(folder: string): IconName {
   return PRESET_FOLDER_ICON[folder] ?? 'folder';
 }
 
-export function MotionPresetsPanel(): JSX.Element {
+/**
+ * The presets library itself — search, save, share, choreography and the
+ * folder tree — without dock chrome, so the Library's Presets section and the
+ * on-demand Presets panel draw the one implementation.
+ */
+export function MotionPresetsBody(): JSX.Element {
   const selectedIds = useSelectionStore((s) => s.ids);
   const notify = useUIStore((s) => s.notify);
   const playhead = useCurrentTime();
@@ -378,13 +383,7 @@ export function MotionPresetsPanel(): JSX.Element {
   const searching = !!search.trim();
 
   return (
-    <Panel
-      id="presets"
-      title="Presets"
-      icon="zap"
-      hideHeader
-      onClose={() => getEventBus().emit('PanelClosed', { panelId: 'presets' })}
-    >
+    <>
       <div className={styles.panelHeader}>
         <div className={styles.searchRow}>
           <SearchField
@@ -575,6 +574,20 @@ export function MotionPresetsPanel(): JSX.Element {
           />
         )}
       </div>
+    </>
+  );
+}
+
+export function MotionPresetsPanel(): JSX.Element {
+  return (
+    <Panel
+      id="presets"
+      title="Presets"
+      icon="zap"
+      hideHeader
+      onClose={() => getEventBus().emit('PanelClosed', { panelId: 'presets' })}
+    >
+      <MotionPresetsBody />
     </Panel>
   );
 }

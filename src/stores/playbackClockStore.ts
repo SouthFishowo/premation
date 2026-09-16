@@ -205,6 +205,106 @@ export function useCurrentFrame(tabId?: string): number {
   return live ?? fallback;
 }
 
+// ── Display clock ───────────────────────────────────────────────────
+//
+// `useCurrentTime` is exact and re-renders its component on every tick. That
+// is right for the few things that must MOVE with the playhead and have no
+// cheaper way to do it; it is wrong for everything that only SHOWS a value at
+// the playhead — an inspector field, a keyframe navigator, a per-row value in
+// the timeline — because each of those re-rendered 60×/s during playback to
+// print numbers nobody can read at that rate.
+//
+// The display clock is the same clock with one policy on top:
+//
+//   - PAUSED (a seek, a scrub, a keyframe jump, an undo): every write passes
+//     straight through. Paused values are exact, always.
+//   - PLAYING: at most one refresh per PLAYING_UI_REFRESH_MS (10 Hz), leading
+//     edge plus a trailing refresh, so the last tick of a burst is never lost.
+//   - PAUSE: flushes the final value immediately.
+//
+// 10 Hz rather than freeze-until-pause: values visibly tracking a playing
+// animation is part of how AE's panels read, and 10 renders a second is a
+// sixth of the old cost for all of them together.
+//
+// One subscription feeds every reader, so all of them refresh in the same
+// React batch rather than each on its own timer.
+
+/** While a tab PLAYS, display readers refresh at most this often. */
+export const PLAYING_UI_REFRESH_MS = 100;
+
+export const useDisplayClockStore = create<PlaybackClockState>()(() => ({ clocks: {} }));
+
+const displayStampAt = new Map<string, number>();
+const displayTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function publishDisplay(tabId: string): void {
+  const pending = displayTimers.get(tabId);
+  if (pending !== undefined) {
+    clearTimeout(pending);
+    displayTimers.delete(tabId);
+  }
+  const live = usePlaybackClockStore.getState().clocks[tabId];
+  if (!live) return;
+  displayStampAt.set(tabId, nowMs());
+  const { clocks } = useDisplayClockStore.getState();
+  const prev = clocks[tabId];
+  if (prev && prev.time === live.time && prev.frame === live.frame) return;
+  useDisplayClockStore.setState({ clocks: { ...clocks, [tabId]: live } });
+}
+
+function syncDisplay(tabId: string): void {
+  if (useProjectStore.getState().tabs[tabId]?.playing !== true) {
+    publishDisplay(tabId);
+    return;
+  }
+  const since = nowMs() - (displayStampAt.get(tabId) ?? -Infinity);
+  if (since >= PLAYING_UI_REFRESH_MS) {
+    publishDisplay(tabId);
+    return;
+  }
+  if (!displayTimers.has(tabId)) {
+    displayTimers.set(tabId, setTimeout(() => {
+      displayTimers.delete(tabId);
+      publishDisplay(tabId);
+    }, PLAYING_UI_REFRESH_MS - since));
+  }
+}
+
+usePlaybackClockStore.subscribe((state, prev) => {
+  if (state.clocks === prev.clocks) return;
+  for (const id of Object.keys(state.clocks)) {
+    if (state.clocks[id] !== prev.clocks[id]) syncDisplay(id);
+  }
+  // A dropped clock (closed tab, reset) drops its display twin.
+  const shown = useDisplayClockStore.getState().clocks;
+  let dropped = false;
+  const next: Record<string, ClockEntry> = {};
+  for (const [id, entry] of Object.entries(shown)) {
+    if (state.clocks[id]) next[id] = entry;
+    else {
+      dropped = true;
+      const pending = displayTimers.get(id);
+      if (pending !== undefined) clearTimeout(pending);
+      displayTimers.delete(id);
+      displayStampAt.delete(id);
+    }
+  }
+  if (dropped) useDisplayClockStore.setState({ clocks: next });
+});
+
+/**
+ * The playhead for DISPLAY — exact while paused, ≤10 Hz while playing (see
+ * above). Use it for anything that shows a value at the playhead; use
+ * {@link subscribeTime} for anything that must move with it every frame.
+ */
+export function useThrottledTime(tabId?: string): number {
+  const active = useProjectStore((s) => s.activeTabId);
+  const id = tabId ?? active ?? '';
+  const live = useDisplayClockStore((s) => s.clocks[id]?.time);
+  const fallback = useProjectStore((s) => (live === undefined ? s.tabs[id]?.time ?? 0 : 0));
+  return live ?? fallback;
+}
+
 // ── Project store → clock ───────────────────────────────────────────
 //
 // The project store is the authority whenever IT moves the playhead: a
@@ -229,8 +329,12 @@ useProjectStore.subscribe((state, prev) => {
       if (before.time !== tab.time || before.frame !== tab.frame) {
         adopt(tab.id, tab.time, tab.frame);
       }
-      // Pause is a coarse moment: the last playback frame becomes authoritative.
-      if (before.playing && !tab.playing) commitTime(tab.id);
+      // Pause is a coarse moment: the last playback frame becomes authoritative,
+      // and display readers stop being throttled on it.
+      if (before.playing && !tab.playing) {
+        commitTime(tab.id);
+        publishDisplay(tab.id);
+      }
     }
     // A closed tab takes its clock with it.
     const { clocks } = usePlaybackClockStore.getState();

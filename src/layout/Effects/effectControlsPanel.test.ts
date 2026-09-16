@@ -23,7 +23,12 @@ describe('Effect Controls panel wiring', () => {
     expect(def).toBeDefined();
     expect(def!.region).toBe('leftSidebar');
     expect(def!.title).toBe('Effect Controls');
-    expect(def!.closable).toBe(false);
+    // On demand since the 2026-09-15 rail consolidation (F3 / Window menu /
+    // `revealEffectControls` open it), and closable like every on-demand
+    // panel — a panel you summon is a panel you can dismiss. The wiring this
+    // file guards is the region and the openers, not permanence.
+    expect(def!.onDemand).toBe(true);
+    expect(def!.closable).toBe(true);
   });
 
   it('the Effects library stays on the right', () => {

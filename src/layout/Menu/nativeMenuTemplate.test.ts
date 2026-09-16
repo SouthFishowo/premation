@@ -30,6 +30,7 @@ import { buildLayerSettingsCommands } from '@layout/Composition/layerSettingsCom
 import { buildTextToolCommands } from '@layout/Text/textToolCommands';
 import { buildTextCommands } from '@layout/Inspector/textCommands';
 import { buildParagraphTextCommands } from '@layout/Inspector/paragraphTextCommands';
+import { buildPaintCommands } from '@layout/Paint/paintCommands';
 import { registerPowerTourCommand } from '@stores/onboardingStore';
 import { readSource } from '@/__testHelpers__/readSource';
 
@@ -80,6 +81,7 @@ describe('buildNativeMenuTemplate over APP_MENU', () => {
       ...buildTextToolCommands(),
       ...buildTextCommands(),
       ...buildParagraphTextCommands(),
+      ...buildPaintCommands(),
     ]) registry.register(cmd);
     // Registers itself rather than returning a Command — the tour's execute
     // closes over the store, so there is no build-only form of it.

@@ -234,7 +234,11 @@ export function extrusionOutlineFor(
   if (layer.kind === 'shape' && layer.primitive === 'path') {
     const subs = layerSubpaths(layer).filter((s) => !s.open && s.points.length >= 3);
     if (subs.length === 0) return null;
-    const key = `path:${subs.map((s) => hashPoints(s.points)).join('/')}`;
+    // The BOX too: the mesh's uvBox is the layer's width/height, which a path
+    // does not derive from its points — two same-shaped paths in different
+    // boxes (or a resized one) reused the first UVs and misregistered the
+    // gradient-wall plate and a bevelled front cap.
+    const key = `path:${subs.map((s) => hashPoints(s.points)).join('/')}:${W}x${H}`;
     let hit = outlines.get(key);
     if (hit === undefined) {
       const rings = bezierRunsToRings(subs.map((s) => ({ points: s.points, open: false })), 0.6);
@@ -287,6 +291,10 @@ export interface ExtrusionMeshRequest {
   bevelStyle: BevelProfile;
   /** Emit the (inset) front cap too — for outlines whose front the layer quad cannot inset. */
   frontCap?: boolean;
+  /** Chamfer the front rim (default on). Off for a front drawn by a full-size quad. */
+  frontBevel?: boolean;
+  /** AE Hole Bevel Depth as a fraction of `bevel` (default 1). */
+  holeBevelScale?: number;
 }
 
 /**
@@ -303,7 +311,10 @@ export function extrusionMeshFor(
   const depth = Math.round(req.depth * 100) / 100;
   const bevel = Math.round(req.bevel * 100) / 100;
   if (depth <= 0) return null;
-  const key = `${outline.key}|d${depth}|b${bevel}|${req.bevelStyle}${req.frontCap ? '|f' : ''}`;
+  const holeScale = Math.round(Math.max(0, Math.min(1, req.holeBevelScale ?? 1)) * 1000) / 1000;
+  // Suffixes appended only at non-default values, so existing keys are unchanged.
+  const key = `${outline.key}|d${depth}|b${bevel}|${req.bevelStyle}${req.frontCap ? '|f' : ''}`
+    + `${req.frontBevel === false ? '|nfb' : ''}${holeScale !== 1 ? `|h${holeScale}` : ''}`;
   let mesh = meshes.get(key);
   if (mesh === undefined) {
     mesh = extrudeOutline(outline.rings, {
@@ -311,6 +322,8 @@ export function extrusionMeshFor(
       bevel,
       bevelStyle: req.bevelStyle,
       frontCap: !!req.frontCap,
+      frontBevel: req.frontBevel !== false,
+      holeBevelScale: holeScale,
       bevelSegments: req.bevelStyle === 'angular' ? 1 : 5,
       uvBox: { x: -width / 2, y: -height / 2, width, height },
     });

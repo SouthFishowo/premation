@@ -73,8 +73,11 @@ import { openContextMenu } from '@stores/contextMenuStore';
 import { useOnionSkinStore } from '@stores/onionSkinStore';
 import { createOnionSkinPainter } from '@core/rendering/onionSkinPainter';
 import { memoizedSceneContentHash } from '@core/rendering/sceneContentHash';
-import { addPaintStroke, type PaintMode } from '@core/paint/paintStrokes';
-import { compToLayerLocal, isPaintableKind, localBrushSize } from '@core/paint/paintCoords';
+import type { PaintMode } from '@core/paint/paintStrokes';
+import { commitPaintDrag } from '@core/paint/paintCommit';
+import { ctrlDragBrush, penSample } from '@core/paint/paintCapture';
+import { isPaintableKind } from '@core/paint/paintCoords';
+import { paintSpaceAt, thinSamples, type PaintSpace } from '@core/paint/paintSpace';
 import { usePaintStore } from '@stores/paintStore';
 import { publishProbe, clearProbe } from './useWorkspaceProbe';
 import {
@@ -87,6 +90,8 @@ import {
 } from './useWorkspaceContextMenu';
 import { useCompareStore, captureLiveFrame, needsLiveFrame } from '@stores/compareStore';
 import { useViewportDisplayStore, viewportHudStats } from '@stores/viewportDisplayStore';
+import { usePlaybackClockStore } from '@stores/playbackClockStore';
+import { framePerf, perfBegin, perfEnd, PerfStage, installPerfDevGlobal } from '@core/perf/framePerf';
 import {
   cancelSmoothDolly,
   dollyNavBy,
@@ -108,6 +113,15 @@ import { compSizeOf } from '@core/composition/compSizes';
 import { isDescendantOf } from '@core/composition/compNavigation';
 import { openLayerOnDoubleClick } from '@layout/LayerViewer/openLayer';
 import { RULER_CSS_PX, inStrip, rulerStrips } from './rulerGeometry';
+import {
+  paintPluginDrawLists,
+  pluginPointerDown,
+  pluginPointerMove,
+  pluginPointerUp,
+  cancelPluginGesture,
+  type PluginModifiers,
+} from './pluginDrawOverlay';
+import { onPluginDrawChanged } from '@core/plugins/uiCanvas';
 
 
 /**
@@ -118,6 +132,9 @@ import { RULER_CSS_PX, inStrip, rulerStrips } from './rulerGeometry';
  * two slightly different ones.
  */
 const VIEWPORT_DRAG_SLOP = 3;
+
+/** Frame-render failures already reported — one console line per distinct message. */
+const reportedRenderErrors = new Set<string>();
 
 // ── Ruler guides (drag-out) ──────────────────────────────────────────
 // Geometry lives in rulerGeometry.ts, shared by the painter and the hit-test —
@@ -180,13 +197,14 @@ export interface UseWorkspaceArgs {
   onionCanvasRef?: React.RefObject<HTMLCanvasElement | null>;
   stageRef: React.RefObject<HTMLElement | null>;
   sceneRev: number;
-  time: number;
+  // No `time`: the playhead reaches the render loop through a clock
+  // subscription (see "Playhead → render"), never through a React prop.
   focus?: SnapshotFocus;
   focusKey?: string;
 }
 
 export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderError: string | null } {
-  const { contentCanvasRef, overlayCanvasRef, cacheCanvasRef, onionCanvasRef, stageRef, sceneRev, time, focus, focusKey } = args;
+  const { contentCanvasRef, overlayCanvasRef, cacheCanvasRef, onionCanvasRef, stageRef, sceneRev, focus, focusKey } = args;
 
   const backendRef = useRef<RenderBackend | null>(null);
   const dprRef = useRef(1);
@@ -210,7 +228,26 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
     comp: Array<{ x: number; y: number }>;
     screen: Array<{ x: number; y: number }>;
     mode: PaintMode;
+    /** The layer's paint space, resolved at PRESS time: the stroke maps through
+     *  the pose it was drawn over, even if the playhead moves before release. */
+    space: PaintSpace;
+    /** Pointer timestamps (Write On replays them) and pen input, per sample. */
+    times: number[];
+    pen: Array<{ pressure: number; tiltX: number; tiltY: number } | null>;
+    /** Shift: continue the previous stroke. Ctrl+Shift eraser: Last Stroke Only. */
+    shift: boolean;
+    lastStrokeOnly: boolean;
+    /** Comp seconds at press — the stroke's Duration starts there. */
+    compTime: number;
   } | null>(null);
+  /** Ctrl-drag in the viewer with a paint tool: Diameter, then Hardness once
+   *  Ctrl is released (AE). `at` is the press point, in overlay px. */
+  const brushSizeDragRef = useRef<{ at: { x: number; y: number }; startX: number; start: { size: number; hardness: number } } | null>(null);
+  /** Pointer over the viewer while cloning (overlay px) — the Clone Source
+   *  Overlay follows it. `compOffset` is Aligned's comp-space offset, fixed by
+   *  the first stroke after aiming. */
+  const cloneHoverRef = useRef<{ x: number; y: number } | null>(null);
+  const cloneCompOffsetRef = useRef<{ x: number; y: number } | null>(null);
   const creationDragRef = useRef<{ start: { x: number; y: number }; current: { x: number; y: number }; tool: Tool } | null>(null);
   /** Type tool: the text layer a press landed on, edited on release. */
   const typeEditRef = useRef<string | null>(null);
@@ -234,8 +271,9 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
   const roiDragRef = useRef<{ handle: RoiHandle; pointerId: number } | null>(null);
   // True while we override the engine cursor with a guide resize cursor.
   const guideCursorRef = useRef(false);
-  const timeRef = useRef(time);
-  timeRef.current = time;
+  // The playhead the render loop draws. Written by the clock subscription
+  // below, not by React — see "Playhead → render".
+  const timeRef = useRef(playheadTime());
   const focusRef = useRef(focus);
   focusRef.current = focus;
 
@@ -359,6 +397,8 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
     backend.attach(content);
     backend.setPreviewChrome?.(true);
     backendRef.current = backend;
+    // `window.__motionPerf` (dev builds) — the per-stage timings the HUD shows.
+    installPerfDevGlobal();
 
     // AnimationChanged revision — part of the cache key so a keyframe edit
     // during a playing loop invalidates every cached frame. Media decode
@@ -399,6 +439,8 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
     // sample of steady-state render speed (see renderAt).
     let lastLiveSetSig = '';
     let liveSetChangedThisRender = false;
+    /** The last `renderFrameAt` threw — its canvas must not enter the RAM preview. */
+    let lastRenderFailed = false;
     /** CSS viewport size — part of the cache key (framing), set by sizeAll. */
     let lastCssSize = '';
     const cacheVisibleClass = workspaceStyles.cacheCanvasVisible ?? 'cacheCanvasVisible';
@@ -444,10 +486,20 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
     });
 
     const paintChrome = (): void => {
-      paintOverlay(overlay, controller.ws.overlay(), dprRef.current, guideDragRef.current, controller, paintDragRef.current?.screen ?? null, timeRef.current, creationDragRef.current, paintDragRef.current?.mode ?? 'paint');
+      paintOverlay(overlay, controller.ws.overlay(), dprRef.current, guideDragRef.current, controller, paintDragRef.current?.screen ?? null, timeRef.current, creationDragRef.current, paintDragRef.current?.mode ?? 'paint', {
+        brushRing: brushSizeDragRef.current
+          ? { at: brushSizeDragRef.current.at, px: drawToolOptions.brushSize * (controller.getView().scale || 1), hardness: usePaintStore.getState().hardness }
+          : null,
+        cloneHover: cloneHoverRef.current,
+        cloneCompOffset: cloneCompOffsetRef.current,
+        content: contentCanvasRef.current,
+      });
       paintMotionPath(overlay, controller, timeRef.current, dprRef.current);
       paintRoi(overlay, controller, dprRef.current);
       paintFaceSelection(overlay, controller, dprRef.current);
+      // Third-party gizmos, last so they sit above the app's own chrome — a
+      // plugin's handles are what the user is about to grab.
+      paintPluginDrawLists(overlay, controller, timeRef.current, dprRef.current);
     };
 
     /**
@@ -461,6 +513,26 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
      * whole correctness argument for caching what it renders.
      */
     const renderFrameAt = (t: number, ghost = false): void => {
+      lastRenderFailed = false;
+      try {
+        renderFrameAtUnguarded(t, ghost);
+      } catch (err) {
+        // One bad layer used to throw straight out of the rAF callback: the
+        // frame blanked, the chrome never repainted and every later render
+        // threw the same way. Contain it to this frame, say so once per
+        // distinct message, and keep the canvas out of the RAM preview (it
+        // holds the PREVIOUS frame's pixels, or none).
+        lastRenderFailed = true;
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (!reportedRenderErrors.has(error.message)) {
+          reportedRenderErrors.add(error.message);
+          console.error('[viewport] frame render failed', error);
+          getEventBus().emit('EngineError', { engine: 'viewport-render', role: 'viewport', error });
+        }
+      }
+    };
+    const renderFrameAtUnguarded = (t: number, ghost: boolean): void => {
+      perfBegin(PerfStage.snapshot);
       const snap = {
         ...buildSnapshot(
           defaultSceneGraph,
@@ -502,6 +574,7 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
         // camera view is a shot, and is — like Active Camera.
         viewIsActiveCamera: isSceneCameraView(camera3dModeRef.current),
       };
+      perfEnd(PerfStage.snapshot);
       // Detect a live-set change (a layer crossed its in/out point this
       // frame). That frame pays one-off costs — rasterize the new layer's
       // texture, upload it, spin up its decoder — that say nothing about the
@@ -696,7 +769,8 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
       // A backend that is still initializing coalesces the snapshot instead of
       // drawing it, which would put us right back to masking with stale or
       // empty pixels. Stand down and let the next real render re-arm us.
-      if (b.lastFrameDidRender?.() === false) return;
+      // A frame that THREW is the same case.
+      if (lastRenderFailed || b.lastFrameDidRender?.() === false) return;
       if (cacheCanvas.width !== content.width || cacheCanvas.height !== content.height) {
         cacheCanvas.width = content.width;
         cacheCanvas.height = content.height;
@@ -733,7 +807,7 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
         while (visited < span.length) {
           renderFrameAt(f / fps);
           // Only a frame that actually drew, with settled media, may be kept.
-          if (b.lastFrameDidRender?.() === false) {
+          if (lastRenderFailed || b.lastFrameDidRender?.() === false) {
             finish();
             return;
           }
@@ -966,6 +1040,10 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
       const renderAt = (t: number, ghost = false): void => renderFrameAt(t, ghost);
       /** HUD sample for this real render — the wall time of the whole tick. */
       const hudStart = performance.now();
+      // Per-stage timings belong to REAL renders only: the blit path above
+      // returned before opening a frame, so cached frames never dilute them.
+      framePerf.beginFrame();
+      perfBegin(PerfStage.total);
 
       // ── Onion skins ────────────────────────────────────────────────
       //
@@ -1000,7 +1078,11 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
           // Frames holding stand-in video pixels (element mid-seek at a loop
           // wrap, a decode still warming) must not be cached — they would
           // replay their stale pixels on every later pass.
-          if (b.lastFrameMediaExact?.() !== false) viewportFrameCache.put(f, content);
+          if (!lastRenderFailed && b.lastFrameMediaExact?.() !== false) {
+            perfBegin(PerfStage.cacheReadback);
+            viewportFrameCache.put(f, content);
+            perfEnd(PerfStage.cacheReadback);
+          }
         }
         lastPlaybackPutFrame = frame;
         // Adaptive Resolution for PLAYBACK: a heavy comp's first pass renders
@@ -1041,14 +1123,18 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
           // And CACHE it, so a scrub leaves a green trail behind it. The idle
           // pump is otherwise the only paused writer, and it needs 1.5s of
           // quiet that an active scrub re-arms away on every move.
-          if (mayFillFromPausedRender({ ...gateState, mediaExact: b.lastFrameMediaExact?.() !== false })) {
+          if (!lastRenderFailed && mayFillFromPausedRender({ ...gateState, mediaExact: b.lastFrameMediaExact?.() !== false })) {
+            perfBegin(PerfStage.cacheReadback);
             viewportFrameCache.put(frame, content);
+            perfEnd(PerfStage.cacheReadback);
           }
         }
       }
 
       renderCache.mark(timeRef.current);
       presentChannelView();
+      perfEnd(PerfStage.total);
+      framePerf.endFrame();
       viewportHudStats.report(performance.now() - hudStart, false);
       paintChrome();
       // Idle pump: paused and settled → start extending the green bar; any
@@ -1293,9 +1379,8 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
   // trailing snapshot after the drag settles (rAF + a 50ms grace). Outside
   // a drag, render eagerly so the next paint reflects the latest edit.
   //
-  // `time` is intentionally exempt: it's the playhead (60×/s during
-  // playback) and rAF coalescing already gives a single snapshot per
-  // frame, which is exactly the cadence we want.
+  // `time` is not here at all: the playhead drives the render through the
+  // clock subscription below ("Playhead → render"), without React.
   const isDragging = useUIStore((s) => s.isDragging);
   useEffect(() => {
     const controller = getWorkspaceController();
@@ -1322,9 +1407,42 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
       if (raf !== null) cancelAnimationFrame(raf);
     };
   }, [sceneRev, isDragging]);
+  // ── Playhead → render ──────────────────────────────────────────────
+  //
+  // The playhead used to reach the renderer as a React prop: clock tick →
+  // WorkspaceViewport re-render (the whole viewport shell and every overlay
+  // under it) → this hook's effect → requestRender for the NEXT animation
+  // frame. A React commit and one vsync of latency on every played frame.
+  //
+  // Now the clock store is subscribed directly. A tick writes `timeRef` and
+  // asks for a redraw; the playback pump then flushes that redraw inside its
+  // own frame (`flushRenderNow`), and anything else — a paused seek, a scrub —
+  // lands on the controller's rAF, which coalesces a burst of seeks to the
+  // latest time because `render()` reads `timeRef` when it runs.
+  useEffect(() => {
+    const controller = getWorkspaceController();
+    const sync = (): void => {
+      const t = playheadTime();
+      if (t === timeRef.current) return;
+      timeRef.current = t;
+      controller.requestRender();
+    };
+    sync();
+    const offClock = usePlaybackClockStore.subscribe(sync);
+    // Switching tabs changes WHICH clock is the playhead without either clock
+    // changing value.
+    const offTab = useWorkspaceStore.subscribe((s, prev) => {
+      if (s.activeTabId !== prev.activeTabId) sync();
+    });
+    return () => {
+      offClock();
+      offTab();
+    };
+  }, []);
+
   useEffect(() => {
     getWorkspaceController().requestRender();
-  }, [time, focusKey, rulers, grid, gridSpacing, gridSubdivisions, gridStyle, gridColor, proportionalGrid, proportionalColumns, proportionalRows, safeArea, camera3dMode, customViews, draft3d, channel, draft, roi, mbEnabled, mbShutter, mbSamples, compKey]);
+  }, [focusKey, rulers, grid, gridSpacing, gridSubdivisions, gridStyle, gridColor, proportionalGrid, proportionalColumns, proportionalRows, safeArea, camera3dMode, customViews, draft3d, channel, draft, roi, mbEnabled, mbShutter, mbSamples, compKey]);
 
   // ── Auto-fit on comp-size change ───────────────────────────────────
   // Switching resolution (e.g. a 9:16 reel ↔ 16:9) re-frames the comp to fill
@@ -1624,6 +1742,25 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
           return;
         }
       }
+      /*
+        Plugin on-canvas UI, before any host gesture that could swallow it.
+
+        Two claims, both in `pluginDrawOverlay`: a contributed TOOL owns the
+        whole viewport while it is active, and a press on a plugin's HANDLE
+        owns that one drag. Anything else falls straight through, which is what
+        lets a plugin's gizmo sit on screen while the user keeps using Select.
+      */
+      if (pluginPointerDown(controller, local(e), modifiersOf(e), timeRef.current)) {
+        e.preventDefault();
+        try {
+          overlay.setPointerCapture(e.pointerId);
+        } catch {
+          /* best-effort */
+        }
+        useUIStore.getState().setDragging(true);
+        controller.requestRender();
+        return;
+      }
       // Region of Interest: grabbing a grip resizes the region. Only the EDGES
       // are interactive (roiHandleAt ignores the interior), so clicking inside
       // the region still selects the layer under it, as in AE.
@@ -1714,30 +1851,70 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
           });
           return;
         }
-        const hitNode = controller.ws.hitTestScreen(local(e));
-        if (!hitNode || hitNode.id !== node.id) {
-          // Off the layer. Not an error worth a toast on every stray click —
-          // paint simply has nowhere to land outside its own layer.
-          return;
-        }
+        // No hit-test against the stack. This used to require the selected layer
+        // to be the TOPMOST thing under the cursor, so a layer lying under
+        // another one silently took no paint at all. AE paints the layer you
+        // target, wherever it sits; a stroke off its surface simply clips.
         e.preventDefault();
         const cp = controller.ws.screenToWorld(local(e));
+        // The layer's placement AT THE PLAYHEAD — parent chain, keyframes, and
+        // for a 3D layer the view on screen. Resolved once and carried on the
+        // drag, so the whole stroke maps through the pose it was drawn over.
+        const comp = compSize();
+        const space = paintSpaceAt(node.id, playheadTime(), { width: comp.w, height: comp.h });
+        const pressLocal = space?.toLocal(cp) ?? null;
+        if (!space || !pressLocal) {
+          // Edge-on to the view (or scaled to nothing): there is no surface
+          // under the pointer, and guessing one paints somewhere else.
+          useUIStore.getState().notify({
+            level: 'info',
+            message: 'This layer has no surface under the pointer in this view — turn it or change the view to paint on it.',
+            durationMs: 2600,
+          });
+          return;
+        }
         // The mode rides on the DRAG, not on the store. The eraser is not "paint
         // with a checkbox someone remembered to tick" — its whole identity is
         // that it erases, so it must not be able to lay down colour because a
         // shared setting happened to be on `paint` when it started.
-        const dragMode = erasing ? 'erase' : usePaintStore.getState().mode;
+        const paintSettings = usePaintStore.getState();
+        // Ctrl-drag sizes the brush instead of painting (Ctrl+Shift stays the
+        // eraser's Last Stroke Only).
+        if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+          brushSizeDragRef.current = { at: local(e), startX: e.clientX, start: { size: drawToolOptions.brushSize, hardness: paintSettings.hardness } };
+          try {
+            overlay.setPointerCapture(e.pointerId);
+          } catch {
+            /* best-effort */
+          }
+          controller.requestRender();
+          return;
+        }
+        const dragMode = erasing ? 'erase' : paintSettings.mode === 'clone' ? 'clone' : 'paint';
         if (dragMode === 'clone') {
           // Clone stamp aiming: Alt-click SETS the source and lays no paint —
-          // the classic gesture. A stroke without an aimed source has nothing
-          // to sample, so it refuses with the reason instead of painting
-          // nothing silently.
+          // the classic gesture. Stored in the SOURCE layer's own space (this
+          // layer, or the Paint panel's Source layer), so it follows that layer
+          // through its animation and cannot leak onto an unrelated one.
           if (e.altKey) {
-            usePaintStore.getState().set({ cloneSource: { x: cp.x, y: cp.y } });
+            const srcId = paintSettings.cloneSourceLayerId && paintSettings.cloneSourceLayerId !== node.id
+              ? paintSettings.cloneSourceLayerId
+              : node.id;
+            const srcSpace = srcId === node.id ? space : paintSpaceAt(srcId, playheadTime(), { width: comp.w, height: comp.h });
+            const at = srcSpace?.toLocal(cp) ?? null;
+            if (!at) return;
+            paintSettings.set({ cloneSource: { nodeId: srcId, x: at.x, y: at.y, compX: cp.x, compY: cp.y }, alignedOffset: null });
+            cloneCompOffsetRef.current = null;
             useUIStore.getState().notify({ level: 'info', message: 'Clone source set.', durationMs: 1400 });
             return;
           }
-          if (!usePaintStore.getState().cloneSource) {
+          // A stroke without a usable source has nothing to sample, so it
+          // refuses with the reason instead of painting nothing silently. A
+          // source aimed on another layer counts only when the Paint panel's
+          // Source names that layer; otherwise it is dropped, not reinterpreted.
+          const source = paintSettings.cloneSource;
+          if (!source || (source.nodeId !== node.id && source.nodeId !== paintSettings.cloneSourceLayerId)) {
+            if (source) paintSettings.set({ cloneSource: null });
             useUIStore.getState().notify({
               level: 'info',
               message: 'Alt-click to set the clone source first.',
@@ -1745,12 +1922,22 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
             });
             return;
           }
+          // Aligned: the first stroke after aiming fixes the overlay's offset too.
+          if (!paintSettings.alignedOffset && source.compX !== undefined && source.compY !== undefined) {
+            cloneCompOffsetRef.current = { x: source.compX - cp.x, y: source.compY - cp.y };
+          }
         }
         paintDragRef.current = {
           nodeId: node.id,
           comp: [cp],
           screen: [local(e)],
           mode: dragMode,
+          space,
+          times: [e.timeStamp],
+          pen: [penSample(e)],
+          shift: e.shiftKey && !(e.ctrlKey || e.metaKey),
+          lastStrokeOnly: erasing && e.shiftKey && (e.ctrlKey || e.metaKey),
+          compTime: playheadTime(),
         };
         try {
           overlay.setPointerCapture(e.pointerId);
@@ -1848,6 +2035,13 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
         moveCameraNav(e);
         return;
       }
+      // A plugin gesture in flight claims the move; with none in flight this
+      // still delivers HOVER to a plugin whose handle is under the pointer and
+      // returns false, because hover is information rather than a claim.
+      if (pluginPointerMove(controller, local(e), modifiersOf(e), timeRef.current)) {
+        controller.requestRender();
+        return;
+      }
       // Region-of-Interest resize in progress.
       {
         const rd = roiDragRef.current;
@@ -1875,10 +2069,35 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
           buttons: e.buttons,
         });
       }
+      // Ctrl-drag brush sizing: Diameter while Ctrl is held, Hardness after.
+      if (brushSizeDragRef.current) {
+        const bs = brushSizeDragRef.current;
+        const zoom = controller.getView().scale || 1;
+        const phase = e.ctrlKey || e.metaKey ? 'size' : 'hardness';
+        const next = ctrlDragBrush(bs.start, (e.clientX - bs.startX) / zoom, phase);
+        drawToolOptions.brushSize = next.size;
+        if (phase === 'hardness') usePaintStore.getState().set({ hardness: next.hardness });
+        controller.requestRender();
+        return;
+      }
+      // Clone Source Overlay follows the pointer while cloning.
+      {
+        const ps = usePaintStore.getState();
+        const cloning = useUIStore.getState().activeTool === 'paint' && ps.mode === 'clone' && ps.cloneOverlay;
+        if (cloning) {
+          cloneHoverRef.current = local(e);
+          if (!paintDragRef.current) controller.requestRender();
+        } else if (cloneHoverRef.current) {
+          cloneHoverRef.current = null;
+          controller.requestRender();
+        }
+      }
       // Active Brush paint: append the sample and repaint the wet-stroke preview.
       if (paintDragRef.current) {
         paintDragRef.current.comp.push(controller.ws.screenToWorld(local(e)));
         paintDragRef.current.screen.push(local(e));
+        paintDragRef.current.times.push(e.timeStamp);
+        paintDragRef.current.pen.push(penSample(e));
         controller.requestRender();
         return;
       }
@@ -1984,6 +2203,14 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
       } catch {
         /* ignore */
       }
+      // Closes the plugin gesture's single undo bracket — see
+      // `beginPluginGesture`. Before every early return below, because a claim
+      // left open suppresses history for the rest of the session.
+      if (pluginPointerUp(controller, local(e), modifiersOf(e), timeRef.current)) {
+        useUIStore.getState().setDragging(false);
+        controller.requestRender();
+        return;
+      }
       if (typeEditRef.current) {
         const id = typeEditRef.current;
         typeEditRef.current = null;
@@ -2004,6 +2231,11 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
         endCameraNav();
         return;
       }
+      if (brushSizeDragRef.current) {
+        brushSizeDragRef.current = null;
+        controller.requestRender();
+        return;
+      }
       // Commit the Brush paint pass: map every sample into layer space and add
       // ONE stroke (one undo step), then clear the wet-stroke preview.
       const pd = paintDragRef.current;
@@ -2012,31 +2244,46 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
         useUIStore.getState().setDragging(false);
         const node = defaultSceneGraph.getNode(pd.nodeId);
         if (node) {
-          const s = usePaintStore.getState();
-          const points = pd.comp.map((cp) => compToLayerLocal(node, cp));
-          // Clone offset: source − first dab, converted to layer-local like the
-          // points themselves so a transformed layer samples the right texels.
-          const cloneOffset = (() => {
-            if (pd.mode !== 'clone' || !s.cloneSource || pd.comp.length === 0) return null;
-            const src = compToLayerLocal(node, { x: s.cloneSource.x, y: s.cloneSource.y });
-            const first = points[0]!;
-            return { x: src.x - first.x, y: src.y - first.y };
-          })();
-          addPaintStroke(pd.nodeId, {
-            points,
-            ...(cloneOffset ? { cloneOffsetX: cloneOffset.x, cloneOffsetY: cloneOffset.y } : {}),
-            // Size + colour are shared with the freehand brush (Tool Options bar).
-            // Size is a comp-pixel diameter → convert to the layer's local units
-            // so a scaled-up layer doesn't turn one stroke into a giant blob.
-            color: drawToolOptions.brushColor,
-            size: localBrushSize(node, drawToolOptions.brushSize),
-            opacity: s.opacity,
-            hardness: s.hardness,
-            // From the DRAG, not the store: the eraser decided this when the
-            // stroke began, and a store read here would let a mode change
-            // mid-stroke commit the opposite of what was drawn on screen.
-            mode: pd.mode,
-          });
+          // Thin the drag first. Every pointer sample used to be stored, so a
+          // slow stroke carried thousands of sub-pixel-apart points into the
+          // document, every undo snapshot and every raster's cache key. Same
+          // 0.5 px jitter rule the Layer panel applies as it samples.
+          const keptIdx = thinSamples(pd.screen, 0.5);
+          // Through the pose resolved at press time (parents, keyframes, 3D).
+          // A sample that slid off an edge-on layer is dropped, not pinned to
+          // the layer origin — with its timestamp and pen input, so the three
+          // stay parallel.
+          const points: Array<{ x: number; y: number }> = [];
+          const times: number[] = [];
+          const pen: typeof pd.pen = [];
+          for (const i of keptIdx) {
+            const p = pd.space.toLocal(pd.comp[i]!);
+            if (!p) continue;
+            points.push(p);
+            times.push(pd.times[i] ?? 0);
+            pen.push(pd.pen[i] ?? null);
+          }
+          if (points.length > 0) {
+            // One stroke, ONE undo step, through the commit the Layer panel
+            // uses. Mode comes from the DRAG, not the store: the eraser decided
+            // it when the stroke began. Size is a comp-pixel diameter → the
+            // layer's local units, measured through the same mapping as the
+            // points, so parent, animated and 3D scale all count.
+            const result = commitPaintDrag({
+              nodeId: pd.nodeId,
+              mode: pd.mode,
+              points,
+              times,
+              pen,
+              size: pd.space.brushSize(pd.comp[keptIdx[0] ?? 0]!, drawToolOptions.brushSize),
+              compTime: pd.compTime,
+              continueStroke: pd.shift,
+              lastStrokeOnly: pd.lastStrokeOnly,
+            });
+            if (!result.ok && result.reason) {
+              useUIStore.getState().notify({ level: 'info', message: result.reason, durationMs: 2600 });
+            }
+          }
         }
         controller.requestRender();
         return;
@@ -2223,6 +2470,10 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
     overlay.addEventListener('wheel', onWheel, { passive: false });
     window.addEventListener('keydown', onAltDown);
     window.addEventListener('keyup', onAltUp);
+    // A plugin changing what it wants drawn has to repaint the chrome. It has
+    // no frame of its own to wait for: the viewport is otherwise idle between
+    // the user's gestures, which is exactly when a plugin answers one.
+    const pluginDrawSub = onPluginDrawChanged(() => { controller.requestRender(); });
 
     return () => {
       overlay.removeEventListener('pointerdown', onDown);
@@ -2237,9 +2488,12 @@ export function useWorkspace(args: UseWorkspaceArgs): { ready: boolean; renderEr
       window.removeEventListener('keyup', onAltUp);
       guidesSub();
       toolSub();
+      pluginDrawSub();
       cancelSmoothDolly();
       controller.ws.cancelTransientInput();
-      // Unmounting mid-drag must not leak an open gesture transaction.
+      // Unmounting mid-drag must not leak an open gesture transaction — the
+      // plugin bracket included, which suppresses history while it is open.
+      cancelPluginGesture();
       endViewportGesture();
       useUIStore.getState().setDragging(false);
       overlay.style.cursor = '';
@@ -2300,6 +2554,18 @@ function paintOverlay(
    * about to cut a hole.
    */
   paintMode: PaintMode = 'paint',
+  /**
+   * Paint-tool chrome: the Ctrl-drag Diameter/Hardness ring, and the Clone
+   * Source Overlay — what the clone stamp would lay down under the pointer,
+   * sampled from the rendered viewport at the source offset (the Aligned
+   * offset once a stroke has fixed it, else the aimed source point).
+   */
+  paintChrome: {
+    brushRing: { at: { x: number; y: number }; px: number; hardness: number } | null;
+    cloneHover: { x: number; y: number } | null;
+    cloneCompOffset: { x: number; y: number } | null;
+    content: HTMLCanvasElement | null;
+  } | null = null,
 ): void {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
@@ -2352,6 +2618,71 @@ function paintOverlay(
       ctx.stroke();
     }
     ctx.restore();
+  }
+
+  // Ctrl-drag brush sizing: the tip at its new diameter, hardness as an inner ring.
+  if (paintChrome?.brushRing) {
+    const { at, px, hardness } = paintChrome.brushRing;
+    const r = Math.max(1, px / 2);
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.shadowColor = 'rgba(0,0,0,0.6)';
+    ctx.shadowBlur = 2;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(at.x, at.y, r, 0, Math.PI * 2);
+    ctx.stroke();
+    if (hardness < 1) {
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.arc(at.x, at.y, Math.max(0.5, r * hardness), 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Clone Source Overlay: a lens at the pointer showing the source content the
+  // stamp would paint there — semi-transparent, or as a Difference against the
+  // pixels under it (black where source and destination already match).
+  {
+    const ps = usePaintStore.getState();
+    const hover = paintChrome?.cloneHover;
+    const content = paintChrome?.content;
+    const src = ps.cloneSource;
+    if (hover && content && controller && ps.cloneOverlay && ps.mode === 'clone'
+        && src?.compX !== undefined && src.compY !== undefined && content.width > 0 && cssW > 0 && cssH > 0) {
+      const hw = controller.ws.screenToWorld(hover);
+      const off = ps.cloneAligned && ps.alignedOffset && paintChrome?.cloneCompOffset
+        ? paintChrome.cloneCompOffset
+        : { x: src.compX - hw.x, y: src.compY - hw.y };
+      const at = controller.ws.worldToScreen({ x: hw.x + off.x, y: hw.y + off.y });
+      const zoom = controller.getView().scale || 1;
+      const r = Math.max(48, drawToolOptions.brushSize * zoom * 1.5);
+      const kx = content.width / cssW;
+      const ky = content.height / cssH;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(hover.x, hover.y, r, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.globalAlpha = Math.max(0, Math.min(1, ps.cloneOverlayOpacity));
+      try {
+        if (ps.cloneOverlayDifference) {
+          ctx.drawImage(content, (hover.x - r) * kx, (hover.y - r) * ky, 2 * r * kx, 2 * r * ky, hover.x - r, hover.y - r, 2 * r, 2 * r);
+          ctx.globalCompositeOperation = 'difference';
+        }
+        ctx.drawImage(content, (at.x - r) * kx, (at.y - r) * ky, 2 * r * kx, 2 * r * ky, hover.x - r, hover.y - r, 2 * r, 2 * r);
+      } catch {
+        // A WebGL canvas mid-resize can refuse a read; the lens just skips a frame.
+      }
+      ctx.restore();
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(hover.x, hover.y, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 
   // Persistent ruler guides (screen-space, from the engine's overlay). Hidden
@@ -2579,14 +2910,47 @@ function paintOverlay(
         ctx.lineWidth = 1;
         ctx.stroke();
       } else if (h.kind === 'point') {
-        // Vertex anchor: filled square
-        ctx.fillStyle = handleAccent;
-        ctx.strokeStyle = '#fff';
+        // Vertex anchor. AE: SELECTED vertices are filled, the rest hollow —
+        // which is how a multi-vertex selection reads at all. An overlay with
+        // no selection flags anywhere (every tool but Direct Selection) keeps
+        // the old all-filled look. The FIRST vertex is drawn larger (AE Set
+        // First Vertex), since it decides where Trim Paths starts.
+        const anySelected = overlay.handles.some((o) => o.selected);
+        const filled = !anySelected || h.selected === true;
+        const half = h.first ? 5.5 : 4;
+        ctx.fillStyle = filled ? handleAccent : '#fff';
+        ctx.strokeStyle = filled ? '#fff' : handleAccent;
         ctx.lineWidth = 1.5;
-        ctx.fillRect(h.position.x - 4, h.position.y - 4, 8, 8);
-        ctx.strokeRect(h.position.x - 4, h.position.y - 4, 8, 8);
+        ctx.fillRect(h.position.x - half, h.position.y - half, half * 2, half * 2);
+        ctx.strokeRect(h.position.x - half, h.position.y - half, half * 2, half * 2);
+      } else if (h.kind === 'feather') {
+        // Mask feather point: a ring at the feather width, tied to its vertex.
+        if (h.origin) {
+          ctx.beginPath();
+          ctx.moveTo(h.origin.x, h.origin.y);
+          ctx.lineTo(h.position.x, h.position.y);
+          ctx.strokeStyle = handleAccent;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+        ctx.beginPath();
+        ctx.arc(h.position.x, h.position.y, 4.5, 0, Math.PI * 2);
+        ctx.fillStyle = h.hovered ? handleAccent : '#fff';
+        ctx.fill();
+        ctx.strokeStyle = handleAccent;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
       } else if (h.kind === 'tangent-in' || h.kind === 'tangent-out') {
-        // Tangent handle: circle
+        // Tangent handle: circle, on an arm from its vertex when the tool
+        // says where that is.
+        if (h.origin) {
+          ctx.beginPath();
+          ctx.moveTo(h.origin.x, h.origin.y);
+          ctx.lineTo(h.position.x, h.position.y);
+          ctx.strokeStyle = 'rgba(90,140,255,0.7)';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
         ctx.beginPath();
         ctx.arc(h.position.x, h.position.y, 4, 0, Math.PI * 2);
         ctx.fillStyle = '#fff';
@@ -2614,6 +2978,22 @@ function paintOverlay(
         ctx.strokeRect(h.position.x - r, h.position.y - r, r * 2, r * 2);
       }
     }
+  }
+
+  // Free Transform Points: the box around the selected vertices. Its grips and
+  // anchor come through `handles` like any other; this is the outline.
+  if (overlay.pathTransformBox) {
+    const c = overlay.pathTransformBox.corners;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(c[0].x, c[0].y);
+    for (let i = 1; i < 4; i++) ctx.lineTo(c[i]!.x, c[i]!.y);
+    ctx.closePath();
+    ctx.strokeStyle = ACCENT;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    ctx.stroke();
+    ctx.restore();
   }
 
   // Draw tangent arm lines (connect vertex to its tangent handles)
@@ -2962,6 +3342,11 @@ function themeGuides(): Omit<NonNullable<typeof guideCache>, 'key'> {
  * Drawn from the SAME projected quads the picker hit-tests, so the highlight can
  * never disagree with what a click would select.
  */
+/** The modifier flags of a pointer event, in the shape the plugin protocol carries. */
+function modifiersOf(e: PointerEvent): PluginModifiers {
+  return { alt: e.altKey, ctrl: e.ctrlKey, meta: e.metaKey, shift: e.shiftKey };
+}
+
 function paintFaceSelection(canvas: HTMLCanvasElement, controller: WorkspaceController, dpr: number): void {
   const fs = useFaceSelectionStore.getState();
   if (!fs.enabled) return;

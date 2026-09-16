@@ -35,3 +35,12 @@ export {
   RotoTool,
   createBuiltinTools,
 } from './builtin';
+export { AddVertexTool, DeleteVertexTool, ConvertVertexTool, MaskFeatherTool } from './pathTools';
+export {
+  outlinesOfNode,
+  selectedOutlines,
+  commitOutline,
+  outlineKey,
+  type Outline,
+  type OutlineId,
+} from './pathEdit';

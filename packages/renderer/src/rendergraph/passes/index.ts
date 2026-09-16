@@ -4,6 +4,7 @@ import { RenderGraph } from '../RenderGraph';
 import { ClearPass } from './ClearPass';
 import { BackgroundPass } from './BackgroundPass';
 import { CompositionPass, PLUGIN_ORIGIN, PLUGIN_HALF1, PLUGIN_HALF2, PLUGIN_QUARTER1, PLUGIN_QUARTER2, LAYER_TARGET, BLUR_TARGET1, BLUR_TARGET2, BLUR_TARGET3, MATTE_TARGET, DOF_TARGET, BACKDROP_HALF1, BACKDROP_HALF2, BACKDROP_DOWNSCALE, PRECOMP_TARGETS, FX_HIST_TARGET, FX_LUT_TARGET } from './CompositionPass';
+import { GENERATOR_TARGET } from './generatorField';
 import { OverlayPass } from './OverlayPass';
 import { MaskPass, MASK_TARGET } from './MaskPass';
 import { EffectPass, SCENE_COLOR_TARGET } from './EffectPass';
@@ -11,6 +12,7 @@ import { EffectPass, SCENE_COLOR_TARGET } from './EffectPass';
 export { ClearPass } from './ClearPass';
 export { BackgroundPass } from './BackgroundPass';
 export { CompositionPass, FX_HIST_TARGET, FX_LUT_TARGET, PLUGIN_ORIGIN, PLUGIN_HALF1, PLUGIN_HALF2, PLUGIN_QUARTER1, PLUGIN_QUARTER2, PLUGIN_SCALED_TARGETS, LAYER_TARGET, BLUR_TARGET1, BLUR_TARGET2, BLUR_TARGET3, MATTE_TARGET, DOF_TARGET, BACKDROP_HALF1, BACKDROP_HALF2, BACKDROP_DOWNSCALE, PRECOMP_TARGETS, MAX_PRECOMP_DEPTH } from './CompositionPass';
+export { GENERATOR_TARGET, forgetGeneratorBuffers, renderGeneratorField } from './generatorField';
 export { OverlayPass } from './OverlayPass';
 export { MaskPass, MASK_TARGET } from './MaskPass';
 export { EffectPass, SCENE_COLOR_TARGET } from './EffectPass';
@@ -141,6 +143,26 @@ export function buildDefaultGraph(): RenderGraph {
   // ago and overwritten. Its own target rather than a loan from the effect
   // pool: borrowing would contend with glow's wide lobe and make a chain's
   // legal length depend on what else is stacked on the layer.
+  /*
+    The offscreen a plugin generator's instances are drawn into.
+
+    Its own target rather than a loan from the blur pool or from LAYER_TARGET,
+    for a reason the pool cannot express: a generator's field is the layer's
+    CONTENT, and the branches immediately after it — mattes, advanced blend,
+    effect chains — use those targets to composite that content. Borrowing one
+    would mean the field being overwritten by the first operation applied to it.
+
+    No depth attachment. The field's instances sort by draw order within a flat
+    layer (see `generatorField.ts`); the layer itself depth-tests, if it is 3D,
+    where every other flat layer does.
+  */
+  graph.declareTarget(GENERATOR_TARGET, (vp) => ({
+    label: GENERATOR_TARGET,
+    width: vp.pixelSize.width,
+    height: vp.pixelSize.height,
+    format: 'rgba16float',
+  }));
+
   graph.declareTarget(PLUGIN_ORIGIN, (vp) => ({
     label: PLUGIN_ORIGIN,
     width: vp.pixelSize.width,

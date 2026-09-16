@@ -68,7 +68,7 @@ describe('declaring a chain', () => {
     // are "worked, but not the way you wrote it".
     const { effect, errors } = parseOne({ shader: FS, passes: [pass('a')] });
     expect(effect).toBeUndefined();
-    expect(errors.join(' ')).toMatch(/declares both "shader" and "passes"/);
+    expect(errors.join(' ')).toMatch(/declares both "shader"\/"glsl" and "passes"/);
   });
 
   it('refuses an empty chain rather than treating it as absent', () => {

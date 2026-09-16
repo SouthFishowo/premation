@@ -11,7 +11,11 @@
  * THE INVARIANTS these pin:
  *   1. absent ≠ 100. Absent means untouched and keeps the effect on its GPU
  *      path; present — at ANY value, 100 included — forces the CPU bake, which
- *      is the only chain that can blend against an input.
+ *      is the only chain that can blend against an input. EXCEPT an effect
+ *      that is one GPU chain entry (2026-09-15): the chain blends those itself
+ *      and they never bake for it — see effectOpacityGpu.test.ts. The fixture
+ *      here is a colour grade, which folds into the layer's colour matrix and
+ *      so still bakes.
  *   2. the reserved key cannot collide with the nineteen effects that already
  *      declare a param plainly named `opacity`.
  *   3. an animated opacity stamps the field on EVERY frame, so a 0→100→0 ramp
@@ -39,7 +43,7 @@ import { pluginEffectDefs } from './pluginEffectDefs';
 import { effectsNeedCpuBake, layerIsBaked } from './effectBake';
 import { resolvePropertyMeta } from '@core/inspector/propertyMeta';
 
-const blur: Effect = { id: 'e1', type: 'blur', params: { radius: 8 } } as Effect;
+const grade: Effect = { id: 'e1', type: 'brightness', params: { brightness: 120 } } as Effect;
 
 describe('the reserved key', () => {
   it('collides with no built-in or plugin param key', () => {
@@ -79,40 +83,40 @@ describe('the reserved key', () => {
 
 describe('absent is not 100', () => {
   it('an untouched effect blends at 1 and forces no bake', () => {
-    expect(effectHasOpacity(blur)).toBe(false);
-    expect(effectOpacityOf(blur)).toBe(1);
-    expect(effectsNeedCpuBake([blur])).toBe(false);
+    expect(effectHasOpacity(grade)).toBe(false);
+    expect(effectOpacityOf(grade)).toBe(1);
+    expect(effectsNeedCpuBake([grade])).toBe(false);
   });
 
   it('a PRESENT opacity forces the bake even at exactly 100', () => {
     // This is what stops a 0→100→0 ramp from flipping to the GPU path at its
     // peak and popping where the two backends round differently.
-    expect(effectsNeedCpuBake([{ ...blur, opacity: 100 }])).toBe(true);
-    expect(effectsNeedCpuBake([{ ...blur, opacity: 50 }])).toBe(true);
-    expect(effectsNeedCpuBake([{ ...blur, opacity: 0 }])).toBe(true);
+    expect(effectsNeedCpuBake([{ ...grade, opacity: 100 }])).toBe(true);
+    expect(effectsNeedCpuBake([{ ...grade, opacity: 50 }])).toBe(true);
+    expect(effectsNeedCpuBake([{ ...grade, opacity: 0 }])).toBe(true);
   });
 
   it('reaches layerIsBaked, so every call site agrees', () => {
     // M5b's single source of truth must see it too, or the rasterizer and the
     // frame-scene builder disagree about who owns the chain and it runs twice.
     for (const kind of ['shape', 'text', 'image', 'video']) {
-      expect(layerIsBaked({ kind, effects: [{ ...blur, opacity: 40 }] })).toBe(true);
+      expect(layerIsBaked({ kind, effects: [{ ...grade, opacity: 40 }] })).toBe(true);
     }
   });
 
   it('a DISABLED effect with an opacity forces no bake', () => {
-    expect(effectsNeedCpuBake([{ ...blur, opacity: 40, enabled: false }])).toBe(false);
+    expect(effectsNeedCpuBake([{ ...grade, opacity: 40, enabled: false }])).toBe(false);
   });
 
   it('rejects a non-finite stored value rather than blending by NaN', () => {
-    expect(effectOpacityOf({ ...blur, opacity: NaN })).toBe(1);
-    expect(effectHasOpacity({ ...blur, opacity: NaN })).toBe(false);
+    expect(effectOpacityOf({ ...grade, opacity: NaN })).toBe(1);
+    expect(effectHasOpacity({ ...grade, opacity: NaN })).toBe(false);
   });
 
   it('clamps a stored value outside 0..100', () => {
-    expect(effectOpacityOf({ ...blur, opacity: 250 })).toBe(1);
-    expect(effectOpacityOf({ ...blur, opacity: -40 })).toBe(0);
-    expect(effectOpacityOf({ ...blur, opacity: 50 })).toBe(0.5);
+    expect(effectOpacityOf({ ...grade, opacity: 250 })).toBe(1);
+    expect(effectOpacityOf({ ...grade, opacity: -40 })).toBe(0);
+    expect(effectOpacityOf({ ...grade, opacity: 50 })).toBe(0.5);
   });
 });
 
@@ -121,31 +125,31 @@ describe('resolveEffectParams samples it per frame', () => {
     p === effectOpacityPath('e1') ? v : undefined;
 
   it('stamps the sampled value onto the effect', () => {
-    const out = resolveEffectParams([blur], sampleAt(35))[0]!;
+    const out = resolveEffectParams([grade], sampleAt(35))[0]!;
     expect(out.opacity).toBe(35);
     expect(effectOpacityOf(out)).toBeCloseTo(0.35);
   });
 
   it('stamps it on frames that sample exactly 100, keeping the path stable', () => {
     // Invariant 3. The whole animation must stay on one render path.
-    const peak = resolveEffectParams([blur], sampleAt(100))[0]!;
+    const peak = resolveEffectParams([grade], sampleAt(100))[0]!;
     expect(peak.opacity).toBe(100);
     expect(effectsNeedCpuBake([peak])).toBe(true);
   });
 
   it('leaves an unanimated effect untouched', () => {
-    const out = resolveEffectParams([blur], sampleAt(undefined))[0]!;
+    const out = resolveEffectParams([grade], sampleAt(undefined))[0]!;
     expect(out.opacity).toBeUndefined();
     expect(effectsNeedCpuBake([out])).toBe(false);
   });
 
   it('the static value survives when there is no track', () => {
-    const out = resolveEffectParams([{ ...blur, opacity: 60 }], sampleAt(undefined))[0]!;
+    const out = resolveEffectParams([{ ...grade, opacity: 60 }], sampleAt(undefined))[0]!;
     expect(out.opacity).toBe(60);
   });
 
   it('an animated value beats the stored one', () => {
-    const out = resolveEffectParams([{ ...blur, opacity: 60 }], sampleAt(10))[0]!;
+    const out = resolveEffectParams([{ ...grade, opacity: 60 }], sampleAt(10))[0]!;
     expect(out.opacity).toBe(10);
   });
 

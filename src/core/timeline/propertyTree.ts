@@ -37,7 +37,7 @@ import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import type { SceneNode } from '@core/types';
 import { readNodeKind } from '@core/scene/sceneDerive';
 import { is3DEnabled } from '@core/scene/threeD';
-import { POSITION_PSEUDO_PROP } from '@motion/animation';
+import { POSITION_PSEUDO_PROP, defaultAnimation } from '@motion/animation';
 import {
   resolvePropertyMeta,
   propertyLabel,
@@ -58,6 +58,16 @@ import {
 import { readPathOps, pathOpParamSpecs, pathOpPropPath } from '@core/scene/pathOps';
 import { readNodePolystar, polystarParamSpecs, polystarPropPath } from '@core/scene/polystar';
 import { readNodeMask, readNodeMaskAnim, maskPropPath, MASK_PROPERTY_KEYS } from '@core/effects/mask';
+import { readNodePaint } from '@core/paint/paintStrokes';
+import {
+  PAINT_CLONE_KEYS,
+  PAINT_TRANSFORM_KEYS,
+  paintColorPath,
+  paintPathProp,
+  paintPropPath,
+  strokeDisplayNames,
+  type PaintNumericKey,
+} from '@core/paint/paintProps';
 import {
   readAnimatorData,
   animatorPropPath,
@@ -72,6 +82,9 @@ import { readTextPathConfig, textPathPropPath, TEXT_PATH_PARAMS } from '@core/te
 import { readFontAxesProp, axisPropPath } from '@core/text/fontAxes';
 import { AUDIO_LEVEL_DB_PROP, AUDIO_PAN_PROP } from '@core/audio/audioParams';
 import { gradientGeometryPropsFor } from '@core/inspector/gradientGeometryProps';
+import { readNodeStrokes } from '@core/paint/stroke';
+import { isIdentityTaper, isIdentityWave } from '@core/scene/strokeProfile';
+import { strokeTrackPath, dashParamAt, type StrokeTrackParam } from '@core/rendering/strokeTracks';
 
 /**
  * The sections a layer's properties fall into, in AE's own twirl order.
@@ -89,6 +102,7 @@ export type TimelineGroupKey =
   | 'styles'
   | 'camera'
   | 'light'
+  | 'geometry'
   | 'material'
   | 'audio'
   | 'time';
@@ -104,9 +118,11 @@ export const TIMELINE_GROUP_ORDER: Readonly<Record<TimelineGroupKey, number>> = 
   // only ever has one of the two, so they share the slot in spirit.
   camera: 6,
   light: 7,
-  material: 8,
-  audio: 9,
-  time: 10,
+  // AE's Geometry Options sits directly above Material Options.
+  geometry: 8,
+  material: 9,
+  audio: 10,
+  time: 11,
 };
 
 /** The synthetic path of the whole-mask keyframe row (see `maskRow` below). */
@@ -163,6 +179,26 @@ function materialRows(node: SceneNode, nodeId: string): StaticPropertyRow[] {
   return props.map((prop) => row(prop, 'material', [prop], { nodeId }));
 }
 
+/** The keyframeable Geometry Options — the depths buildSnapshot samples per frame. */
+const GEOMETRY_PROPS: ReadonlySet<string> = new Set(['extrusionDepth', 'bevelDepth', 'holeBevelDepth']);
+
+/**
+ * AE Geometry Options rows for a 3D layer that can have a body — listed before
+ * anything is keyed, so extrusion can be animated from the timeline and not
+ * only from the inspector's stopwatches. Hole Bevel Depth only where there are
+ * counters to bevel (text and free paths). Cameras, lights and nulls have no
+ * geometry.
+ */
+function geometryRows(node: SceneNode, nodeId: string): StaticPropertyRow[] {
+  if (!is3DEnabled(node)) return [];
+  const kind = readNodeKind(node);
+  if (kind === 'camera' || kind === 'light' || kind === 'null' || kind === 'group' || kind === 'audio') return [];
+  const shapeType = node.components.find((c) => c.type === 'Transform')?.props.shapeType;
+  const hasHoles = kind === 'text' || (kind === 'shape' && typeof shapeType === 'string' && shapeType !== 'rect' && shapeType !== 'ellipse');
+  const props = hasHoles ? ['bevelDepth', 'holeBevelDepth', 'extrusionDepth'] : ['bevelDepth', 'extrusionDepth'];
+  return props.map((prop) => row(prop, 'geometry', [prop], { nodeId }));
+}
+
 /**
  * The section a path belongs to.
  *
@@ -172,8 +208,11 @@ function materialRows(node: SceneNode, nodeId: string): StaticPropertyRow[] {
  */
 export function groupForProp(prop: string, nodeId?: string): TimelineGroupKey {
   if (prop === MASK_ANIM_PROP || prop.startsWith('mask.')) return 'masks';
+  // AE lists Paint as an effect: Effects ▸ Paint ▸ Brush N.
+  if (prop.startsWith('paint.')) return 'effects';
   if (prop.startsWith(GROUP_PLACEHOLDER_PREFIX) || prop === POSITION_PSEUDO_PROP) return 'transform';
   if (MATERIAL_PROPS.has(prop)) return 'material';
+  if (GEOMETRY_PROPS.has(prop)) return 'geometry';
   if (prop === AUDIO_LEVEL_DB_PROP || prop === AUDIO_PAN_PROP || prop === 'audioLevel') return 'audio';
   if (prop.startsWith('effect.')) {
     const id = prop.slice('effect.'.length).split('.')[0] ?? '';
@@ -376,6 +415,42 @@ function layerStyleRows(nodeId: string): StaticPropertyRow[] {
  * keyframe. Drawing four rows off one track would claim four independent curves
  * that do not exist. The row says what the engine actually holds.
  */
+/**
+ * AE's Effects ▸ Paint ▸ Brush N / Eraser N / Clone N — one block per stroke,
+ * in document order: Path, Stroke Options (Start, End, Color, Diameter, Angle,
+ * Hardness, Roundness, Spacing, Opacity, Flow; Clone Position / Time / Time
+ * Shift on clones), then Transform. Colour is absent on erasers and clones,
+ * which paint no colour of their own.
+ *
+ * Path is a `points` DATA track. The timeline's stopwatch keys numeric tracks
+ * only, so an un-animated Path row carries no members (label only, no
+ * stopwatch that would write a scalar keyframe onto a path); once the Paint
+ * panel's Path stopwatch has keyed it, the row names the track and the engine's
+ * data row — diamonds, move, delete — merges onto it.
+ */
+function paintRows(node: SceneNode, nodeId: string): StaticPropertyRow[] {
+  const paint = readNodePaint(node);
+  if (!paint) return [];
+  const names = strokeDisplayNames(paint.strokes);
+  const out: StaticPropertyRow[] = [];
+  for (const s of paint.strokes) {
+    const pathProp = paintPathProp(s.id);
+    const pathKeyed = defaultAnimation.isDataAnimated(nodeId, pathProp);
+    out.push(row(pathProp, 'effects', pathKeyed ? [pathProp] : [], { nodeId, valueProps: [] }));
+    const num = (key: PaintNumericKey): void => {
+      const p = paintPropPath(s.id, key);
+      out.push(row(p, 'effects', [p], { nodeId }));
+    };
+    num('start');
+    num('end');
+    if (s.mode === 'paint') out.push(colorRow(paintColorPath(s.id), 'effects', nodeId, `${names.get(s.id)} Color`));
+    for (const key of ['diameter', 'angle', 'hardness', 'roundness', 'spacing', 'opacity', 'flow'] as const) num(key);
+    if (s.mode === 'clone') for (const key of PAINT_CLONE_KEYS) num(key);
+    for (const key of PAINT_TRANSFORM_KEYS) num(key);
+  }
+  return out;
+}
+
 function maskRows(node: SceneNode, nodeId: string): StaticPropertyRow[] {
   const mask = readNodeMask(node);
   const animated = readNodeMaskAnim(node).length > 0;
@@ -455,6 +530,66 @@ function polystarRows(node: SceneNode, nodeId: string): StaticPropertyRow[] {
     const path = polystarPropPath(spec.param);
     return row(path, 'contents', [path], { nodeId });
   });
+}
+
+/**
+ * AE's Contents ▸ Stroke N — every ENABLED stroke of a shape's stack, each with
+ * its own stopwatches.
+ *
+ * Rows follow the stroke's STRUCTURE, the way AE's twirl does: Miter Limit only
+ * on a miter join, a row per dash slot the pattern actually has (plus Offset),
+ * the Taper and Wave rows only once the group does something, the gradient
+ * points only on a gradient paint. A row for a parameter the stroke cannot use
+ * would be a stopwatch whose keyframes change nothing — the F34 shape.
+ *
+ * Shape layers only: a text/image stroke is the compiled silhouette outline,
+ * which reads width/colour/opacity alone.
+ */
+function strokeRows(node: SceneNode, nodeId: string): StaticPropertyRow[] {
+  if (readNodeKind(node) !== 'shape') return [];
+  const out: StaticPropertyRow[] = [];
+  readNodeStrokes(node).forEach((s, i) => {
+    if (!s.enabled) return;
+    const one = (param: StrokeTrackParam): void => {
+      const path = strokeTrackPath(i, param);
+      out.push(row(path, 'contents', [path], { nodeId }));
+    };
+    out.push(colorRow(strokeTrackPath(i, 'color'), 'contents', nodeId, i === 0 ? 'Stroke Color' : `Stroke ${i + 1} Color`));
+    one('opacity');
+    one('width');
+    if (s.join === 'miter') one('miterLimit');
+    s.dash.forEach((_, k) => {
+      const slot = dashParamAt(k);
+      if (slot) one(slot);
+    });
+    if (s.dash.length > 0) one('dashOffset');
+    if (!isIdentityTaper(s.taper)) {
+      for (const p of ['taperStartLength', 'taperEndLength', 'taperStartWidth', 'taperEndWidth', 'taperStartEase', 'taperEndEase'] as const) one(p);
+    }
+    if (!isIdentityWave(s.wave)) {
+      for (const p of ['waveAmount', 'waveWavelength', 'wavePhase'] as const) one(p);
+    }
+    if (s.paint && s.paint.type !== 'solid') {
+      for (const p of ['gradientStartX', 'gradientStartY', 'gradientEndX', 'gradientEndY'] as const) one(p);
+      if (s.paint.type === 'radial') { one('highlightLength'); one('highlightAngle'); }
+    }
+  });
+  return out;
+}
+
+/**
+ * A shape layer's Path, as ONE row keyed on its whole-path `path.points` track.
+ *
+ * Like the Mask Shape row: the track holds whole-outline snapshots, so the
+ * stopwatch keys the entire path at once (App routes `path.points` to
+ * `togglePathAnimation`). Only a layer with a DRAWN outline — a primitive
+ * rectangle has no vertices to snapshot until it is converted.
+ */
+function shapePathRows(node: SceneNode): StaticPropertyRow[] {
+  if (readNodeKind(node) !== 'shape') return [];
+  const points = node.components.find((c) => c.type === 'Geometry')?.props.points;
+  if (!Array.isArray(points) || points.length < 2) return [];
+  return [{ prop: 'path.points', label: 'Path', group: 'contents', members: ['path.points'], valueProps: [] }];
 }
 
 /** One row per parameter of every path operator in the chain. */
@@ -601,9 +736,13 @@ export function buildStaticPropertyTree(nodeId: string): StaticPropertyRow[] {
 
   const text = [...textOptionRows(node, nodeId), ...textAnimatorRows(node, nodeId)];
   const contents = [
+    // A drawn path's Path property first, as AE lists it in the shape group.
+    ...shapePathRows(node),
     // The layer's own parametric geometry precedes the operators that deform
     // it — the same top-down order the chain evaluates in.
     ...polystarRows(node, nodeId),
+    // Paint, then the operators — AE lists Stroke/Fill beside the path.
+    ...strokeRows(node, nodeId),
     ...pathOpRows(node, nodeId),
     // A text layer's gradient geometry — fill, then stroke. Keyframeable
     // scalars whose static value lives inside a paint (gradientGeometryProps).
@@ -623,6 +762,7 @@ export function buildStaticPropertyTree(nodeId: string): StaticPropertyRow[] {
     ...contents,
     ...maskRows(node, nodeId),
     ...effectRows(nodeId),
+    ...paintRows(node, nodeId),
     ...scanned.filter((r) => r.group === 'effects'),
     ...transform,
     ...scanned.filter((r) => r.group === 'transform'),
@@ -631,6 +771,8 @@ export function buildStaticPropertyTree(nodeId: string): StaticPropertyRow[] {
     ...scanned.filter((r) => r.group === 'camera'),
     ...scanned.filter((r) => r.group === 'light'),
     ...layerStyleRows(nodeId),
+    ...geometryRows(node, nodeId),
+    ...scanned.filter((r) => r.group === 'geometry'),
     ...materialRows(node, nodeId),
     ...scanned.filter((r) => r.group === 'material'),
     ...audioRows(node, nodeId),

@@ -11,12 +11,23 @@ import { parseEdition, setEdition } from '@core/config/edition';
 import { setDevRendererBuild } from '@core/rendering/rendererIdentity';
 import { purgeLegacyLocalAiKeys } from '@core/api/purgeLocalKeys';
 import { installPluginNetBridge } from '@core/plugins/pluginNetBridge';
+import { configureUiPlatform } from '@core/config/uiPlatform';
 import './styles/global.css';
 
 // FIRST, before any store hydrates or any plugin host boots: remove plaintext
 // provider keys an earlier build mirrored into localStorage. Ordering is the
 // whole point — a purge that runs after a plugin can read storage is theatre.
 purgeLegacyLocalAiKeys();
+
+// Which desktop chrome to draw — the macOS unified toolbar or the Windows /
+// Linux title bar. The Electron shell passes its answer on the URL; in a
+// browser dev build `PREMATION_UI_PLATFORM` previews the desktop chrome without
+// Electron. Before the first render, which already draws the bar.
+configureUiPlatform({
+  search: window.location.search,
+  devOverride: import.meta.env.PREMATION_UI_PLATFORM as string | undefined,
+  isDev: import.meta.env.DEV === true,
+});
 
 // Which edition this build is (`VITE_EDITION=local` for the open-source desktop
 // build; anything else, including unset, is the hosted 'server' edition). Read

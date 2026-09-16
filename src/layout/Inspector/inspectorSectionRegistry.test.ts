@@ -43,7 +43,11 @@ const EMBEDDED: Readonly<Record<string, string>> = {
   AudioEffectsSection: 'AudioControls (the Audio Settings section)',
   AudioWaveformSection: 'ShapeEffects (the shape Audio Waveform section)',
   CompOverridesSection: 'PrecompControl (the Pre-composition section)',
+  RetimeSection: 'MediaSection (Video Source) and PrecompControl (the Pre-composition section)',
   FaceMaterialsSection: 'MaterialSection',
+  // The two halves of the Motion tools section (one header, two subheads).
+  ModifierStackSection: 'MotionToolsSection (the Motion tools section)',
+  AudioDriverSection: 'MotionToolsSection (the Motion tools section)',
   StylePresetsSection: 'LayerStylesWithPresetsSection (the Layer Styles section)',
   TransformSection: 'TransformWithThreeDSection (the Transform section, with the 3D switch)',
   // Mounted by a panel other than the inspector accordion.

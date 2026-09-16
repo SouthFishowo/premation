@@ -24,6 +24,7 @@ export const DISPLAY_MODE_LABEL: Record<DisplayMode, string> = {
 
 const SNAP_PIXEL_KEY = 'motion-editor.snapToPixel.v1';
 const HUD_KEY = 'motion-editor.viewportHud.v1';
+const HUD_STAGES_KEY = 'motion-editor.viewportHudStages.v1';
 
 function loadFlag(key: string, fallback: boolean): boolean {
   try {
@@ -44,11 +45,14 @@ function saveFlag(key: string, v: boolean): void {
 
 interface ViewportDisplayStore {
   hud: boolean;
+  /** The HUD's per-stage breakdown (snapshot / flatten / feed / … mean + p95). */
+  hudStages: boolean;
   displayMode: DisplayMode;
   snapToPixel: boolean;
   pixelAspectCorrection: boolean;
   setHud: (on: boolean) => void;
   toggleHud: () => void;
+  toggleHudStages: () => void;
   setDisplayMode: (m: DisplayMode) => void;
   cycleDisplayMode: () => void;
   setSnapToPixel: (on: boolean) => void;
@@ -59,11 +63,17 @@ interface ViewportDisplayStore {
 
 export const useViewportDisplayStore = create<ViewportDisplayStore>((set, get) => ({
   hud: loadFlag(HUD_KEY, false),
+  hudStages: loadFlag(HUD_STAGES_KEY, false),
   displayMode: 'shaded',
   snapToPixel: loadFlag(SNAP_PIXEL_KEY, false),
   pixelAspectCorrection: false,
   setHud: (on) => { saveFlag(HUD_KEY, on); set({ hud: on }); },
   toggleHud: () => get().setHud(!get().hud),
+  toggleHudStages: () => {
+    const on = !get().hudStages;
+    saveFlag(HUD_STAGES_KEY, on);
+    set({ hudStages: on });
+  },
   setDisplayMode: (m) => set({ displayMode: m }),
   cycleDisplayMode: () =>
     set((s) => ({ displayMode: s.displayMode === 'shaded' ? 'wireframe' : s.displayMode === 'wireframe' ? 'bounds' : 'shaded' })),

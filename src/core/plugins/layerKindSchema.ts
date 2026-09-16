@@ -40,6 +40,31 @@
  *              and authors should pick `"proxy"` when the output can be
  *              expressed as native layers.
  *
+ *              As of API 6 it also NAMES its shader: `shader: "<effectId>"`
+ *              points at one of the plugin's own declared effects, and that
+ *              effect's fragment kernel fills the layer. Before that the two
+ *              contribution lists had no reference between them — the manifest
+ *              said a kind drew itself and nothing said with what, which is the
+ *              gap `depthPluginRebuild.test.ts` recorded as GAP 2.
+ *
+ *   `"generator"` The kind produces GEOMETRY, once per frame, from real plugin
+ *              code: a packed buffer of instances (particles, sprites, a mesh)
+ *              that the host draws instanced. Live as of API 6.
+ *
+ *              The strategy that exists because neither of the others can
+ *              express a simulation. `proxy` would mean fifty thousand native
+ *              layers; `shader` would mean expressing a particle system as a
+ *              function of screen position, which is only possible for the
+ *              systems that were never the reason anyone asked. What survives an
+ *              uninstall is the same as for `shader`: the layer and its
+ *              properties, drawing nothing — so the `proxy`-when-you-can advice
+ *              above applies here too, and applies less often, because output
+ *              this strategy is for genuinely cannot be native layers.
+ *
+ *              See `generator/generatorContract.ts` for the buffer layout and
+ *              `generator/generatorScheduler.ts` for when the code runs (never
+ *              inside the render loop).
+ *
  * ── Why only some types animate ──────────────────────────────────────────────
  *
  * `number`, `color` and `boolean` may be `animatable`. A string keyframe is not
@@ -53,7 +78,21 @@
  */
 
 /** How a kind gets on screen. See the module comment. */
-export type LayerRenderStrategy = 'none' | 'proxy' | 'shader';
+export type LayerRenderStrategy = 'none' | 'proxy' | 'shader' | 'generator';
+
+/**
+ * The grammar version each strategy arrived in.
+ *
+ * A table rather than an `if` per value, because the version gate and the
+ * message that explains it have to agree, and a second `if` written next year
+ * is how they stop agreeing.
+ */
+export const RENDER_STRATEGY_SINCE: Readonly<Record<LayerRenderStrategy, number>> = {
+  none: 3,
+  proxy: 3,
+  shader: 4,
+  generator: 6,
+};
 
 /**
  * Reserved render strategies, refused with a VERSION message rather than an
@@ -64,7 +103,7 @@ export type LayerRenderStrategy = 'none' | 'proxy' | 'shader';
  */
 export const RESERVED_RENDER_STRATEGIES: readonly string[] = [];
 
-export const RENDER_STRATEGIES = ['none', 'proxy', 'shader'] as const;
+export const RENDER_STRATEGIES = ['none', 'proxy', 'shader', 'generator'] as const;
 
 /**
  * What a declared property may be.
@@ -170,6 +209,18 @@ export interface LayerKindContribution {
   /** Monotonic. Bumped when the prop shape changes; drives `onMigrateLayer`. */
   schemaVersion: number;
   props: Record<string, LayerPropSchema>;
+  /**
+   * `render: "shader"` only — the id of one of THIS plugin's declared effects,
+   * whose fragment kernel fills the layer.
+   *
+   * Validated in two halves and deliberately so: the NAME is checked here (it
+   * has to look like an effect id), and that the effect EXISTS is checked in
+   * `manifest.ts`, once both contribution lists have been parsed. Checking
+   * existence here would mean this validator taking a dependency on the effect
+   * list's parse order, which is the kind of coupling that turns "add a
+   * contribution type" into "re-order the parser".
+   */
+  shader?: string;
 }
 
 /*
@@ -444,6 +495,15 @@ export function parseLayerKinds(
   raw: unknown,
   errors: string[],
   icons: ReadonlySet<string>,
+  /**
+   * The grammar the manifest declares, for `RENDER_STRATEGY_SINCE`.
+   *
+   * Optional, and absent means "the newest grammar". The caller that matters
+   * (`manifest.ts`) always passes it; the ones that do not are exercising the
+   * validator directly and have no manifest to read a version from, and making
+   * them invent one would be inventing a constraint the test is not about.
+   */
+  opts: { apiVersion?: number } = {},
 ): LayerKindContribution[] {
   const out: LayerKindContribution[] = [];
   if (raw === undefined) return out;
@@ -497,6 +557,39 @@ export function parseLayerKinds(
     if (typeof render !== 'string' || !(RENDER_STRATEGIES as readonly string[]).includes(render)) {
       errors.push(`"${at}.render" must be one of: ${RENDER_STRATEGIES.join(', ')}.`);
       return;
+    }
+    const strategy = render as LayerRenderStrategy;
+    const since = RENDER_STRATEGY_SINCE[strategy];
+    if (opts.apiVersion !== undefined && opts.apiVersion < since) {
+      // A version message for a value that EXISTS, which is the same
+      // distinction `RESERVED_RENDER_STRATEGIES` draws: "raise your apiVersion"
+      // and "you made a typo" are different problems with different fixes.
+      errors.push(`"${at}.render": "${strategy}" requires "apiVersion": ${since}.`);
+      return;
+    }
+
+    /*
+      The shader a `"shader"` kind draws with — GAP 2 of the depth-plugin
+      rebuild, closed.
+
+      Only the NAME is checked here; that the effect exists is checked in
+      `manifest.ts` once both contribution lists are parsed. Refused on any
+      other strategy rather than ignored: a `proxy` kind naming a shader has
+      been written by an author who believes the host will draw it, and a
+      silently-dropped field would leave them looking for the bug in their
+      effect.
+    */
+    let shader: string | undefined;
+    if (entry.shader !== undefined) {
+      if (strategy !== 'shader') {
+        errors.push(`"${at}.shader" is only meaningful on a kind with "render": "shader", not "${strategy}".`);
+        return;
+      }
+      if (typeof entry.shader !== 'string' || !KIND_ID_RE.test(entry.shader)) {
+        errors.push(`"${at}.shader" must name one of this plugin's own effects, by its id.`);
+        return;
+      }
+      shader = entry.shader;
     }
 
     const schemaVersion = entry.schemaVersion;
@@ -569,9 +662,10 @@ export function parseLayerKinds(
       id,
       label,
       ...(typeof entry.icon === 'string' ? { icon: entry.icon } : {}),
-      render: render as LayerRenderStrategy,
+      render: strategy,
       schemaVersion,
       props,
+      ...(shader !== undefined ? { shader } : {}),
     });
   });
 

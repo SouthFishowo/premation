@@ -299,7 +299,16 @@ export type EffectType =
   | 'fractal'
   // Simulation — an emitter on the clock, and bubbles on a keyframed evolution.
   | 'particle-systems'
-  | 'cc-bubbles';
+  | 'cc-bubbles'
+  // ── Stroke-like paint effects (2026-09-15) ──
+  //
+  // AE Generate paint effects that lay a round brush along MASKS rather than
+  // along the layer alpha. `path-stroke` is AE Stroke, labelled Stroke, and the
+  // older alpha-outline `stroke` above is relabelled Alpha Stroke with its id
+  // unchanged. Both are Canvas2D-only, like Vegas. See `pathStroke.ts` and
+  // `scribble.ts`.
+  | 'path-stroke'
+  | 'scribble';
 
 /** Curve control points: `[inputX, outputY]` pairs in 0–255. */
 export type CurvePoints = ReadonlyArray<readonly [number, number]>;
@@ -415,6 +424,13 @@ export interface EffectParamDef {
   /** The choices for an `'enum'` param, in menu order. Ignored for other types. */
   options?: ReadonlyArray<{ value: number; label: string }>;
   /**
+   * What a `'maskPath'` picker calls its empty choice. Absent = "None". The
+   * paint effects (Stroke, Scribble) read an empty pick as the FIRST mask, as
+   * AE's Path menu does, and a control saying "None" would describe the
+   * opposite of what renders.
+   */
+  noneLabel?: string;
+  /**
    * The collapsible section this param belongs to — Colorama's "Output Cycle",
    * Bend's "Distortion". Absent = a top-level param, which is most of them.
    *
@@ -446,6 +462,19 @@ export interface EffectDef {
    * Hue-Sat/Keylight could not be expressed at all.
    */
   params: EffectParamDef[];
+  /**
+   * Values a NEWLY ADDED instance starts with, over the declared `default`s.
+   *
+   * `default` answers two questions that usually agree: what a fresh effect
+   * starts at, and what a STORED effect reads for a key it does not carry. When
+   * an effect gains a mode, they stop agreeing — a document saved before the
+   * mode existed must read the OLD behaviour, while a fresh instance should
+   * start in the new one. `addEffect` stores every param explicitly, so a key
+   * set here reaches new instances only and stored documents keep `default`.
+   * Write-on (brush form) and Vegas (Bunched) are the users, and the reason no
+   * document migration was needed for either.
+   */
+  newInstanceParams?: EffectParams;
   /** Build the CSS filter function. Empty for GPU-only effects. */
   css: (p: EffectParams) => string;
   /**
@@ -537,7 +566,13 @@ export function scaleEffectLengths(
   return effects.map((e) => {
     const def = DEF.get(e.type);
     if (!def) return e;
-    const lengths = def.params.filter((p) => p.type === 'number' && p.unit === 'px');
+    // A `resolved` param declared in px is GEOMETRY the pipeline filled in — a
+    // mask path's flattened points, Write-on's dab positions — laid out in the
+    // same layer px as a number param and wrong by exactly the raster scale if
+    // left alone: a Vegas light on a mask drew at half its distance from the
+    // centre on a 2x bake. Such arrays scale element-wise; resolved params that
+    // are counts or flags simply do not declare a unit.
+    const lengths = def.params.filter((p) => (p.type === 'number' || p.type === 'resolved') && p.unit === 'px');
     if (lengths.length === 0) return e;
     // Resolve through paramsOf first: it folds in declared defaults and the
     // legacy `amount`, so a param the caller never set still scales.
@@ -545,6 +580,9 @@ export function scaleEffectLengths(
     for (const p of lengths) {
       const v = params[p.key];
       if (typeof v === 'number') params[p.key] = v * k;
+      else if (p.type === 'resolved' && Array.isArray(v)) {
+        params[p.key] = (v as readonly unknown[]).map((x) => (typeof x === 'number' ? x * k : x)) as number[];
+      }
     }
     return { ...e, params };
   });
@@ -637,6 +675,11 @@ export function defaultParams(def: EffectDef): EffectParams {
   const out: Record<string, EffectParamValue> = {};
   for (const p of def.params) out[p.key] = p.default;
   return out;
+}
+
+/** The params a NEW instance is created with — defaults, then `newInstanceParams`. */
+export function newInstanceParamsOf(def: EffectDef): EffectParams {
+  return def.newInstanceParams ? { ...defaultParams(def), ...def.newInstanceParams } : defaultParams(def);
 }
 
 /**
@@ -1758,30 +1801,66 @@ export const EFFECT_DEFS: EffectDef[] = [
   // are all defined in ARC LENGTH around the alpha contour, which is why
   // `rotation` is a full lap per 360 degrees regardless of the shape: a linear
   // keyframe on it is a constant-speed chase around anything.
+  //
+  // The AE controls added 2026-09-15 (All Masks, Stroke Sequentially, Segment
+  // Distribution, Random Phase, Blend Mode, the three-point opacity profile)
+  // all DEFAULT to the look Vegas had before them — Even spacing, Over, flat
+  // 100 % — so a stored document renders identically. A new instance starts
+  // Bunched, as AE's does (`newInstanceParams`).
   {
     type: 'vegas',
     label: 'Vegas',
     params: [
+      // A mask path as the contour instead of the alpha silhouette — the AE
+      // "Stroke: Mask/Path" reading of this effect. With a TRACKED mask the
+      // lights chase around a moving object. None = Image Contours.
+      { key: 'pathMaskId', label: 'Path', type: 'maskPath', default: '', noneLabel: 'None (Image Contours)' },
+      // Every mask on the layer, in mask order, instead of the one picked.
+      { key: 'allMasks', label: 'All Masks', type: 'checkbox', default: false },
+      // With All Masks: one sequence of lights running through the masks in
+      // order, rather than a full set of lights on each.
+      { key: 'strokeSequentially', label: 'Stroke Sequentially', type: 'checkbox', default: false },
       { key: 'segments', label: 'Segments', type: 'number', unit: '', min: 1, max: 200, default: 3 },
       // Percent of each light's own SLOT, not of the whole perimeter, so
       // changing the count does not also change how long each light is.
       { key: 'length', label: 'Length', type: 'number', unit: '%', min: 0, max: 100, default: 40 },
+      {
+        key: 'segmentDistribution', label: 'Segment Distribution', type: 'enum', default: 1,
+        options: [{ value: 0, label: 'Bunched' }, { value: 1, label: 'Even' }],
+      },
       // The animated one. A full lap per 360 degrees.
       { key: 'rotation', label: 'Rotation', type: 'number', unit: '°', min: -3600, max: 3600, default: 0 },
+      // Each contour / mask starts its lights at a random point of its own lap.
+      { key: 'randomPhase', label: 'Random Phase', type: 'checkbox', default: false },
+      { key: 'randomSeed', label: 'Random Seed', type: 'number', min: 0, max: 100000, precision: 0, default: 0 },
+      {
+        key: 'blendMode', label: 'Blend Mode', type: 'enum', default: 1,
+        options: [
+          { value: 0, label: 'Transparent' },
+          { value: 1, label: 'Over' },
+          { value: 2, label: 'Under' },
+          { value: 3, label: 'Stencil' },
+        ],
+      },
+      { key: 'color', label: 'Color', type: 'color', default: '#ffffff' },
       { key: 'width', label: 'Width', type: 'number', unit: 'px', min: 0.1, max: 200, default: 6 },
       { key: 'hardness', label: 'Hardness', type: 'number', unit: '%', min: 0, max: 100, default: 100 },
+      // Opacity ALONG each light: Start → Mid-point (at Mid-point Position) → End.
+      { key: 'startOpacity', label: 'Start Opacity', type: 'number', unit: '%', min: 0, max: 100, default: 100 },
+      { key: 'midOpacity', label: 'Mid-point Opacity', type: 'number', unit: '%', min: 0, max: 100, default: 100 },
+      { key: 'midPosition', label: 'Mid-point Position', type: 'number', unit: '%', min: 0, max: 100, default: 50 },
+      { key: 'endOpacity', label: 'End Opacity', type: 'number', unit: '%', min: 0, max: 100, default: 100 },
+      // The whole effect's opacity, on top of the profile above.
+      { key: 'opacity', label: 'Opacity', type: 'number', unit: '%', min: 0, max: 100, default: 100 },
       // Where the contour is cut. Clamped away from both ends in `drawVegas`:
       // at 0 every pixel counts as inside and there is no edge to trace, at 255
       // an antialiased shape contours along its own interior.
-      { key: 'threshold', label: 'Threshold', type: 'number', unit: '', min: 1, max: 254, default: 128 },
-      { key: 'color', label: 'Color', type: 'color', default: '#ffffff' },
-      { key: 'opacity', label: 'Opacity', type: 'number', unit: '%', min: 0, max: 100, default: 100 },
-      // A mask path as the contour instead of the alpha silhouette — the AE
-      // "Stroke: Mask/Path" reading of this effect. With a TRACKED mask the
-      // lights chase around a moving object.
-      { key: 'pathMaskId', label: 'Path', type: 'maskPath', default: '' },
-      { key: 'pathPoints', label: 'Path (resolved)', type: 'resolved', default: [] },
+      { key: 'threshold', label: 'Threshold', type: 'number', unit: '', min: 1, max: 254, default: 128, group: 'Image Contours' },
+      { key: 'pathPoints', label: 'Path (resolved)', type: 'resolved', unit: 'px', default: [] },
+      { key: 'maskPathsMeta', label: 'Masks (resolved)', type: 'resolved', default: [] },
+      { key: 'maskPathsXY', label: 'Mask points (resolved)', type: 'resolved', unit: 'px', default: [] },
     ],
+    newInstanceParams: { segmentDistribution: 0 },
     css: () => '',
   },
   // Cell Pattern: Worley (cellular) noise. `membrane` switches between the two
@@ -2056,10 +2135,13 @@ export const EFFECT_DEFS: EffectDef[] = [
     css: () => '',
   },
 
-  // Stroke: a coloured outline around the content's alpha silhouette.
+  // Alpha Stroke: a coloured outline around the content's alpha silhouette.
+  // Id `stroke` for every stored document and layer style; relabelled
+  // 2026-09-15 when AE's own Stroke (brush along a mask) arrived as
+  // `path-stroke` below and took the name.
   {
     type: 'stroke',
-    label: 'Stroke',
+    label: 'Alpha Stroke',
     params: [
       { key: 'width', label: 'Width', type: 'number', unit: 'px', min: 0, max: 50, default: 3 },
       { key: 'color', label: 'Color', type: 'color', default: '#ffffff' },
@@ -2075,6 +2157,114 @@ export const EFFECT_DEFS: EffectDef[] = [
           { value: 2, label: 'Center' },
         ],
       },
+    ],
+    css: () => '',
+  },
+
+  // Stroke (AE Generate ▸ Stroke): round brush dabs along a mask path, or all
+  // of them. Defaults are AE's. Start/End are percent of arc length; Spacing is
+  // percent of the brush size. The masks arrive resolved per frame from
+  // buildSnapshot (`maskPathsMeta` / `maskPathsXY` / `pathMaskIndex`), so a
+  // tracked or keyframed mask moves the stroke. Kernel: `pathStroke.ts`.
+  {
+    type: 'path-stroke',
+    label: 'Stroke',
+    params: [
+      { key: 'pathMaskId', label: 'Path', type: 'maskPath', default: '', noneLabel: 'Mask 1 (first mask)' },
+      { key: 'allMasks', label: 'All Masks', type: 'checkbox', default: false },
+      { key: 'strokeSequentially', label: 'Stroke Sequentially', type: 'checkbox', default: false },
+      { key: 'color', label: 'Color', type: 'color', default: '#ffffff' },
+      { key: 'brushSize', label: 'Brush Size', type: 'number', unit: 'px', min: 0, max: 50, precision: 1, default: 2 },
+      { key: 'brushHardness', label: 'Brush Hardness', type: 'number', unit: '%', min: 0, max: 100, default: 75 },
+      { key: 'opacity', label: 'Opacity', type: 'number', unit: '%', min: 0, max: 100, precision: 1, default: 100 },
+      { key: 'start', label: 'Start', type: 'number', unit: '%', min: 0, max: 100, precision: 1, default: 0 },
+      { key: 'end', label: 'End', type: 'number', unit: '%', min: 0, max: 100, precision: 1, default: 100 },
+      { key: 'spacing', label: 'Spacing', type: 'number', unit: '%', min: 0, max: 100, precision: 1, default: 15 },
+      {
+        key: 'paintStyle', label: 'Paint Style', type: 'enum', default: 0,
+        options: [
+          { value: 0, label: 'On Original Image' },
+          { value: 1, label: 'On Transparent' },
+          { value: 2, label: 'Reveal Original Image' },
+        ],
+      },
+      { key: 'maskPathsMeta', label: 'Masks (resolved)', type: 'resolved', default: [] },
+      { key: 'maskPathsXY', label: 'Mask points (resolved)', type: 'resolved', unit: 'px', default: [] },
+      { key: 'pathMaskIndex', label: 'Path index (resolved)', type: 'resolved', default: -1 },
+    ],
+    css: () => '',
+  },
+
+  // Scribble (AE Generate ▸ Scribble): a mask filled or edged with one
+  // continuous zig-zag pen line. The wiggle is a keyframe-free animation: the
+  // resolved `wiggleState` is quantised from the layer clock in buildSnapshot,
+  // so the kernel stays a pure function and Static / Jumpy scribbles cache.
+  // Kernel and model: `scribble.ts`.
+  {
+    type: 'scribble',
+    label: 'Scribble',
+    params: [
+      {
+        key: 'scribbleMode', label: 'Scribble', type: 'enum', default: 0,
+        options: [
+          { value: 0, label: 'Single Mask' },
+          { value: 1, label: 'All Masks' },
+          { value: 2, label: 'All Masks Using Modes' },
+        ],
+      },
+      { key: 'pathMaskId', label: 'Mask', type: 'maskPath', default: '', noneLabel: 'Mask 1 (first mask)' },
+      {
+        key: 'fillType', label: 'Fill Type', type: 'enum', default: 0,
+        options: [
+          { value: 0, label: 'Inside' },
+          { value: 1, label: 'Centered Edge' },
+          { value: 2, label: 'Inside Edge' },
+          { value: 3, label: 'Outside Edge' },
+          { value: 4, label: 'Left Edge' },
+          { value: 5, label: 'Right Edge' },
+        ],
+      },
+      { key: 'edgeWidth', label: 'Edge Width', type: 'number', unit: 'px', min: 0, max: 1000, precision: 1, default: 10, group: 'Edge Options' },
+      {
+        key: 'endCap', label: 'End Cap', type: 'enum', default: 1, group: 'Edge Options',
+        options: [{ value: 0, label: 'Butt' }, { value: 1, label: 'Round' }, { value: 2, label: 'Projecting' }],
+      },
+      {
+        key: 'join', label: 'Join', type: 'enum', default: 1, group: 'Edge Options',
+        options: [{ value: 0, label: 'Miter' }, { value: 1, label: 'Round' }, { value: 2, label: 'Bevel' }],
+      },
+      { key: 'miterLimit', label: 'Miter Limit', type: 'number', min: 1, max: 500, precision: 1, default: 4, group: 'Edge Options' },
+      { key: 'color', label: 'Color', type: 'color', default: '#ffffff' },
+      { key: 'opacity', label: 'Opacity', type: 'number', unit: '%', min: 0, max: 100, precision: 1, default: 100 },
+      { key: 'angle', label: 'Angle', type: 'number', unit: '°', min: -3600, max: 3600, default: 45 },
+      { key: 'strokeWidth', label: 'Stroke Width', type: 'number', unit: 'px', min: 0.1, max: 50, precision: 1, default: 5 },
+      { key: 'curviness', label: 'Curviness', type: 'number', unit: '%', min: 0, max: 100, default: 5, group: 'Stroke Options' },
+      { key: 'curvinessVariation', label: 'Curviness Variation', type: 'number', unit: '%', min: 0, max: 100, default: 1, group: 'Stroke Options' },
+      { key: 'spacing', label: 'Spacing', type: 'number', unit: 'px', min: 0.1, max: 1000, precision: 1, default: 5, group: 'Stroke Options' },
+      { key: 'spacingVariation', label: 'Spacing Variation', type: 'number', unit: 'px', min: 0, max: 1000, precision: 1, default: 1, group: 'Stroke Options' },
+      { key: 'pathOverlap', label: 'Path Overlap', type: 'number', unit: '%', min: -100, max: 100, default: 0, group: 'Stroke Options' },
+      { key: 'pathOverlapVariation', label: 'Path Overlap Variation', type: 'number', unit: '%', min: 0, max: 100, default: 5, group: 'Stroke Options' },
+      { key: 'start', label: 'Start', type: 'number', unit: '%', min: 0, max: 100, precision: 1, default: 0 },
+      { key: 'end', label: 'End', type: 'number', unit: '%', min: 0, max: 100, precision: 1, default: 100 },
+      { key: 'fillPathsSequentially', label: 'Fill Paths Sequentially', type: 'checkbox', default: true },
+      {
+        key: 'wiggleType', label: 'Wiggle Type', type: 'enum', default: 2, group: 'Wiggle',
+        options: [{ value: 0, label: 'Static' }, { value: 1, label: 'Jumpy' }, { value: 2, label: 'Smooth' }],
+      },
+      { key: 'wigglesPerSecond', label: 'Wiggles/Second', type: 'number', min: 0, max: 100, precision: 2, default: 5, group: 'Wiggle' },
+      { key: 'randomSeed', label: 'Random Seed', type: 'number', min: 0, max: 100000, precision: 0, default: 0, group: 'Wiggle' },
+      {
+        key: 'composite', label: 'Composite', type: 'enum', default: 1,
+        options: [
+          { value: 0, label: 'On Original Image' },
+          { value: 1, label: 'On Transparent' },
+          { value: 2, label: 'Reveal Original Image' },
+        ],
+      },
+      { key: 'maskPathsMeta', label: 'Masks (resolved)', type: 'resolved', default: [] },
+      { key: 'maskPathsXY', label: 'Mask points (resolved)', type: 'resolved', unit: 'px', default: [] },
+      { key: 'pathMaskIndex', label: 'Mask index (resolved)', type: 'resolved', default: -1 },
+      { key: 'wiggleState', label: 'Wiggle state (resolved)', type: 'resolved', default: 0 },
     ],
     css: () => '',
   },
@@ -3350,28 +3540,78 @@ export const EFFECT_DEFS: EffectDef[] = [
   },
   {
     /*
-      Write-on — a stroke drawn progressively from Start toward End; keyframe
-      `completion` for the reveal. Wobble bends the path deterministically so
-      the line reads hand-drawn rather than ruled.
+      Write-on. Two forms behind Mode:
+
+      Brush Position (AE's Write-on, 2026-09-15) records a brush: a dab at
+      Brush Position every Brush Spacing seconds from the first keyframe to
+      now, so keyframing the position draws its motion path. Stroke Length
+      keeps the last N seconds (0 = all). Paint / Brush Time Properties keep
+      each dab's colour / opacity / size / hardness from the moment it was laid.
+      The dab history is sampled by buildSnapshot (`brushTrail*`); kernel in
+      `writeOnBrush.ts`. CPU-baked.
+
+      Classic Line / Path is the form this effect shipped with — a stroke drawn
+      progressively from Start toward End (or along a mask path), revealed by
+      Completion, with Wobble and Taper. It keeps its GPU shader.
+
+      Mode DEFAULTS to Classic, because every document saved before the brush
+      form existed stores no `writeOnMode` and must keep its look; a new
+      instance starts on the brush (`newInstanceParams`).
     */
     type: 'write-on',
     label: 'Write-on',
     params: [
-      { key: 'startX', label: 'Start X', type: 'number', unit: 'px', min: -4000, max: 4000, default: -120 },
-      { key: 'startY', label: 'Start Y', type: 'number', unit: 'px', min: -4000, max: 4000, default: 0 },
-      { key: 'endX', label: 'End X', type: 'number', unit: 'px', min: -4000, max: 4000, default: 120 },
-      { key: 'endY', label: 'End Y', type: 'number', unit: 'px', min: -4000, max: 4000, default: 0 },
-      { key: 'completion', label: 'Completion', type: 'number', unit: '%', min: 0, max: 100, default: 100 },
-      { key: 'brushSize', label: 'Brush Size', type: 'number', unit: 'px', min: 1, max: 100, default: 8 },
+      {
+        key: 'writeOnMode', label: 'Mode', type: 'enum', default: 1,
+        options: [{ value: 0, label: 'Brush Position' }, { value: 1, label: 'Classic Line / Path' }],
+      },
+      { key: 'brushPositionX', label: 'Brush Position X', type: 'number', unit: 'px', min: -4000, max: 4000, default: 0 },
+      { key: 'brushPositionY', label: 'Brush Position Y', type: 'number', unit: 'px', min: -4000, max: 4000, default: 0 },
       { key: 'brushColor', label: 'Color', type: 'color', default: '#ffffff' },
-      { key: 'wobble', label: 'Wobble', type: 'number', unit: '%', min: 0, max: 100, default: 25 },
-      { key: 'taper', label: 'Taper', type: 'number', unit: '%', min: 0, max: 100, default: 40 },
+      { key: 'brushSize', label: 'Brush Size', type: 'number', unit: 'px', min: 1, max: 100, default: 8 },
+      { key: 'brushHardness', label: 'Brush Hardness', type: 'number', unit: '%', min: 0, max: 100, default: 75 },
+      { key: 'brushOpacity', label: 'Brush Opacity', type: 'number', unit: '%', min: 0, max: 100, precision: 1, default: 100 },
+      { key: 'strokeLength', label: 'Stroke Length (secs)', type: 'number', unit: 's', min: 0, max: 3600, precision: 2, default: 0 },
+      { key: 'brushSpacing', label: 'Brush Spacing (secs)', type: 'number', unit: 's', min: 0.001, max: 10, precision: 3, default: 0.001 },
+      {
+        key: 'paintTimeProps', label: 'Paint Time Properties', type: 'enum', default: 0,
+        options: [{ value: 0, label: 'None' }, { value: 1, label: 'Opacity' }, { value: 2, label: 'Color' }],
+      },
+      {
+        key: 'brushTimeProps', label: 'Brush Time Properties', type: 'enum', default: 0,
+        options: [
+          { value: 0, label: 'None' },
+          { value: 1, label: 'Size' },
+          { value: 2, label: 'Hardness' },
+          { value: 3, label: 'Size & Hardness' },
+        ],
+      },
+      {
+        key: 'paintStyle', label: 'Paint Style', type: 'enum', default: 0,
+        options: [
+          { value: 0, label: 'On Original Image' },
+          { value: 1, label: 'On Transparent' },
+          { value: 2, label: 'Reveal Original Image' },
+        ],
+      },
+      { key: 'startX', label: 'Start X', type: 'number', unit: 'px', min: -4000, max: 4000, default: -120, group: 'Classic Line / Path' },
+      { key: 'startY', label: 'Start Y', type: 'number', unit: 'px', min: -4000, max: 4000, default: 0, group: 'Classic Line / Path' },
+      { key: 'endX', label: 'End X', type: 'number', unit: 'px', min: -4000, max: 4000, default: 120, group: 'Classic Line / Path' },
+      { key: 'endY', label: 'End Y', type: 'number', unit: 'px', min: -4000, max: 4000, default: 0, group: 'Classic Line / Path' },
+      { key: 'completion', label: 'Completion', type: 'number', unit: '%', min: 0, max: 100, default: 100, group: 'Classic Line / Path' },
+      { key: 'wobble', label: 'Wobble', type: 'number', unit: '%', min: 0, max: 100, default: 25, group: 'Classic Line / Path' },
+      { key: 'taper', label: 'Taper', type: 'number', unit: '%', min: 0, max: 100, default: 40, group: 'Classic Line / Path' },
       // Draw along a mask path instead of the Start→End line (Start/End/Wobble
       // are ignored then — the path IS the shape). Keyframe `completion` to
       // reveal the stroke along it; with a tracked mask, along the OBJECT.
-      { key: 'pathMaskId', label: 'Path', type: 'maskPath', default: '' },
-      { key: 'pathPoints', label: 'Path (resolved)', type: 'resolved', default: [] },
+      { key: 'pathMaskId', label: 'Path', type: 'maskPath', default: '', group: 'Classic Line / Path' },
+      { key: 'pathPoints', label: 'Path (resolved)', type: 'resolved', unit: 'px', default: [] },
+      { key: 'brushTrailXY', label: 'Brush trail (resolved)', type: 'resolved', unit: 'px', default: [] },
+      { key: 'brushTrailSize', label: 'Brush trail sizes (resolved)', type: 'resolved', unit: 'px', default: [] },
+      { key: 'brushTrailAttr', label: 'Brush trail attributes (resolved)', type: 'resolved', default: [] },
+      { key: 'brushTrailFilled', label: 'Brush trail thinned (resolved)', type: 'resolved', default: 0 },
     ],
+    newInstanceParams: { writeOnMode: 0 },
     css: () => '',
   },
   {
@@ -4684,7 +4924,7 @@ export function addEffect(nodeId: string, type: EffectType, id?: string): void {
   const effects = getNodeEffects(nodeId);
   const taken = new Set(effects.map((e) => e.id));
   const useId = id && !taken.has(id) ? id : `fx_${(seq += 1)}`;
-  writeNodeEffects(nodeId, [...effects, { id: useId, type, params: defaultParams(def) }]);
+  writeNodeEffects(nodeId, [...effects, { id: useId, type, params: newInstanceParamsOf(def) }]);
 }
 
 /** Set one of an effect's parameters. */
@@ -4726,7 +4966,7 @@ export function resetEffectParams(nodeId: string, effectId: string): void {
     // the defaults, so leaving it would make a reset effect keep its old look.
     effects.map((e) =>
       e.id === effectId
-        ? { id: e.id, type: e.type, params: defaultParams(def), enabled: e.enabled, maskId: e.maskId, labelColor: e.labelColor }
+        ? { id: e.id, type: e.type, params: newInstanceParamsOf(def), enabled: e.enabled, maskId: e.maskId, labelColor: e.labelColor }
         : e,
     ),
   );

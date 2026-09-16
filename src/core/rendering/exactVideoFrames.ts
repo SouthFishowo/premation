@@ -28,10 +28,35 @@
  * through `waits()`, which the export convergence loop awaits before
  * accepting a frame (same mechanism as the legacy `takeMediaWaits`).
  *
- * Memory: canvases are LRU-evicted per source under a byte budget, same
- * policy as videoFrameCache. The `ExactVideoSource` underneath additionally
- * holds its own small `VideoFrame` cache (GOP-sized) which it owns and
- * evicts itself — we draw its frames into canvases and NEVER close them.
+ * ── What a cached frame IS ───────────────────────────────────────────────────
+ *
+ * Every frame used to be drawn into a canvas here, on top of the ImageBitmap
+ * copy the decoder session had already made — two full-resolution copies per
+ * frame before the GPU upload made a third. Now the cache stores whatever the
+ * decode path handed over, when it can own it:
+ *
+ *   ImageBitmap  the session's retained copy (random access, handed over with
+ *                `take`) or a decode-worker copy (streaming, `release`d).
+ *                Stored as is — no redraw.
+ *   VideoFrame   the ONE frame per source a random-access seek asked for as
+ *                `raw` (interactive cache only): uploaded to the GPU straight
+ *                from the decoder's buffer. It pins a hardware pool slot, so
+ *                a source holds at most one; the next raw frame demotes it to
+ *                an ImageBitmap copy.
+ *   canvas       everything else — rotated footage (the rotation is baked
+ *                here), frames the stream only lends, and CPU consumers
+ *                (pulldown weave, Pixel Motion) via the result's `canvas`.
+ *
+ * Owned images (bitmaps, VideoFrames) are closed exactly once: on eviction, on
+ * demotion to a canvas, or when the source is dropped. Canvases recycle.
+ *
+ * ── Policies ─────────────────────────────────────────────────────────────────
+ *
+ * The interactive singleton (`exactVideoFrames`) decodes in the decode worker,
+ * scrubs latest-wins and keeps raw frames for direct upload. Private caches
+ * (export, thumbnails, auxiliary panes) default to the in-thread decoder, the
+ * serial queue and no raw frames — export pixels and exact-frame convergence
+ * are exactly what they were.
  */
 
 import { requestMediaRepaint } from './repaintScheduler';
@@ -41,9 +66,17 @@ import { demuxFile } from '@core/video/demuxClient';
 import {
   ExactVideoSource,
   SequentialFrameReader,
+  isSuperseded,
+  isTransientDecodeError,
+  isVideoFrame,
+  retainFrameCopy,
   webCodecsAvailable,
+  webCodecsIO,
   type DecodedFrameLike,
+  type DecoderIO,
+  type FrameRequest,
 } from '@core/video/exactVideoSource';
+import { renderDecodeIO } from '@core/video/workerDecoderIO';
 import { pulldownFrameFor } from '@core/video/pulldownDetect';
 
 /** Frames are captured at source resolution; 512MB is ~65 1080p frames. */
@@ -145,11 +178,42 @@ export function streamPlanFor(byteBudget: number, frameBytes: number): StreamPla
   return { frameBytes: bytes, budgetBytes, capacity, ahead };
 }
 
+/** What a cached exact frame is stored as (see the header). */
+export type ExactFrameImage = HTMLCanvasElement | ImageBitmap | VideoFrame;
+
+function isImageBitmap(v: unknown): v is ImageBitmap {
+  return typeof ImageBitmap === 'function' && v instanceof ImageBitmap;
+}
+
+function isCanvas(v: unknown): v is HTMLCanvasElement {
+  return typeof HTMLCanvasElement === 'function' && v instanceof HTMLCanvasElement;
+}
+
+/** Pixel size of a frame image — a VideoFrame reports display size, not width. */
+export function frameImageSize(image: ExactFrameImage): { width: number; height: number } {
+  if (isVideoFrame(image)) return { width: image.displayWidth, height: image.displayHeight };
+  return { width: image.width, height: image.height };
+}
+
+/** Close an owned frame image. Canvases are plain memory and need nothing. */
+function closeImage(image: ExactFrameImage): void {
+  if (isCanvas(image)) return;
+  try {
+    image.close();
+  } catch {
+    // already closed
+  }
+}
+
 /** The slice of ExactVideoSource the cache uses — structural, so tests can
- *  stub a source without a decoder. */
+ *  stub a source without a decoder. `req` is advisory for stubs: a stub that
+ *  ignores it must still hand back a frame the cache may close (a fresh one
+ *  per call), because the cache always asks to `take`. */
 export interface ExactSourceLike {
   frameIndexAt(timeUs: number): number;
-  frameAt(presIdx: number): Promise<DecodedFrameLike>;
+  frameAt(presIdx: number, req?: FrameRequest): Promise<DecodedFrameLike>;
+  /** Latest-wins: a pending request is still wanted this turn. */
+  renew?(presIdx: number): boolean;
   close(): void;
 }
 
@@ -175,6 +239,8 @@ export interface LoadedExactSource {
  *  injectable so jsdom tests can stream without WebCodecs. */
 export interface SequentialReaderLike {
   frameAt(presIdx: number): Promise<DecodedFrameLike>;
+  /** Claim the frame last returned (see SequentialFrameReader.release). */
+  release?(): DecodedFrameLike | null;
   close(): void;
 }
 
@@ -194,16 +260,21 @@ export type ExactSourceLoader = (src: string) => Promise<LoadedExactSource>;
 
 export type ExactFrameResult =
   /** A decoded frame. `exact` is false when it is the nearest cached
-   *  neighbour of a decode still in flight — a repaint will follow. */
-  | { state: 'frame'; canvas: HTMLCanvasElement; presIndex: number; exact: boolean }
+   *  neighbour of a decode still in flight — a repaint will follow.
+   *
+   *  `image` is what to upload (canvas, ImageBitmap or VideoFrame — the cache
+   *  owns it; never close it, never hold it past this render). `canvas`
+   *  converts the cached frame to a canvas on first access, for consumers
+   *  that need CPU pixels; after reading `canvas`, do not use `image`. */
+  | { state: 'frame'; image: ExactFrameImage; readonly canvas: HTMLCanvasElement; presIndex: number; exact: boolean }
   /** Demux in progress, or ready with nothing decoded yet. A repaint will
    *  follow; feed the legacy path meanwhile. */
   | { state: 'pending' }
   /** This source will never decode exactly in this session. Legacy path. */
   | { state: 'unavailable' };
 
-interface CachedCanvas {
-  canvas: HTMLCanvasElement;
+interface CachedFrame {
+  image: ExactFrameImage;
   bytes: number;
 }
 
@@ -212,8 +283,8 @@ interface ReadyEntry {
   source: ExactSourceLike;
   width: number;
   height: number;
-  /** presentation index → decoded canvas */
-  frames: Map<number, CachedCanvas>;
+  /** presentation index → decoded frame */
+  frames: Map<number, CachedFrame>;
   /** LRU order: presentation indices, oldest first. */
   order: number[];
   bytes: number;
@@ -241,6 +312,8 @@ interface ReadyEntry {
   plan: StreamPlan;
   /** True once `plan` has been re-derived from a real decoded frame. */
   planMeasured: boolean;
+  /** Presentation index of the one cached VideoFrame, or -1. */
+  live: number;
 }
 
 type Entry =
@@ -253,41 +326,60 @@ function exactHolder(src: string): string {
   return `exact:${src}`;
 }
 
-async function defaultLoader(src: string): Promise<LoadedExactSource> {
-  // A `motion-blob:<hash>` ref is not fetchable. Resolving it here is what
-  // lets footage carried INSIDE a `.motion` bundle reach the exact decoder at
-  // all — before this, `fetch('motion-blob:…')` threw, the source went sticky
-  // `unavailable`, and the element tier could not open the ref either, so a
-  // bundled clip had no working tier. Retained for as long as this cache holds
-  // the source; `sweepIdle`/`clear` release it.
-  const url = isLocalBlobRef(src) ? await resolveLocalBlobObjectUrl(src, exactHolder(src)) : src;
-  if (!url) throw new Error(`local blob not found: ${src}`);
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
-  const buf = await res.arrayBuffer();
-  if (buf.byteLength > MAX_DEMUX_BYTES) {
-    throw new Error(`file too large for in-memory demux (${buf.byteLength} bytes) — generate a proxy`);
-  }
-  // Off the main thread when one is available, inline otherwise — same
-  // function either way (see demuxClient). The container check moves inside;
-  // `buf` is TRANSFERRED on the worker path and must not be read after this.
-  const demuxed = await demuxFile(buf);
-  if ((demuxed as { hasAlpha?: boolean }).hasAlpha) {
-    // The exact path decodes only the primary bitstream; the alpha plane
-    // rides in BlockAdditional side data it never feeds. The element tier
-    // composites alpha correctly, so alpha WebM stays there — opaque frames
-    // here would LOSE the transparency the ingest transcode exists to keep.
-    throw new Error('alpha WebM — element path preserves transparency');
-  }
-  const source = new ExactVideoSource(demuxed);
-  return {
-    source,
-    width: demuxed.codedWidth,
-    height: demuxed.codedHeight,
-    demuxed,
-    lastPresIndex: source.frameCount - 1,
-    ...(demuxed.rotation ? { rotation: demuxed.rotation } : {}),
+/** A loader whose sources decode through `io` (resolved per load). */
+export function makeExactLoader(io: () => DecoderIO): ExactSourceLoader {
+  return async (src: string): Promise<LoadedExactSource> => {
+    // A `motion-blob:<hash>` ref is not fetchable. Resolving it here is what
+    // lets footage carried INSIDE a `.motion` bundle reach the exact decoder at
+    // all — before this, `fetch('motion-blob:…')` threw, the source went sticky
+    // `unavailable`, and the element tier could not open the ref either, so a
+    // bundled clip had no working tier. Retained for as long as this cache holds
+    // the source; `sweepIdle`/`clear` release it.
+    const url = isLocalBlobRef(src) ? await resolveLocalBlobObjectUrl(src, exactHolder(src)) : src;
+    if (!url) throw new Error(`local blob not found: ${src}`);
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > MAX_DEMUX_BYTES) {
+      throw new Error(`file too large for in-memory demux (${buf.byteLength} bytes) — generate a proxy`);
+    }
+    // Off the main thread when one is available, inline otherwise — same
+    // function either way (see demuxClient). The container check moves inside;
+    // `buf` is TRANSFERRED on the worker path and must not be read after this.
+    const demuxed = await demuxFile(buf);
+    if ((demuxed as { hasAlpha?: boolean }).hasAlpha) {
+      // The exact path decodes only the primary bitstream; the alpha plane
+      // rides in BlockAdditional side data it never feeds. The element tier
+      // composites alpha correctly, so alpha WebM stays there — opaque frames
+      // here would LOSE the transparency the ingest transcode exists to keep.
+      throw new Error('alpha WebM — element path preserves transparency');
+    }
+    const source = new ExactVideoSource(demuxed, io());
+    return {
+      source,
+      width: demuxed.codedWidth,
+      height: demuxed.codedHeight,
+      demuxed,
+      lastPresIndex: source.frameCount - 1,
+      ...(demuxed.rotation ? { rotation: demuxed.rotation } : {}),
+    };
   };
+}
+
+const defaultLoader = makeExactLoader(() => webCodecsIO);
+
+export interface ExactFrameCacheOptions {
+  /** Private (per-backend) instances skip the AnimationChanged emit: an
+   *  export's landed decodes must not repaint the viewport — each decode
+   *  used to trigger a parked-playhead render whose request then killed
+   *  the export's own stream. Local onChange listeners still fire. */
+  emitEvents?: boolean;
+  /** Scrub random access latest-wins (see ExactVideoSource). Interactive only:
+   *  a convergence loop stays correct under it, but gains nothing. */
+  latestWins?: boolean;
+  /** Ask random-access seeks for the decoder's own frame and keep ONE per
+   *  source for a direct GPU upload. */
+  directFrames?: boolean;
 }
 
 export class ExactVideoFrameCache {
@@ -311,6 +403,7 @@ export class ExactVideoFrameCache {
       if (now - e.lastUsed > ExactVideoFrameCache.IDLE_EVICT_MS) {
         this.killStream(e);
         e.source.close();
+        this.releaseFrames(e);
         this.sources.delete(src);
         // The object URL belongs in the same teardown as the decoder, the
         // frames and the file bytes — but only OUR claim on it. A `<video>`
@@ -329,11 +422,7 @@ export class ExactVideoFrameCache {
     /** Injectable so jsdom tests can exercise streaming without WebCodecs. */
     private readonly makeReader: (demuxed: DemuxedVideo, from: number, to: number) => SequentialReaderLike =
       (demuxed, from, to) => new SequentialFrameReader(demuxed, from, to),
-    /** Private (per-backend) instances skip the AnimationChanged emit: an
-     *  export's landed decodes must not repaint the viewport — each decode
-     *  used to trigger a parked-playhead render whose request then killed
-     *  the export's own stream. Local onChange listeners still fire. */
-    private readonly opts: { emitEvents?: boolean } = {},
+    private readonly opts: ExactFrameCacheOptions = {},
   ) {}
 
   onChange(fn: () => void): () => void {
@@ -401,24 +490,25 @@ export class ExactVideoFrameCache {
         : ({ kind: 'plain', index: presIdx } as const);
 
     if (target.kind === 'weave') {
-      const woven = entry.frames.get(target.index);
-      if (woven) {
+      if (entry.frames.has(target.index)) {
         this.touch(entry, target.index);
         entry.lastReq = presIdx;
         // Keep an active stream decoding ahead of the pulldown playhead —
         // woven hits are the steady state of pulldown playback.
         this.advanceStream(src, entry, target.bottom);
-        return { state: 'frame', canvas: woven.canvas, presIndex: target.index, exact: true };
+        return this.frameResult(entry, target.index, true);
       }
       // Both source frames must be decoded before the weave exists. Request
       // what is missing; each landed decode repaints and this re-runs.
-      const top = entry.frames.get(target.top);
-      const bottom = entry.frames.get(target.bottom);
-      if (top && bottom) {
-        const canvas = this.weaveCanvas(top.canvas, bottom.canvas);
+      const hasTop = entry.frames.has(target.top);
+      const hasBottom = entry.frames.has(target.bottom);
+      if (hasTop && hasBottom) {
+        const top = this.canvasOf(entry, target.top)!;
+        const bottom = this.canvasOf(entry, target.bottom)!;
+        const canvas = this.weaveCanvas(top, bottom);
         this.store(entry, target.index, canvas, canvas.width * canvas.height * 4);
         entry.lastReq = presIdx;
-        return { state: 'frame', canvas, presIndex: target.index, exact: true };
+        return this.frameResult(entry, target.index, true);
       }
       // Route the miss through the same run/loop detection plain frames use —
       // pulldown sources previously never advanced lastReq/seqRun here, so
@@ -426,13 +516,12 @@ export class ExactVideoFrameCache {
       // GOP random access (the exact freeze streaming was built to fix). A
       // stream started at `top` also covers `bottom` (top + 1) via lookahead.
       const absorbed = this.noteMiss(src, entry, target.top, prevReq);
-      if (!top && !absorbed) this.requestDecode(src, entry, target.top);
-      if (!bottom && !absorbed) this.requestDecode(src, entry, target.bottom);
+      if (!hasTop && !absorbed) this.requestDecode(src, entry, target.top);
+      if (!hasBottom && !absorbed) this.requestDecode(src, entry, target.bottom);
       return this.nearest(entry, target.index);
     }
 
-    const hit = entry.frames.get(target.index);
-    if (hit) {
+    if (entry.frames.has(target.index)) {
       this.touch(entry, target.index);
       entry.lastReq = target.index;
       const end = this.lastPresIndex(entry);
@@ -445,13 +534,47 @@ export class ExactVideoFrameCache {
         // on misses would stall the moment it caught up.
         this.advanceStream(src, entry, target.index);
       }
-      return { state: 'frame', canvas: hit.canvas, presIndex: target.index, exact: true };
+      return this.frameResult(entry, target.index, true);
     }
 
     if (!this.noteMiss(src, entry, target.index, prevReq)) {
       this.requestDecode(src, entry, target.index);
     }
     return this.nearest(entry, target.index);
+  }
+
+  /** A `frame` result over a cached index (must exist). */
+  private frameResult(entry: ReadyEntry, presIndex: number, exact: boolean): ExactFrameResult {
+    const cached = entry.frames.get(presIndex)!;
+    const materialize = (): HTMLCanvasElement => this.canvasOf(entry, presIndex) ?? this.canvasFor(1, 1);
+    return {
+      state: 'frame',
+      image: cached.image,
+      get canvas(): HTMLCanvasElement {
+        return materialize();
+      },
+      presIndex,
+      exact,
+    };
+  }
+
+  /**
+   * The cached frame at `presIdx` as a canvas, converting it in place when it
+   * is stored as an ImageBitmap or VideoFrame (the original is closed; the
+   * byte cost is unchanged). Null when nothing is cached there.
+   */
+  private canvasOf(entry: ReadyEntry, presIdx: number): HTMLCanvasElement | null {
+    const cached = entry.frames.get(presIdx);
+    if (!cached) return null;
+    if (isCanvas(cached.image)) return cached.image;
+    const { width, height } = frameImageSize(cached.image);
+    const canvas = this.canvasFor(Math.max(1, width), Math.max(1, height));
+    const ctx = canvas.getContext('2d');
+    ctx?.drawImage(cached.image, 0, 0, canvas.width, canvas.height);
+    closeImage(cached.image);
+    cached.image = canvas;
+    if (entry.live === presIdx) entry.live = -1;
+    return canvas;
   }
 
   // ── Streaming playback ───────────────────────────────────────────
@@ -463,7 +586,7 @@ export class ExactVideoFrameCache {
   // bug, verbatim.) So when misses arrive as an ascending run — playback and
   // export, never scrub gestures — the source switches to a
   // SequentialFrameReader that decodes each frame ONCE, slightly ahead of
-  // the newest request, into the same canvas cache. Steady-state playback
+  // the newest request, into the same frame cache. Steady-state playback
   // is then synchronous cache hits. A backwards or far-forward request is a
   // seek: the stream dies and random access resumes.
 
@@ -579,13 +702,22 @@ export class ExactVideoFrameCache {
           try {
             frame = await s.reader.frameAt(idx);
           } catch {
-            // Reader died (decode error, closed source). Random access takes
-            // over on the next get(), with its own failure accounting.
+            // Reader died (decode error, closed source, decode worker crash).
+            // Random access takes over on the next get(), with its own failure
+            // accounting — which is also how a crashed worker resumes at the
+            // playhead rather than where the stream had got to.
             if (entry.stream === s) this.killStream(entry);
             return;
           }
           if (entry.stream !== s || this.sources.get(src) !== entry) return;
-          this.capture(entry, idx, frame);
+          // A stream frame is only LENT (the reader closes it on the next
+          // read) unless claimed. An ImageBitmap — what the decode worker
+          // streams — is claimed and stored as is; a raw VideoFrame is never
+          // claimed (lookahead frames must not pin pool slots) and is copied.
+          const owned = entry.rotation === 0 && isImageBitmap(frame) && s.reader.release
+            ? s.reader.release()
+            : null;
+          this.capture(entry, idx, owned ?? frame, owned !== null);
           s.next = idx + 1;
           // Repaint when the frame the renderer is showing stale pixels for
           // has landed; pure lookahead frames stay silent (no repaint storms).
@@ -621,10 +753,7 @@ export class ExactVideoFrameCache {
         bestIdx = idx;
       }
     }
-    if (bestIdx >= 0) {
-      const near = entry.frames.get(bestIdx)!;
-      return { state: 'frame', canvas: near.canvas, presIndex: bestIdx, exact: false };
-    }
+    if (bestIdx >= 0) return this.frameResult(entry, bestIdx, false);
     return { state: 'pending' };
   }
 
@@ -732,6 +861,7 @@ export class ExactVideoFrameCache {
             rotation: loaded.rotation ?? 0,
             plan: streamPlanFor(this.maxBytesPerSource, (loaded.width || 2) * (loaded.height || 2) * 4),
             planMeasured: false,
+            live: -1,
           });
           this.notify(src);
         },
@@ -754,23 +884,47 @@ export class ExactVideoFrameCache {
   }
 
   private requestDecode(src: string, entry: ReadyEntry, presIdx: number): void {
-    if (entry.pending.has(presIdx)) return;
+    if (entry.pending.has(presIdx)) {
+      // Still wanted: under latest-wins a pending seek the render keeps asking
+      // for must survive the turn's sweep.
+      if (this.opts.latestWins) entry.source.renew?.(presIdx);
+      return;
+    }
     entry.pending.add(presIdx);
+    const req: FrameRequest = {
+      // The cache owns what it stores: the session hands the frame over rather
+      // than lending one the cache would then have to copy.
+      take: true,
+      ...(this.opts.latestWins ? { latest: true } : {}),
+      // Rotation is baked by drawing, so a rotated source gains nothing from
+      // the decoder's own frame.
+      ...(this.opts.directFrames && entry.rotation === 0 ? { raw: true } : {}),
+    };
     this.track(
-      entry.source.frameAt(presIdx).then(
+      entry.source.frameAt(presIdx, req).then(
         (frame) => {
           entry.pending.delete(presIdx);
-          if (this.sources.get(src) !== entry) return; // cleared/replaced meanwhile
-          this.capture(entry, presIdx, frame);
+          if (this.sources.get(src) !== entry) {
+            // Cleared/replaced meanwhile — the frame is ours and nobody else's.
+            frame.close();
+            return;
+          }
+          this.capture(entry, presIdx, frame, true);
           entry.failures = 0;
           this.notify(src);
         },
-        () => {
+        (err: unknown) => {
           entry.pending.delete(presIdx);
           if (this.sources.get(src) !== entry) return;
-          entry.failures += 1;
-          if (entry.failures >= MAX_DECODE_FAILURES) {
-            this.markUnavailable(src, entry, 'decoder failed repeatedly');
+          // A newer seek replaced this one; its own landing repaints.
+          if (isSuperseded(err)) return;
+          // A crashed or hung decode worker says nothing about the file. The
+          // repaint re-asks, which is how decoding resumes at the playhead.
+          if (!isTransientDecodeError(err)) {
+            entry.failures += 1;
+            if (entry.failures >= MAX_DECODE_FAILURES) {
+              this.markUnavailable(src, entry, 'decoder failed repeatedly');
+            }
           }
           // Repaint either way: the renderer re-asks and either retries or
           // settles onto the legacy path.
@@ -780,34 +934,63 @@ export class ExactVideoFrameCache {
     );
   }
 
-  private capture(entry: ReadyEntry, presIdx: number, frame: DecodedFrameLike): void {
-    if (entry.frames.has(presIdx)) return;
+  /**
+   * Store the decoded frame for `presIdx`. `owned` frames belong to the cache
+   * from here on (it closes them exactly once); borrowed frames are copied
+   * and left to their owner.
+   */
+  private capture(entry: ReadyEntry, presIdx: number, frame: DecodedFrameLike, owned: boolean): void {
+    if (entry.frames.has(presIdx)) {
+      if (owned) frame.close();
+      return;
+    }
     // A real VideoFrame reports its display size (PAR-corrected); the coded
     // size from the demux is the fallback so a stub or odd frame still lands.
     const f = frame as unknown as { displayWidth?: number; displayHeight?: number };
     const w = f.displayWidth || entry.width;
     const h = f.displayHeight || entry.height;
-    if (!w || !h) return;
+    if (!w || !h) {
+      if (owned) frame.close();
+      return;
+    }
     // Container rotation: decoder output is unrotated; the element tier
     // rotates automatically, so this is where the tiers are made to agree.
     const rot = entry.rotation;
     const swap = rot === 90 || rot === 270;
     const cw = swap ? h : w;
     const ch = swap ? w : h;
-    const canvas = this.canvasFor(cw, ch);
-    const ctx = canvas.getContext('2d');
-    // jsdom has no 2D context; bookkeeping still runs so the LRU is testable.
-    // Cache owns the frame — draw, never close (see ExactVideoSource header).
-    if (ctx) {
-      if (rot !== 0) {
-        ctx.save();
-        ctx.translate(cw / 2, ch / 2);
-        ctx.rotate((rot * Math.PI) / 180);
-        ctx.drawImage(frame as unknown as CanvasImageSource, -w / 2, -h / 2, w, h);
-        ctx.restore();
-      } else {
-        ctx.drawImage(frame as unknown as CanvasImageSource, 0, 0, w, h);
+
+    let image: ExactFrameImage | null = null;
+    if (owned && rot === 0) {
+      if (isVideoFrame(frame)) {
+        if (this.opts.directFrames) {
+          this.admitLive(entry, presIdx);
+          image = frame;
+        } else {
+          const copy = retainFrameCopy(frame);
+          if (copy !== (frame as DecodedFrameLike)) image = copy as unknown as ImageBitmap | HTMLCanvasElement;
+        }
+      } else if (isImageBitmap(frame) || isCanvas(frame)) {
+        image = frame;
       }
+    }
+    if (!image) {
+      const canvas = this.canvasFor(cw, ch);
+      const ctx = canvas.getContext('2d');
+      // jsdom has no 2D context; bookkeeping still runs so the LRU is testable.
+      if (ctx) {
+        if (rot !== 0) {
+          ctx.save();
+          ctx.translate(cw / 2, ch / 2);
+          ctx.rotate((rot * Math.PI) / 180);
+          ctx.drawImage(frame as unknown as CanvasImageSource, -w / 2, -h / 2, w, h);
+          ctx.restore();
+        } else {
+          ctx.drawImage(frame as unknown as CanvasImageSource, 0, 0, w, h);
+        }
+      }
+      if (owned) frame.close();
+      image = canvas;
     }
 
     const bytes = cw * ch * 4;
@@ -819,7 +1002,31 @@ export class ExactVideoFrameCache {
       entry.planMeasured = true;
       entry.plan = streamPlanFor(this.maxBytesPerSource, bytes);
     }
-    this.store(entry, presIdx, canvas, bytes);
+    this.store(entry, presIdx, image, bytes);
+  }
+
+  /**
+   * Make room for a new cached VideoFrame at `presIdx`: at most ONE per
+   * source. The previous one becomes an ImageBitmap copy (same pixels, no
+   * pool slot) — or a canvas where the platform cannot copy synchronously —
+   * and its original is closed.
+   */
+  private admitLive(entry: ReadyEntry, presIdx: number): void {
+    const prev = entry.live;
+    entry.live = presIdx;
+    if (prev < 0 || prev === presIdx) return;
+    const cached = entry.frames.get(prev);
+    if (!cached || !isVideoFrame(cached.image)) return;
+    const copy = retainFrameCopy(cached.image as unknown as DecodedFrameLike);
+    if (copy !== (cached.image as unknown as DecodedFrameLike)) {
+      cached.image = copy as unknown as ImageBitmap | HTMLCanvasElement;
+      return;
+    }
+    // No synchronous copy route: draw it (canvasOf closes the original).
+    const saved = entry.live;
+    entry.live = prev;
+    this.canvasOf(entry, prev);
+    entry.live = saved;
   }
 
   /** Recycled canvases from evicted frames. Streaming playback and export
@@ -842,6 +1049,27 @@ export class ExactVideoFrameCache {
     return c;
   }
 
+  /** Release a cached image: canvases back to the pool, owned images closed. */
+  private dropImage(entry: ReadyEntry, presIdx: number, image: ExactFrameImage): void {
+    if (entry.live === presIdx) entry.live = -1;
+    if (isCanvas(image)) {
+      if (this.canvasPool.length < ExactVideoFrameCache.CANVAS_POOL_MAX) this.canvasPool.push(image);
+      return;
+    }
+    closeImage(image);
+  }
+
+  /** Close every owned frame of a source being dropped. */
+  private releaseFrames(entry: ReadyEntry): void {
+    for (const [idx, cached] of entry.frames) {
+      if (!isCanvas(cached.image)) this.dropImage(entry, idx, cached.image);
+    }
+    entry.frames.clear();
+    entry.order = [];
+    entry.bytes = 0;
+    entry.live = -1;
+  }
+
   /**
    * LRU insert shared by decoded and woven frames.
    *
@@ -855,9 +1083,9 @@ export class ExactVideoFrameCache {
    * about to be asked for. That is the eviction half of the "already cached but
    * re-decoded at 4K" bug; `streamPlanFor` is the arithmetic half.
    */
-  private store(entry: ReadyEntry, presIdx: number, canvas: HTMLCanvasElement, bytes: number): void {
+  private store(entry: ReadyEntry, presIdx: number, image: ExactFrameImage, bytes: number): void {
     if (entry.frames.has(presIdx)) return;
-    entry.frames.set(presIdx, { canvas, bytes });
+    entry.frames.set(presIdx, { image, bytes });
     entry.order.push(presIdx);
     entry.bytes += bytes;
 
@@ -880,9 +1108,7 @@ export class ExactVideoFrameCache {
       if (old) {
         entry.bytes -= old.bytes;
         entry.frames.delete(oldest);
-        if (this.canvasPool.length < ExactVideoFrameCache.CANVAS_POOL_MAX) {
-          this.canvasPool.push(old.canvas);
-        }
+        this.dropImage(entry, oldest, old.image);
       }
     }
   }
@@ -898,6 +1124,7 @@ export class ExactVideoFrameCache {
   private markUnavailable(src: string, entry: ReadyEntry, reason: string): void {
     this.killStream(entry);
     entry.source.close();
+    this.releaseFrames(entry);
     this.sources.set(src, { state: 'unavailable', reason });
     // This source will never decode exactly again, so this cache has no
     // further use for the URL. The element tier is about to become the
@@ -911,6 +1138,7 @@ export class ExactVideoFrameCache {
       if (entry.state === 'ready') {
         this.killStream(entry);
         entry.source.close();
+        this.releaseFrames(entry);
       }
       releaseLocalBlobObjectUrl(src, exactHolder(src));
     }
@@ -918,14 +1146,36 @@ export class ExactVideoFrameCache {
   }
 
   /** For tests and diagnostics. */
-  stats(src: string): { state: string; frames: number; bytes: number; plan?: StreamPlan } | null {
+  stats(src: string): {
+    state: string;
+    frames: number;
+    bytes: number;
+    plan?: StreamPlan;
+    /** Cached frames by storage kind. */
+    kinds?: { canvas: number; bitmap: number; videoFrame: number };
+  } | null {
     const e = this.sources.get(src);
     if (!e) return null;
     if (e.state !== 'ready') return { state: e.state, frames: 0, bytes: 0 };
-    return { state: e.state, frames: e.frames.size, bytes: e.bytes, plan: e.plan };
+    const kinds = { canvas: 0, bitmap: 0, videoFrame: 0 };
+    for (const { image } of e.frames.values()) {
+      if (isVideoFrame(image)) kinds.videoFrame += 1;
+      else if (isImageBitmap(image)) kinds.bitmap += 1;
+      else kinds.canvas += 1;
+    }
+    return { state: e.state, frames: e.frames.size, bytes: e.bytes, plan: e.plan, kinds };
   }
 }
 
-/** The renderer's cache — shared by viewport and export, which use the same
- *  backend instance (see MotionRendererBackend). */
-export const exactVideoFrames = new ExactVideoFrameCache();
+/** The renderer's interactive cache — the viewport backend's (and the golden
+ *  harness's). Private per-backend instances cover export and aux panes (see
+ *  MotionRendererBackend). Decodes in the decode worker when there is one,
+ *  scrubs latest-wins, and keeps the seek target as a VideoFrame for a direct
+ *  upload. */
+export const exactVideoFrames = new ExactVideoFrameCache(
+  DEFAULT_BUDGET_BYTES,
+  makeExactLoader(renderDecodeIO),
+  webCodecsAvailable,
+  (demuxed, from, to) => new SequentialFrameReader(demuxed, from, to, renderDecodeIO()),
+  { latestWins: true, directFrames: true },
+);

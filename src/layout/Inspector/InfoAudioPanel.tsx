@@ -1,18 +1,19 @@
 import { useState, useEffect, useRef } from 'react';
-import { useInfoStore } from '@stores/infoStore';
 import { useWorkspaceStore } from '@stores/projectStore';
-import { useSelectionStore } from '@stores/selectionStore';
-import { useCompositionStore } from '@stores/compositionStore';
 import { audioEngine } from '@core/audio/AudioEngine';
 import { toDb, meterFraction } from '@core/audio/audioLevels';
-import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { Icon } from '@components/Icon';
 import { cn } from '@utils/cn';
+import { InfoReadout } from './InfoReadout';
 import styles from './InfoAudioPanel.module.css';
 
 /**
- * Info & Audio — three flat readout groups: the pointer, the composition, and
- * the master meter.
+ * Info — three flat readout groups: the pointer, the composition, and the
+ * master meter. The on-demand `info` panel.
+ *
+ * The pointer and composition groups are `InfoReadout`, shared with the Audio
+ * panel, which carries them compactly at its top since the two right-rail tabs
+ * were merged (2026-09-15).
  *
  * Rows, not cards. The panel used to draw each group in its own bordered,
  * rounded box, so a 280px column held three boxes inside a box; a readout is a
@@ -20,11 +21,6 @@ import styles from './InfoAudioPanel.module.css';
  * needs.
  */
 export function InfoAudioPanel(): JSX.Element {
-  const { x, y, rgba, present } = useInfoStore();
-  const selectedIds = useSelectionStore((s) => s.ids);
-  const compWidth = useCompositionStore((s) => s.width);
-  const compHeight = useCompositionStore((s) => s.height);
-  const compFps = useCompositionStore((s) => s.fps);
   const playing = useWorkspaceStore((s) => (s.activeTabId ? (s.tabs[s.activeTabId]?.playing ?? false) : false));
 
   const [bars, setBars] = useState<{ l: number; r: number }>({ l: 0, r: 0 });
@@ -48,79 +44,12 @@ export function InfoAudioPanel(): JSX.Element {
     return () => cancelAnimationFrame(raf.current);
   }, [playing]);
 
-  const swatch =
-    rgba && rgba.a > 0
-      ? `rgba(${rgba.r}, ${rgba.g}, ${rgba.b}, ${(rgba.a / 255).toFixed(2)})`
-      : 'transparent';
-
-  const hexColor = rgba
-    ? `#${rgba.r.toString(16).padStart(2, '0')}${rgba.g.toString(16).padStart(2, '0')}${rgba.b.toString(16).padStart(2, '0')}`.toUpperCase()
-    : '—';
-
-  const primaryNode = selectedIds[0] ? defaultSceneGraph.getNode(selectedIds[0]) : null;
   const volumeLabel = `${volumeDb > 0 ? `+${volumeDb}` : volumeDb} dB`;
 
   return (
     <div className={styles.root}>
-      {/* ── Pointer ── */}
-      <section className={styles.group} aria-label="Pointer">
-        <div className={styles.groupHead}>
-          <span className={styles.groupLabel}>Pointer</span>
-          <span className={cn(styles.status, present && styles.statusLive)}>{present ? 'Live' : 'Idle'}</span>
-        </div>
-        <div className={styles.rows}>
-          <div className={styles.row}>
-            <span className={styles.key}>X</span>
-            <span className={cn(styles.value, styles.mono)}>{present ? `${x} px` : '—'}</span>
-          </div>
-          <div className={styles.row}>
-            <span className={styles.key}>Y</span>
-            <span className={cn(styles.value, styles.mono)}>{present ? `${y} px` : '—'}</span>
-          </div>
-          <div className={styles.row}>
-            <span className={styles.key}>RGB</span>
-            <span className={cn(styles.value, styles.mono)}>
-              {rgba ? (
-                <>
-                  <span className={styles.colorSwatch} style={{ background: swatch }} />
-                  {`${rgba.r}, ${rgba.g}, ${rgba.b}`}
-                </>
-              ) : '—'}
-            </span>
-          </div>
-          <div className={styles.row}>
-            <span className={styles.key}>Alpha</span>
-            <span className={cn(styles.value, styles.mono)}>{rgba ? `${Math.round((rgba.a / 255) * 100)}%` : '—'}</span>
-          </div>
-          <div className={styles.row}>
-            <span className={styles.key}>Hex</span>
-            <span className={cn(styles.value, styles.mono)}>{hexColor}</span>
-          </div>
-        </div>
-      </section>
-
-      {/* ── Composition ── */}
-      <section className={styles.group} aria-label="Composition">
-        <div className={styles.groupHead}>
-          <span className={styles.groupLabel}>Composition</span>
-        </div>
-        <div className={styles.rows}>
-          <div className={styles.row}>
-            <span className={styles.key}>Size</span>
-            <span className={cn(styles.value, styles.mono)}>{compWidth} × {compHeight}</span>
-          </div>
-          <div className={styles.row}>
-            <span className={styles.key}>Frame rate</span>
-            <span className={cn(styles.value, styles.mono)}>{compFps} fps</span>
-          </div>
-          <div className={styles.row}>
-            <span className={styles.key}>Selected</span>
-            <span className={styles.value} title={primaryNode?.name ?? undefined}>
-              {primaryNode ? `${primaryNode.name}${selectedIds.length > 1 ? ` +${selectedIds.length - 1}` : ''}` : 'None'}
-            </span>
-          </div>
-        </div>
-      </section>
+      {/* ── Pointer + Composition ── */}
+      <InfoReadout />
 
       {/* ── Audio ── */}
       <section className={styles.group} aria-label="Audio">

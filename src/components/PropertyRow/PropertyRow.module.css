@@ -261,3 +261,93 @@
   min-width: 0;
   padding-top: 2px;
 }
+
+/* ── Inspector layout ────────────────────────────────────────────── */
+/* Grid: [label] [value(s)] [animation cell]
+
+   The label column is fixed so every row's fields start at the same x, and
+   the values cell takes the rest so a pair of fields splits it evenly instead
+   of sitting at a 58px island on the right. The animation cell is RESERVED at
+   navigator width (3 × 16px + 2 × 1px gap) even on unanimated rows: an `auto`
+   cell would make an animated row's fields narrower than its neighbours', and
+   enabling animation would visibly squeeze the fields under the cursor. */
+/* Label 64px and an `auto` animation column (was 72px + a reserved 50px).
+   Measured at the default 280px inspector: the values cell was 51px wide, so a
+   Position pair got 24px per field and every number was clipped ("X 9("). The
+   navigator cell is empty until a property is animated, so `auto` collapses it
+   to nothing; the one-time sideways move when animation starts is the cheaper
+   cost than numbers nobody can read. */
+.inspector {
+  grid-template-columns:
+    var(--prop-label-col, 64px)
+    minmax(0, 1fr)
+    var(--prop-anim-col, auto);
+  column-gap: var(--space-2);
+  /* The field look for this layout, handed to ValueField through its custom
+     properties so its own hover / editing / dragging states still win. */
+  --value-field-bg: var(--color-surface-1);
+  --value-field-border: var(--color-field-border);
+  --value-field-color: var(--color-text-primary);
+}
+
+.inspector .name {
+  font-weight: var(--font-weight-regular);
+  color: var(--color-text-secondary);
+}
+
+.inspector .values {
+  justify-content: flex-start;
+  gap: var(--space-1);
+}
+
+/* Fields share the cell evenly — a pair is two equal halves, a triple thirds. */
+.inspector .values > [data-numeric] {
+  flex: 1 1 0;
+  max-width: none;
+}
+
+/* A lone non-numeric control (a colour swatch) fills the cell; companions of a
+   field (the rotation dial, a link toggle) keep their own size. */
+.inspector .values > :only-child:not([data-numeric]) {
+  flex: 1 1 auto;
+}
+
+.inspector .values > :not([data-numeric]):not(:only-child) {
+  flex: none;
+}
+
+.anim {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+/* The tray is always "on"; its CHILDREN are what hover reveals. `display`
+   rather than opacity, so a hidden control does not keep eating the label's
+   width at rest. */
+.inspector .trailing {
+  opacity: 1;
+}
+
+.inspector .trailing > * {
+  display: none;
+}
+
+.inspector:hover .trailing > *,
+.inspector:focus-within .trailing > *,
+.inspector .trailing > [data-persist] {
+  display: inline-flex;
+}
+
+/* At 72px a "mixed" pill would take half the label. The field already shows
+   `—`; the mark shrinks to a dot, keeping its name for assistive tech. */
+.inspector .mixedMark {
+  width: 5px;
+  height: 5px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--color-text-tertiary);
+  font-size: 0;
+  line-height: 0;
+}

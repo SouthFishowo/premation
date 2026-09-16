@@ -21,6 +21,18 @@ import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 // Shared with the tracking walks — see that module for why an `await` alone
 // does not hand the thread back.
 import { yieldToUi } from '@core/loading/yieldToUi';
+import {
+  hasGeneratorLayers,
+  setGeneratorExactMode,
+  settleGenerators,
+  takeGeneratorErrors,
+} from '@core/plugins/generator';
+import {
+  setNativeExactMode,
+  settleNative,
+  takeNativeErrors,
+} from '@core/plugins/native';
+import { warmPluginKernels } from '@core/effects/pluginCpuEffect';
 import { defaultAnimation } from '@motion/animation';
 
 export interface OfflineRenderParams {
@@ -35,6 +47,18 @@ export interface OfflineRenderParams {
   endFrame?: number;
   /** Motion blur (threaded from the viewport settings so export matches). */
   motionBlur?: MotionBlurConfig;
+  /**
+   * Hand the thread back only once this many ms have passed since the last
+   * yield, instead of after every frame. Absent: yield every frame, which is
+   * what the interactive walks built on this loop (auto-trace, reframe) want.
+   *
+   * A delivered export sets it. Electron 32 has no `scheduler.yield`, so each
+   * yield is a `setTimeout(0)` — clamped to 4 ms once nested — and on a comp
+   * that renders in 10 ms that clamp alone was a third of the export's wall
+   * clock. Frames still yield promptly when they are slow (one heavy frame
+   * already exceeds the budget), so progress and Cancel stay responsive.
+   */
+  yieldBudgetMs?: number;
 }
 
 /**
@@ -109,6 +133,35 @@ export function resolveRange(params: OfflineRenderParams): { start: number; end:
 
 // ── The render loop ──────────────────────────────────────────────────
 
+/**
+ * The yield budget a DELIVERED export renders with (`yieldBudgetMs`): about
+ * twenty progress repaints a second, which is as responsive as a progress bar
+ * and a Cancel button need to be.
+ */
+export const EXPORT_YIELD_BUDGET_MS = 48;
+
+/**
+ * How long one frame waits for its plugin generators.
+ *
+ * Between the per-generate budget (20 s in export) and the media convergence
+ * cap (15 s), because a single frame may legitimately need SEVERAL generate
+ * calls: a simulation resuming from a checkpoint replays in chunks, and an
+ * export that starts at frame 400 begins with one of those. Shorter than the
+ * sum of what it is waiting for would turn a slow first frame into a refused
+ * export.
+ */
+export const GENERATOR_SETTLE_MS = 30_000;
+
+/**
+ * How long one frame waits for a plugin's COMPILED addon.
+ *
+ * The same 30 s, for the same reason and deliberately not a second number: a
+ * frame may hold several native calls (an effect per layer, plus whatever the
+ * bake queued), each with its own per-call timeout in the plugin's process, and
+ * this is the ceiling on all of them together rather than on any one.
+ */
+export const NATIVE_SETTLE_MS = 30_000;
+
 export type FrameSink = (
   canvas: HTMLCanvasElement,
   frame: number,
@@ -155,19 +208,144 @@ export async function renderOffline(
 
     const { start, end } = resolveRange(params);
     const total = end - start + 1;
+    const yieldBudget = params.yieldBudgetMs ?? 0;
+    let lastYield = performance.now();
+    /*
+      One frame's snapshot. A closure rather than an inline call because a
+      generator layer needs it TWICE: the first build states which frames its
+      plugin must produce, and the second picks up the geometry that arrived.
+      One call site keeps the two identical — including `exportComp`, which
+      `exportPathsMarkForExport.test.ts` reads this source to check.
+    */
+    const buildFrame = (t: number) => buildSnapshot(
+      defaultSceneGraph,
+      defaultAnimation,
+      t,
+      undefined,
+      undefined,
+      exportView(params.width, params.height, params.comp), // 1:1 comp→frame (no preview inset)
+      params.motionBlur,
+      exportComp(params.comp),
+    );
+
+    /*
+      Plugin generators produce geometry off this thread, and an export must
+      have the EXACT frame rather than the most recent one.
+
+      `setGeneratorExactMode` switches the scheduler out of its preview
+      behaviour for the whole export: no look-ahead competing with the frame
+      being waited on, the longer per-frame budget, and every request tracked so
+      `settleGenerators` knows what is outstanding. Restored in the `finally`
+      below, so a cancelled or failed export does not leave the viewport in
+      export mode.
+
+      `setNativeExactMode` is the same switch for the compiled tier, in the same
+      words on purpose: nothing coalesced, nothing dropped, and the preview
+      budget that benches a slow addon lifted for the duration — an export that
+      quietly took an effect's JavaScript fallback would produce a different
+      picture from the one the user approved in the viewport.
+    */
+    setGeneratorExactMode(true);
+    setNativeExactMode(true);
     for (let i = start; i <= end; i++) {
       if (signal?.aborted) throw new DOMException('Render cancelled', 'AbortError');
       const t = frameTimeAt(i, params.fps);
-      const snap = buildSnapshot(
-        defaultSceneGraph,
-        defaultAnimation,
-        t,
-        undefined,
-        undefined,
-        exportView(params.width, params.height, params.comp), // 1:1 comp→frame (no preview inset)
-        params.motionBlur,
-        exportComp(params.comp),
-      );
+      let snap = buildFrame(t);
+      /*
+        Await the generator frames this snapshot asked for.
+
+        Only when something asked — `hasGeneratorLayers` is false for every
+        project without one, so this is a map-size check and a branch, and the
+        second build never happens.
+
+        A layer that does not land in time becomes a DIAGNOSTIC, through the
+        same `layerErrors` channel a layer that threw during the build uses, and
+        the gate below refuses the frame. It must not fall through: the
+        scheduler would serve the previous frame's particles, the export would
+        succeed, and the file would contain a simulation that stutters at
+        exactly the frames the plugin was slow on — which nobody would ever
+        attribute to this.
+      */
+      if (hasGeneratorLayers()) {
+        const unmet = await settleGenerators(GENERATOR_SETTLE_MS);
+        if (signal?.aborted) throw new DOMException('Render cancelled', 'AbortError');
+        snap = buildFrame(t);
+        const failed = takeGeneratorErrors();
+        if (unmet.length > 0 || (failed && failed.length > 0)) {
+          snap.layerErrors = [
+            ...(snap.layerErrors ?? []),
+            ...unmet.map((layerId) => ({
+              layerId,
+              stage: 'snapshot' as const,
+              message:
+                `its plugin did not produce frame ${i} within ${GENERATOR_SETTLE_MS} ms`,
+            })),
+            ...(failed ?? []).map((e) => ({
+              layerId: e.layerId,
+              stage: 'snapshot' as const,
+              message: `${e.pluginId}.${e.kindId}: ${e.message}`,
+            })),
+          ];
+        }
+      }
+      /*
+        And the compiled tier, reported the same way.
+
+        A separate gate rather than a branch of the one above, because the two
+        wait for different things. A native GENERATOR's call is awaited inside
+        the generator pump and is already covered by `settleGenerators`; a
+        native EFFECT's is outstanding against a layer's bake, with no generator
+        layer waiting on it, so nothing above would ever notice it.
+
+        Unconditional, unlike the generator block: `settleNative` resolves an
+        empty list without allocating a scheduler when nothing has ever called
+        one, and gating on "is there native work RIGHT NOW" would drop the
+        errors of a call that failed quickly — which is precisely the frame that
+        must not ship. No second `buildFrame`: what a native effect produces
+        reaches the bake, not the snapshot.
+
+        The rule is the generator block's, for the reason stated there: a frame
+        that is missing native work is REFUSED, never written with whatever the
+        fallback path happened to leave behind.
+      */
+      const unmetNative = await settleNative(NATIVE_SETTLE_MS);
+      if (signal?.aborted) throw new DOMException('Render cancelled', 'AbortError');
+      const nativeFailed = takeNativeErrors();
+      if (unmetNative.length > 0 || nativeFailed.length > 0) {
+        snap.layerErrors = [
+          ...(snap.layerErrors ?? []),
+          ...unmetNative.map((instanceId) => ({
+            layerId: instanceId,
+            stage: 'snapshot' as const,
+            message:
+              `its plugin's native module did not answer for frame ${i} within ${NATIVE_SETTLE_MS} ms`,
+          })),
+          ...nativeFailed.map((e) => ({
+            layerId: e.instanceId,
+            stage: 'snapshot' as const,
+            message: `${e.pluginId} (native): ${e.message}`,
+          })),
+        ];
+      }
+      /*
+        Warm this frame's plugin CPU kernels BEFORE anything draws.
+
+        A kernel module instantiates asynchronously. A preview accepts that and
+        takes the one-frame warm-up — the layer redraws when the module lands.
+        An export cannot: the bake runs inside `renderFrame`, so a frame drawn
+        while the module is still loading is written with that effect simply
+        ABSENT, and the export then reports success. The user gets a file that
+        is missing an effect at exactly the frames the module was still loading,
+        with nothing anywhere saying so.
+
+        Cheap after the first frame: `warmPluginKernels` skips every module that
+        is loaded or already known to be missing, so this is a walk of the
+        frame's effects and nothing else. A module that cannot load is recorded
+        as missing rather than retried, so a broken package costs one attempt
+        for the whole export, not one per frame.
+      */
+      await warmPluginKernels(snap.layers.flatMap((l) => l.effects ?? []));
+      if (signal?.aborted) throw new DOMException('Render cancelled', 'AbortError');
       backend.renderFrame(snap);
       // Converge media: while a render started async media work (video seeks,
       // first decode, blend-cache fills), await it and re-render. The element
@@ -186,24 +364,6 @@ export async function renderOffline(
         if (signal?.aborted) throw new DOMException('Render cancelled', 'AbortError');
         backend.renderFrame(snap);
       }
-      // The exactness gate, closing the loophole the header promises is shut:
-      // the renderer KNOWS when a frame holds stand-in video pixels
-      // (nearest-neighbour while a decode is in flight, an element mid-seek,
-      // a warming source) via lastFrameMediaExact() — but only the RAM
-      // preview cache ever read it. The DELIVERABLE accepted the stale frame:
-      // after the 4-pass cap or the 15s race, the loop fell through and
-      // encoded whatever pixels were there, silently. M8b's rule is the
-      // opposite — wrong pixels on screen are recoverable; wrong pixels in a
-      // file are not — so a frame that never converged REFUSES, like every
-      // other known-bad frame below.
-      if (backend.lastFrameMediaExact?.() === false) {
-        throw new Error(
-          `Export stopped at frame ${i}: the video decode for this frame did not finish in time, `
-          + 'so the frame would contain stale footage pixels. Re-run the export; if this repeats, '
-          + 'generate a proxy for the footage or transcode it (Media Settings ▸ Proxy).',
-        );
-      }
-
       // EXPORT half of the M8a split: FAIL, do not warn.
       //
       // The preview shows the same notice and keeps the frame, because a human
@@ -214,6 +374,12 @@ export async function renderOffline(
       //
       // Thrown BEFORE onFrame, so a frame known to be wrong is never handed to
       // the sink. A refused export beats a half-written file that looks finished.
+      //
+      // Read BEFORE the media-exactness gate below, deliberately: a lost GPU
+      // device or a layer that threw also leaves that frame's footage
+      // unconverged, and checking exactness first reported a device loss as
+      // "the video decode did not finish" — sending the user to transcode
+      // footage that was never the problem. The diagnostic names the cause.
       const diags = backend.lastFrameDiagnostics?.() ?? [];
       if (diags.length > 0) {
         const lines = diags.map((d) => `  • ${d.detail}${d.layerId ? ` (layer ${d.layerId})` : ''}`);
@@ -223,13 +389,36 @@ export async function renderOffline(
         );
       }
 
+      // The exactness gate, closing the loophole the header promises is shut:
+      // the renderer KNOWS when a frame holds stand-in video pixels
+      // (nearest-neighbour while a decode is in flight, an element mid-seek,
+      // a warming source) via lastFrameMediaExact() — but only the RAM
+      // preview cache ever read it. The DELIVERABLE accepted the stale frame:
+      // after the 4-pass cap or the 15s race, the loop fell through and
+      // encoded whatever pixels were there, silently. M8b's rule is the
+      // opposite — wrong pixels on screen are recoverable; wrong pixels in a
+      // file are not — so a frame that never converged REFUSES, like every
+      // other known-bad frame above.
+      if (backend.lastFrameMediaExact?.() === false) {
+        throw new Error(
+          `Export stopped at frame ${i}: the video decode for this frame did not finish in time, `
+          + 'so the frame would contain stale footage pixels. Re-run the export; if this repeats, '
+          + 'generate a proxy for the footage or transcode it (Media Settings ▸ Proxy).',
+        );
+      }
+
       await onFrame(canvas, i - start, total, backend);
       // Yield so progress paints, the editor stays usable, and cancellation can
-      // interrupt between frames.
-      await yieldToUi();
+      // interrupt between frames — on a time budget when the caller set one.
+      if (yieldBudget <= 0 || performance.now() - lastYield >= yieldBudget) {
+        await yieldToUi();
+        lastYield = performance.now();
+      }
     }
     return total;
   } finally {
+    setGeneratorExactMode(false);
+    setNativeExactMode(false);
     backend.dispose();
   }
 }

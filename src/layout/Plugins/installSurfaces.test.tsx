@@ -1,15 +1,16 @@
 /**
- * Where a plugin can be installed FROM, now that the dock is not one of them.
+ * Where a plugin can be installed FROM.
  *
- * Installing moved to the dashboard's Plugins page so it sits beside publishing.
- * Both surfaces still render one `PluginsList` — that is what keeps them from
- * drifting — so the difference is a single prop, and a single prop is exactly
- * the kind of thing that gets passed to the wrong one later.
+ * In the hosted build installing lives on the dashboard's Plugins page, beside
+ * publishing, and the editor dock does not install. The local edition has no
+ * dashboard, so there the dock is the install surface. Every surface renders
+ * one `PluginsList` — that is what keeps them from drifting — so the difference
+ * is a single prop, and a single prop is exactly the kind of thing that gets
+ * passed to the wrong one later.
  *
  * The assertion that earns its place is the DROP target. Hiding a button is
  * visible the moment anyone looks; leaving the drop zone live behind it is not,
- * and it would mean the dock still installs by a route nobody can see. That is
- * strictly worse than the button being there.
+ * and it would mean the dock still installs by a route nobody can see.
  */
 
 import { render, screen, fireEvent } from '@testing-library/react';
@@ -18,7 +19,13 @@ import { PluginsList } from './PluginsList';
 
 const takeFile = jest.fn(async () => {});
 
-jest.mock('@core/config/edition', () => ({ pluginRegistryEnabled: () => false }));
+/** Whether this "build" has the dashboard. Flipped per describe. */
+const edition = { hasDashboard: true };
+
+jest.mock('@core/config/edition', () => ({
+  pluginRegistryEnabled: () => false,
+  cloudProjectsEnabled: () => edition.hasDashboard,
+}));
 jest.mock('@core/plugins/registry', () => ({
   browseRegistry: jest.fn(async () => ({ available: false, items: [], total: 0 })),
   checkForUpdates: jest.fn(async () => []),
@@ -32,7 +39,10 @@ jest.mock('./useDiskInstall', () => ({
   }),
 }));
 
-beforeEach(() => { takeFile.mockClear(); });
+beforeEach(() => {
+  takeFile.mockClear();
+  edition.hasDashboard = true;
+});
 
 /** A files drag, as the browser reports one. */
 function dropFile(target: HTMLElement): void {
@@ -41,7 +51,7 @@ function dropFile(target: HTMLElement): void {
   fireEvent.drop(target, { dataTransfer });
 }
 
-describe('the editor dock', () => {
+describe('the editor dock, in a build with a dashboard', () => {
   it('offers no way to add a plugin', () => {
     render(<PluginsPanel />);
     expect(screen.queryByRole('button', { name: /add a plugin/i })).not.toBeInTheDocument();
@@ -63,6 +73,27 @@ describe('the editor dock', () => {
     // state and fails claiming the text is missing.
     render(<PluginsPanel />);
     expect(await screen.findByText(/dashboard.s Plugins page/i)).toBeInTheDocument();
+  });
+});
+
+describe('the editor dock, in the local edition (no dashboard)', () => {
+  beforeEach(() => { edition.hasDashboard = false; });
+
+  it('offers the add control — it is the only install surface there is', () => {
+    render(<PluginsPanel />);
+    expect(screen.getByRole('button', { name: /add a plugin/i })).toBeInTheDocument();
+  });
+
+  it('★ installs a dropped package', () => {
+    const { container } = render(<PluginsPanel />);
+    dropFile(container.firstElementChild as HTMLElement);
+    expect(takeFile).toHaveBeenCalled();
+  });
+
+  it('never points at a dashboard that does not exist', async () => {
+    render(<PluginsPanel />);
+    expect(await screen.findByText(/install plugins from a folder or a \.zip package/i)).toBeInTheDocument();
+    expect(screen.queryByText(/dashboard.s Plugins page/i)).not.toBeInTheDocument();
   });
 });
 

@@ -1,6 +1,10 @@
 import { buildPropertyMenu } from './propertyMenu';
 import { defaultAnimation } from '@motion/animation';
 import { setCommandSystem, CommandSystem } from '@core/commands/CommandSystem';
+import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
+import { SCENE_KIND_PROP } from '@core/scene/seedDefaultScene';
+import { onExpressionEditorRequest } from '@core/animation/expressionCommands';
+import type { SceneNode } from '@core/types';
 
 const NODE = 'n1';
 
@@ -118,11 +122,73 @@ describe('buildPropertyMenu — actions', () => {
     expect(defaultAnimation.isAnimated(NODE, 'rotation')).toBe(false);
   });
 
+  it('keeps a bare id (no scene node) free of the expression entries', () => {
+    const items = buildPropertyMenu({ nodeId: NODE, prop: 'x', layerT: 0, value: 1 });
+    expect(items.some((i) => i.id === 'expr-add' || i.id === 'expr-edit')).toBe(false);
+  });
+
   it('names entries from the registry, so an effect param reads properly', () => {
     const items = buildPropertyMenu({
       nodeId: NODE, prop: 'effect.fx_3.radius', layerT: 0, value: 16, setValue: () => {},
     });
     // Not "Reset effect.fx_3.radius".
     expect(labels(items).some((l) => /Radius/.test(l) && !/fx_3/.test(l))).toBe(true);
+  });
+});
+
+/**
+ * The expression entries — the way a compact inspector field (whose `=` is
+ * hover-only, or absent on a two-field row) reaches its expression.
+ */
+describe('buildPropertyMenu — expression entries', () => {
+  const REAL = 'menu_expr_a';
+  const OTHER = 'menu_expr_b';
+
+  const add = (id: string): void => {
+    defaultSceneGraph.addNode({
+      id, name: id, parent: null, children: [], visible: true, locked: false,
+      transform: { position: { x: 0, y: 0 }, rotation: 0, scale: { x: 1, y: 1 } },
+      components: [{ id: `${id}_t`, type: 'Transform', props: { [SCENE_KIND_PROP]: 'shape', x: 0, y: 0 } }],
+    } as unknown as SceneNode);
+  };
+
+  beforeEach(() => {
+    for (const id of [REAL, OTHER]) {
+      if (defaultSceneGraph.getNode(id)) defaultSceneGraph.removeNode(id);
+      add(id);
+    }
+  });
+
+  it('offers Add Expression when the property has none', () => {
+    const items = buildPropertyMenu({ nodeId: REAL, prop: 'x', layerT: 0, value: 0 });
+    expect(labels(items)).toContain('Add Expression');
+    expect(labels(items)).not.toContain('Edit Expression');
+  });
+
+  it('Add attaches `value` to every selected layer in one go', () => {
+    const items = buildPropertyMenu({ nodeId: REAL, prop: 'x', layerT: 0, value: 0, nodeIds: [REAL, OTHER] });
+    items.find((i) => i.id === 'expr-add')!.onSelect!();
+    expect(defaultAnimation.hasExpression(REAL, 'x')).toBe(true);
+    expect(defaultAnimation.hasExpression(OTHER, 'x')).toBe(true);
+  });
+
+  it('offers Edit + Remove (and no Add) once there is one; Edit asks that row to open its editor', () => {
+    defaultAnimation.setExpression(REAL, 'x', 'value');
+    const items = buildPropertyMenu({ nodeId: REAL, prop: 'x', layerT: 0, value: 0 });
+    expect(labels(items)).toEqual(expect.arrayContaining(['Edit Expression', 'Remove Expression']));
+    expect(labels(items)).not.toContain('Add Expression');
+
+    const heard: Array<{ nodeId: string; prop: string }> = [];
+    const off = onExpressionEditorRequest((ref) => heard.push(ref));
+    items.find((i) => i.id === 'expr-edit')!.onSelect!();
+    off();
+    expect(heard).toEqual([{ nodeId: REAL, prop: 'x' }]);
+  });
+
+  it('Remove drops the expression', () => {
+    defaultAnimation.setExpression(REAL, 'x', 'value');
+    const items = buildPropertyMenu({ nodeId: REAL, prop: 'x', layerT: 0, value: 0 });
+    items.find((i) => i.id === 'expr-remove')!.onSelect!();
+    expect(defaultAnimation.hasExpression(REAL, 'x')).toBe(false);
   });
 });

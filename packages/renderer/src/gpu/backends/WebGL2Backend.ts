@@ -189,6 +189,17 @@ export class WebGL2Backend implements RenderBackend {
   private onContextRestored: (() => void) | null = null;
   private readonly lossListeners = new Set<() => void>();
   private readonly restoreListeners = new Set<() => void>();
+  /**
+   * When true, `dispose` releases every GL object but does NOT call
+   * `WEBGL_lose_context.loseContext()`.
+   *
+   * Normal teardown loses the context on purpose (it frees a slot under the
+   * browser's per-page cap). A context-loss RECOVERY is the one teardown where
+   * that is wrong: the browser has just restored this context, the replacement
+   * backend is about to adopt the same canvas, and losing it again would hand
+   * that backend a dead context — the recovery would cause the next loss.
+   */
+  retainContextOnDispose = false;
 
   async initialize(surface?: RenderSurface): Promise<void> {
     if (!surface) throw new Error('WebGL2Backend requires a canvas surface');
@@ -364,7 +375,14 @@ export class WebGL2Backend implements RenderBackend {
       // today, and a future flip would silently change the alpha space on this
       // backend with no code change to blame.
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !sourcePassesThrough(source));
-      const src = source.type === 'bitmap' ? source.bitmap : source.type === 'video' ? source.video : source.canvas;
+      // A VideoFrame is a TexImageSource like the others: uploaded at display
+      // size under the default UNPACK_COLORSPACE_CONVERSION (the browser's
+      // YUV → sRGB, the same one a canvas draw applies) and the same unpack
+      // flags as every other source kind, so it matches the canvas route.
+      const src = source.type === 'bitmap' ? source.bitmap
+        : source.type === 'video' ? source.video
+        : source.type === 'videoFrame' ? source.frame
+        : source.canvas;
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, src as TexImageSource);
     }
   }
@@ -406,6 +424,42 @@ export class WebGL2Backend implements RenderBackend {
     const p = (shader.native as NativeProgram).program;
     this.livePrograms.delete(p);
     this.gl.deleteProgram(p);
+  }
+
+  /**
+   * Compile and LINK a GLSL program now, and hand back what the driver said.
+   *
+   * ── Why this exists, and why it links rather than only compiling ────────────
+   *
+   * A plugin effect may ship a GLSL ES 3.0 kernel for this tier. Before it is
+   * put in front of a frame the host wants to know whether it compiles, for the
+   * same reason the WebGPU backend offers `shaderDiagnostics`: a pipeline that
+   * fails to create mid-frame leaves a cleared target, which reads as the
+   * effect having erased the layer rather than as a shader with a typo in it.
+   *
+   * It LINKS because a link error is a whole class of problem compilation
+   * cannot see — a fragment stage reading a varying the vertex stage does not
+   * write is two files that are each individually valid. The program is deleted
+   * immediately; this is a check, not a cache.
+   *
+   * Errors as separate lines, unfiltered. Unlike WebGPU there is no severity on
+   * a GL info log — it is one string — so it is returned whole and the host
+   * re-points its line numbers at the author's own source.
+   */
+  async glslDiagnostics(label: string, vertex: string, fragment: string): Promise<string[]> {
+    const gl = this.gl;
+    let program: WebGLProgram | null = null;
+    try {
+      program = link(gl, compile(gl, gl.VERTEX_SHADER, vertex), compile(gl, gl.FRAGMENT_SHADER, fragment));
+      return [];
+    } catch (err) {
+      const text = err instanceof Error ? err.message : String(err);
+      return text.split('\n').map((l) => l.trim()).filter(Boolean).map((l) => `${label}: ${l}`);
+    } finally {
+      // Deleted on both paths. A probe that leaked a program per plugin change
+      // would leak one per sync, and syncs happen on every plugin event.
+      if (program) gl.deleteProgram(program);
+    }
   }
 
   createPipeline(desc: PipelineDescriptor): PipelineHandle {
@@ -740,14 +794,16 @@ export class WebGL2Backend implements RenderBackend {
     // Release the context itself. Browsers cap live WebGL contexts per page
     // (~16 in Chromium); relying on GC to reclaim them made re-entry blank
     // once the cap was hit. Explicit loseContext frees the slot immediately.
-    gl.getExtension('WEBGL_lose_context')?.loseContext();
+    // Skipped for a context-loss RECOVERY teardown (see
+    // `retainContextOnDispose`), where the browser just restored this context
+    // and the replacement backend is about to adopt it.
+    if (!this.retainContextOnDispose) gl.getExtension('WEBGL_lose_context')?.loseContext();
     this.gl = undefined as unknown as GL;
   }
 }
 
 class WebGL2PassEncoder implements RenderPassEncoder {
   private pipeline: NativePipeline | null = null;
-  private vertexBuffer: NativeBuffer | null = null;
   private indexFormat: IndexFormat = 'uint32';
 
   /** `msaaTarget` is set only for a multisample pass — see end. */
@@ -862,11 +918,28 @@ class WebGL2PassEncoder implements RenderPassEncoder {
     if (shadow2Sampler && shadow2Unit >= 0) gl.bindSampler(shadow2Unit, shadow2Sampler);
     for (const u of depthUnits) gl.bindSampler(u, null);
   }
-  setVertexBuffer(_slot: number, buffer: BufferHandle): void {
-    this.vertexBuffer = buffer.native as NativeBuffer;
+  /**
+   * Bind one vertex buffer and point THAT SLOT's attributes at it.
+   *
+   * The slot used to be ignored: every call rebound one ARRAY_BUFFER and then
+   * re-pointed every attribute of every declared layout at it. That was
+   * harmless while every material had exactly one vertex buffer, and it is
+   * exactly wrong for an instanced draw, where slot 0 is the shared unit quad
+   * and slot 1 is a per-layer instance buffer — pointing the instance
+   * attributes at the quad reads six vertices of garbage and draws nothing.
+   *
+   * The layout's `stepMode` reaches the GL here too, via `vertexAttribDivisor`.
+   * WebGPU bakes it into the pipeline; WebGL2 has no pipeline object, so an
+   * `instance` layout was silently dropped and `drawArraysInstanced` replayed
+   * identical geometry N times — 50 000 sprites stacked on one pixel.
+   */
+  setVertexBuffer(slot: number, buffer: BufferHandle): void {
+    const native = buffer.native as NativeBuffer;
     const gl = this.gl;
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer.buffer);
-    if (this.pipeline) configureAttribs(gl, this.pipeline.layout);
+    gl.bindBuffer(gl.ARRAY_BUFFER, native.buffer);
+    const layout = this.pipeline?.layout[slot];
+    if (layout) configureAttribs(gl, [layout]);
+    else if (this.pipeline) configureAttribs(gl, this.pipeline.layout);
   }
   setIndexBuffer(buffer: BufferHandle, format: IndexFormat): void {
     const nb = buffer.native as NativeBuffer;
@@ -880,11 +953,17 @@ class WebGL2PassEncoder implements RenderPassEncoder {
     this.gl.scissor(x, y, width, height);
   }
   draw(vertexCount: number, instanceCount = 1): void {
+    // Zero instances is a real state — a generator whose simulation has no live
+    // particles this frame — and it means DRAW NOTHING. Falling through to the
+    // non-instanced branch would draw the geometry once, against whatever the
+    // instance attributes happened to hold.
+    if (instanceCount <= 0) return;
     const mode = this.pipeline ? topo(this.gl, this.pipeline.topology) : this.gl.TRIANGLES;
     if (instanceCount > 1) this.gl.drawArraysInstanced(mode, 0, vertexCount, instanceCount);
     else this.gl.drawArrays(mode, 0, vertexCount);
   }
   drawIndexed(indexCount: number, instanceCount = 1, firstIndex = 0): void {
+    if (instanceCount <= 0) return;
     const gl = this.gl;
     const mode = this.pipeline ? topo(gl, this.pipeline.topology) : gl.TRIANGLES;
     const u16 = this.indexFormat === 'uint16';
@@ -942,10 +1021,18 @@ function link(gl: GL, vertex: WebGLShader, fragment: WebGLShader): WebGLProgram 
 
 function configureAttribs(gl: GL, layouts: VertexBufferLayout[]): void {
   for (const layout of layouts) {
+    // The divisor is per-ATTRIBUTE in GL and per-buffer in WebGPU; set on every
+    // attribute of the layout, and set to 0 explicitly rather than only when
+    // instanced. Attribute state is global and sticky, so a location left at
+    // divisor 1 by an earlier instanced draw would make the NEXT pipeline's
+    // ordinary vertex attribute advance once per instance — a bug that appears
+    // in a shader that has nothing to do with instancing.
+    const divisor = layout.stepMode === 'instance' ? 1 : 0;
     for (const attr of layout.attributes) {
       const size = attr.format === 'float32' ? 1 : attr.format === 'float32x2' ? 2 : attr.format === 'float32x3' ? 3 : 4;
       gl.enableVertexAttribArray(attr.shaderLocation);
       gl.vertexAttribPointer(attr.shaderLocation, size, gl.FLOAT, false, layout.strideBytes, attr.offsetBytes);
+      gl.vertexAttribDivisor(attr.shaderLocation, divisor);
     }
   }
 }

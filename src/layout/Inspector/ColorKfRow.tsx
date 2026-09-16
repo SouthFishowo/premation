@@ -12,10 +12,10 @@ import { essentialPropMenuItems } from '@core/inspector/propertyMenu';
 import { resolveChannelColor } from '@core/effects/effects';
 
 
-import { InspectorRow } from '@components/Inspector';
+import { PropertyRow } from '@components/PropertyRow';
 import { ColorPicker } from '@components/ColorPicker';
-import styles from './TransformSection.module.css';
-import { AnimToggle } from './AnimToggle';
+import { useTrackNavigator } from './AnimToggle';
+import { useInspectorHosted } from './inspectorSelection';
 
 export interface ColorKfRowProps {
   nodeId: string;
@@ -57,6 +57,16 @@ export function ColorKfRow({
       : value),
     [animated, nodeId, propPrefix, layerT, value],
   );
+
+  // The stopwatch + navigator `AnimToggle` used to draw beside the swatch, now
+  // placed by `PropertyRow` — in the Properties panel that is the compact
+  // inspector grid, so a colour lines up with the numeric rows around it.
+  const tracks = useMemo(() => [rProp, gProp, bProp, aProp], [rProp, gProp, bProp, aProp]);
+  const navigator = useTrackNavigator(nodeId, tracks, label, () => {
+    const c = Color.fromHex(displayColor);
+    return [c.r, c.g, c.b, c.a ?? 1];
+  });
+  const hosted = useInspectorHosted();
 
   const onChange = (hex: string): void => {
     if (animated || autoKeyframe) {
@@ -110,26 +120,17 @@ export function ColorKfRow({
   };
 
   return (
-    <InspectorRow label={label} align="center">
-      <div className={styles.control} onContextMenu={onContextMenu}>
-        <div style={{ display: 'flex', alignItems: 'center', height: '100%' }}>
-          <AnimToggle
-            nodeId={nodeId}
-            tracks={[rProp, gProp, bProp, aProp]}
-            label={label}
-            animated={animated}
-            onToggle={toggle}
-            values={() => {
-              const c = Color.fromHex(displayColor);
-              return [c.r, c.g, c.b, c.a ?? 1];
-            }}
-          />
-        </div>
-        <div className={styles.field}>
-          <ColorPicker value={displayColor} onChange={onChange} aria-label={label} />
-        </div>
-      </div>
-    </InspectorRow>
+    <PropertyRow
+      label={label}
+      layout={hosted ? 'inspector' : undefined}
+      compact
+      animated={animated}
+      onStopwatch={toggle}
+      navigator={navigator}
+      onContextMenu={onContextMenu}
+    >
+      <ColorPicker value={displayColor} onChange={onChange} aria-label={label} />
+    </PropertyRow>
   );
 }
 

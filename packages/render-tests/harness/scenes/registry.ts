@@ -10,6 +10,7 @@ import linearGradientFill from './linearGradientFill';
 import { shapeScenes } from './shapes';
 import { strokeScenes } from './strokes';
 import { strokeProfileScenes } from './strokeProfile';
+import { strokeOptionScenes } from './strokeOptions';
 import { blendModeScenes, matteModeScenes, alphaAddSeamScene } from './blendModes';
 import { effectScenes } from './effects';
 import { compositedScenes } from './composited';
@@ -28,6 +29,8 @@ import { rigScenes } from './rig';
 import { alphaInterpScenes } from './alphaInterp';
 import { keyframeFamilyScenes } from './keyframeFamilies';
 import { pluginEffectScenes } from './pluginEffects';
+import { pluginKernelScenes } from './pluginKernels';
+import { generatorLayerScenes } from './generatorLayers';
 import { extrusionScenes } from './extrusion';
 import { primitiveScenes } from './primitives';
 import { modelMapScenes } from './modelMaps';
@@ -42,6 +45,9 @@ export const SCENES: Scene[] = [
   ...shapeScenes,
   ...strokeScenes,
   ...strokeProfileScenes,
+  // AE Stroke options (Composite, paint blend, units, dash pairs, gradient
+  // points) — all new features, so first blesses, not re-blesses.
+  ...strokeOptionScenes,
   ...blendModeScenes,
   // Registered as of the F10/F12 fix. Both families produce partial alpha in
   // the final composite, which is precisely what used to accumulate.
@@ -83,4 +89,15 @@ export const SCENES: Scene[] = [
   // Plugin effects. The only scenes that render a shader the host did not
   // write, and the only place the plugin path is exercised end to end.
   ...pluginEffectScenes,
+  // Round C2's render-time capabilities: a GLSL+WGSL kernel reading the host
+  // block, a CPU kernel on the raster path, two layer inputs, and an effect
+  // that draws outside its own box. UNBLESSED — each carries a control
+  // rendered in the same run, because a golden blessed while a feature was
+  // inert records "the effect changes nothing" as the reference.
+  ...pluginKernelScenes,
+  // Plugin layer kinds: a generator's instanced draw, and a `shader` kind drawn
+  // by the effect it names. Beside the plugin effects for the same reason those
+  // exist — they are the only scenes that render content the host did not
+  // write, and unit tests cannot tell "drew nothing" from "drew correctly".
+  ...generatorLayerScenes,
 ];

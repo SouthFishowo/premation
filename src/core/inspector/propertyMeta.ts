@@ -32,6 +32,8 @@ import {
   EFFECT_DEFS, EFFECT_OPACITY_KEY, effectDefFor, getNodeEffects, type EffectParamDef,
 } from '@core/effects/effects';
 import { pluginEffectDefs } from '@core/effects/pluginEffectDefs';
+import { humaniseParamName } from '@core/plugins/uiParams';
+import { findPluginParamByPath, readPluginParam } from '@core/plugins/uiParamValues';
 import {
   LAYER_STYLE_EFFECT_TYPE,
   LAYER_STYLE_LABEL,
@@ -42,6 +44,15 @@ import { POSITION_PSEUDO_PROP } from '@motion/animation';
 import defaultSceneGraph from '@core/scene/DefaultSceneGraph';
 import { readNodeKind } from '@core/scene/sceneDerive';
 import { readAnimatorData } from '@core/text/textAnimators';
+import { parseStrokeTrackPath, strokeTrackPath } from '@core/rendering/strokeTracks';
+import {
+  PAINT_KEY_LABEL,
+  PAINT_KEY_UNIT,
+  PAINT_PERCENT_KEYS,
+  parsePaintColorPath,
+  parsePaintPropPath,
+  strokeDisplayNames,
+} from '@core/paint/paintProps';
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -315,22 +326,72 @@ const STATIC: Record<string, MetaSpec> = {
     min: 0, max: 1, step: 0.01, precision: 0, defaultValue: 0, resettable: true,
     displayScale: 100, order: ORDER.stroke,
   },
+  // AE's range: −100% pointy … 0 straight … +100% round (strokeProfile.easeRamp).
   strokeTaperStartEase: {
     label: 'Taper Start Ease', group: 'stroke', type: 'percent', unit: '%',
-    min: 0, max: 1, step: 0.01, precision: 0, defaultValue: 0, resettable: true,
+    min: -1, max: 1, step: 0.01, precision: 0, defaultValue: 0, resettable: true,
     displayScale: 100, order: ORDER.stroke,
   },
   strokeTaperEndEase: {
     label: 'Taper End Ease', group: 'stroke', type: 'percent', unit: '%',
-    min: 0, max: 1, step: 0.01, precision: 0, defaultValue: 0, resettable: true,
+    min: -1, max: 1, step: 0.01, precision: 0, defaultValue: 0, resettable: true,
     displayScale: 100, order: ORDER.stroke,
   },
   // Wave amplitude and wavelength are ARC-LENGTH px, not fractions — a period
-  // that scaled with the path would change the look on resize.
+  // that scaled with the path would change the look on resize. (Units = Cycles
+  // re-describes the wavelength per node — see `resolveStrokeUnits`.)
   strokeWaveAmount: { ...PX('Wave Amount', 'stroke', ORDER.stroke), defaultValue: 0 },
   strokeWaveWavelength: { ...PX('Wavelength', 'stroke', ORDER.stroke), min: 0, defaultValue: 0 },
   // The one that animates.
   strokeWavePhase: { ...DEG('Wave Phase', 'stroke', ORDER.stroke), defaultValue: 0 },
+
+  // ── The rest of AE's Stroke group, keyframeable on strokes[0] ──
+  // Same contract as everything above: each is folded by `resolveStrokeTracks`
+  // (rendering/strokeTracks.ts), whose quoted table satisfies the G2 guard.
+  // Strokes 2+ use `stroke.<i>.<param>`, resolved by `resolveStrokeStackParam`.
+  strokeOpacity: {
+    label: 'Stroke Opacity', group: 'stroke', type: 'percent', unit: '%',
+    min: 0, max: 1, step: 0.01, precision: 0, defaultValue: 1, resettable: true,
+    displayScale: 100, order: ORDER.stroke,
+  },
+  // A multiple of the stroke width, as Canvas2D and AE both define it; below 1
+  // no miter exists, and 4 is the default the rasterizer has always run with.
+  strokeMiterLimit: {
+    label: 'Miter Limit', group: 'stroke', type: 'number', unit: '',
+    min: 1, step: 0.1, precision: 1, defaultValue: 4, resettable: true, order: ORDER.stroke,
+  },
+  // AE's three Dash/Gap pairs, in pattern order. Arc-length px like the offset.
+  strokeDash1: { ...PX('Dash', 'stroke', ORDER.stroke), min: 0, defaultValue: 10 },
+  strokeGap1: { ...PX('Gap', 'stroke', ORDER.stroke), min: 0, defaultValue: 10 },
+  strokeDash2: { ...PX('Dash 2', 'stroke', ORDER.stroke), min: 0, defaultValue: 10 },
+  strokeGap2: { ...PX('Gap 2', 'stroke', ORDER.stroke), min: 0, defaultValue: 10 },
+  strokeDash3: { ...PX('Dash 3', 'stroke', ORDER.stroke), min: 0, defaultValue: 10 },
+  strokeGap3: { ...PX('Gap 3', 'stroke', ORDER.stroke), min: 0, defaultValue: 10 },
+  // Gradient Stroke Start/End points, in the relative box units the fill's
+  // radial centre uses (stored 0..1, shown as %). Unbounded: a point may sit
+  // outside the layer, exactly as an AE gradient handle may.
+  strokeGradientStartX: {
+    label: 'Stroke Gradient Start X', group: 'stroke', type: 'percent', unit: '%',
+    step: 0.01, precision: 0, defaultValue: 0.5, resettable: true, displayScale: 100, order: ORDER.stroke,
+  },
+  strokeGradientStartY: {
+    label: 'Stroke Gradient Start Y', group: 'stroke', type: 'percent', unit: '%',
+    step: 0.01, precision: 0, defaultValue: 0, resettable: true, displayScale: 100, order: ORDER.stroke,
+  },
+  strokeGradientEndX: {
+    label: 'Stroke Gradient End X', group: 'stroke', type: 'percent', unit: '%',
+    step: 0.01, precision: 0, defaultValue: 0.5, resettable: true, displayScale: 100, order: ORDER.stroke,
+  },
+  strokeGradientEndY: {
+    label: 'Stroke Gradient End Y', group: 'stroke', type: 'percent', unit: '%',
+    step: 0.01, precision: 0, defaultValue: 1, resettable: true, displayScale: 100, order: ORDER.stroke,
+  },
+  strokeHighlightLength: {
+    label: 'Highlight Length', group: 'stroke', type: 'percent', unit: '%',
+    min: -1, max: 1, step: 0.01, precision: 0, defaultValue: 0, resettable: true,
+    displayScale: 100, order: ORDER.stroke,
+  },
+  strokeHighlightAngle: { ...DEG('Highlight Angle', 'stroke', ORDER.stroke), defaultValue: 0 },
 
   // Trim paths — matched by the `pathop.<id>.<param>` resolver below, not by a
   // literal key, since document version 1.4.0 made trim a chain entry with an
@@ -343,6 +404,12 @@ const STATIC: Record<string, MetaSpec> = {
   // used to live here were labels for property paths nothing writes any more.
 
   // Time
+  // Speed % retime (`core/animation/retime.ts`) — integrated, not sampled, by
+  // the renderer; lives on the layer's ordinary keyframe axis.
+  timeSpeed: {
+    label: 'Speed', group: 'time', type: 'percent', unit: '%',
+    min: -1000, max: 1000, step: 1, precision: 0, defaultValue: 100, resettable: false, order: ORDER.time,
+  },
   timeRemap: {
     label: 'Time Remap', group: 'time', type: 'time', unit: 's',
     min: 0, step: 0.05, precision: 3, defaultValue: 0, resettable: false, order: ORDER.time,
@@ -427,6 +494,13 @@ const STATIC: Record<string, MetaSpec> = {
     label: 'Accepts Shadows', group: 'material', type: 'enum', unit: '',
     min: 0, max: 2, step: 1, precision: 0, defaultValue: 1, resettable: true, order: ORDER.material,
   },
+
+  // Geometry Options (3D). Flat Transform props that buildSnapshot samples per
+  // frame (`a.get('extrusionDepth' | 'bevelDepth' | 'holeBevelDepth')`), so
+  // they keyframe like any transform property. Ranges match the inspector's.
+  extrusionDepth: { ...PX('Extrusion Depth', 'geometry', ORDER.geometry), min: 0, max: 1000 },
+  bevelDepth: { ...PX('Bevel Depth', 'geometry', ORDER.geometry), min: 0, max: 200 },
+  holeBevelDepth: PCT('Hole Bevel Depth', 'geometry', ORDER.geometry),
 
   // Audio Levels, in decibels. `audioParams.ts` samples it per frame and
   // schedules the gain ramp; Pan rides the same seam into a StereoPannerNode.
@@ -622,6 +696,67 @@ function fromEffectParam(path: string, effectLabel: string, p: EffectParamDef): 
  * right often enough to beat showing the raw path — and is why the timeline no
  * longer prints `effect.fx_3.radius`.
  */
+/**
+ * `pluginUi.<plugin>.<panel>.<param>[.x|y|z]` — one parameter a plugin
+ * contributes to the inspector of a layer it does not own.
+ *
+ * The plugin declares the label, the unit and the range; this is where they
+ * reach every surface that describes a property, so the timeline, the graph
+ * editor and the multi-selection rows all name it the way its author did
+ * without any of them knowing plugins exist.
+ *
+ * ── `logarithmic`, implemented as a value-proportional step ──────────────────
+ *
+ * A log slider means "a pixel of drag is a constant RATIO, not a constant
+ * amount" — which is what you want for a blur radius that is useful at both 0.5
+ * and 500. `ValueField` scrubs linearly by `step`, so rather than teach it a
+ * second gesture, the step is recomputed here from the parameter's CURRENT
+ * value: 2% of it, floored at the parameter's own minimum. The result is the
+ * behaviour a log axis is asked for (fine near the bottom, coarse near the top)
+ * with no new mode in a control every panel in the editor shares.
+ */
+function resolvePluginParam(path: string, nodeId?: string): PropertyMeta | null {
+  const ref = findPluginParamByPath(path);
+  if (!ref) return null;
+  const { schema, axis } = ref;
+
+  const label = schema.label ?? humaniseParamName(schema.name);
+  const base = {
+    path,
+    // The plugin's name is NOT in the label: the section header already says
+    // whose parameters these are, and "Acme Lab: Amount" in a pair row's
+    // 90-pixel name cell is a truncated string that names nothing.
+    label: axis ? `${label} ${axis.toUpperCase()}` : label,
+    group: 'other' as const,
+    type: 'number' as const,
+    unit: schema.type === 'angle' ? '°' : (schema.unit ?? ''),
+    precision: 2,
+    resettable: true,
+    order: ORDER.other,
+  };
+
+  const min = schema.min;
+  const max = schema.max;
+  let step = schema.step ?? 1;
+  if (schema.logarithmic && nodeId) {
+    const current = readPluginParam(nodeId, ref.pluginId, ref.panel.id, schema, axis);
+    const magnitude = typeof current === 'number' ? Math.abs(current) : (min ?? 1);
+    step = Math.max(magnitude * 0.02, (min ?? 0.01) || 0.01);
+  }
+
+  const fallback = axis
+    ? (schema.default as Record<string, number> | undefined)?.[axis] ?? 0
+    : schema.default;
+
+  return {
+    ...base,
+    ...(min !== undefined ? { min } : {}),
+    ...(max !== undefined ? { max } : {}),
+    step,
+    defaultValue: typeof fallback === 'number' ? fallback : null,
+  };
+}
+
 function resolveEffectParam(path: string, nodeId?: string): PropertyMeta | null {
   const m = /^effect\.([^.]+)(?:\.(.+))?$/.exec(path);
   if (!m) return null;
@@ -875,6 +1010,51 @@ function resolvePolystarParam(path: string): PropertyMeta | null {
  * Opacity is 0..100 here like every other opacity; the mask stores 0..1 and
  * `applyMaskPropertyTracks` scales.
  */
+/**
+ * `paint.<strokeId>.*` — AE's Effects ▸ Paint ▸ Brush N rows: Stroke Options,
+ * the colour channels, the Path, the Transform. Named for the stroke when the
+ * node is known ("Brush 2 Opacity"), in the units the timeline animates
+ * (see `core/paint/paintProps.ts`).
+ */
+function resolvePaintProperty(path: string, nodeId?: string): PropertyMeta | null {
+  if (!path.startsWith('paint.')) return null;
+  const num = parsePaintPropPath(path);
+  const col = num ? null : parsePaintColorPath(path);
+  const pathRow = !num && !col ? /^paint\.([^.]+)\.path$/.exec(path) : null;
+  const strokeId = num?.strokeId ?? col?.strokeId ?? pathRow?.[1];
+  if (!strokeId) return null;
+  let name = 'Paint';
+  if (nodeId) {
+    const fx = defaultSceneGraph.getNode(nodeId)?.components.find((c) => c.type === 'fx');
+    const strokes = (fx?.props.paint as { strokes?: Array<{ id: string; mode: 'paint' | 'erase' | 'clone'; name?: string }> } | undefined)?.strokes;
+    if (Array.isArray(strokes)) name = strokeDisplayNames(strokes).get(strokeId) ?? name;
+  }
+  const base = { path, group: 'effects' as const, resettable: true, order: ORDER.effects };
+  if (pathRow) {
+    return { ...base, label: `${name} Path`, type: 'path', unit: '', step: 1, precision: 0, defaultValue: null, resettable: false };
+  }
+  if (col) {
+    return { ...base, label: `${name} Color ${col.channel.toUpperCase()}`, type: 'colorChannel', unit: '', min: 0, max: 1, step: 0.01, precision: 3, defaultValue: 1 };
+  }
+  const key = num!.key;
+  const label = `${name} ${PAINT_KEY_LABEL[key]}`;
+  const unit = PAINT_KEY_UNIT[key];
+  if (PAINT_PERCENT_KEYS.has(key)) {
+    const dflt = key === 'start' ? 0 : key === 'spacing' ? 25 : 100;
+    return { ...base, label, type: 'percent', unit, min: key === 'spacing' ? 1 : 0, ...(key === 'spacing' ? {} : { max: 100 }), step: 1, precision: 1, defaultValue: dflt };
+  }
+  if (key === 'angle' || key === 'rotation') {
+    return { ...base, label, type: 'angle', unit, step: 1, precision: 1, defaultValue: 0 };
+  }
+  if (key === 'cloneTime' || key === 'cloneTimeShift') {
+    return { ...base, label, type: 'time', unit, step: 0.01, precision: 2, defaultValue: 0 };
+  }
+  if (key === 'scale') {
+    return { ...base, label, type: 'percent', unit, step: 1, precision: 1, defaultValue: 100 };
+  }
+  return { ...base, label, type: 'number', unit, ...(key === 'diameter' ? { min: 0.1 } : {}), step: 1, precision: 1, defaultValue: key === 'diameter' ? 12 : 0, resettable: key === 'diameter' };
+}
+
 function resolveMaskProperty(path: string, nodeId?: string): PropertyMeta | null {
   const m = /^mask\.([^.]+)\.(feather|opacity|expansion)$/.exec(path);
   if (!m) return null;
@@ -1189,6 +1369,11 @@ function readAnimatorsForMeta(
  * named `a`/`r`/`g`/`b` isn't mistaken for a colour channel of `ctrl`.
  */
 const RESOLVERS: ReadonlyArray<(path: string, nodeId?: string) => PropertyMeta | null> = [
+  // Before `resolveColorChannel`: `stroke.1.color_r` must be named for its
+  // stroke, not title-cased as a channel of an unknown base.
+  resolveStrokeStackParam,
+  // Before `resolveColorChannel` too: `paint.<id>.color_r` is a stroke's colour.
+  resolvePaintProperty,
   resolveMaskProperty,
   resolveGroupPlaceholder,
   resolveControl,
@@ -1198,9 +1383,71 @@ const RESOLVERS: ReadonlyArray<(path: string, nodeId?: string) => PropertyMeta |
   resolveTextAnimator,
   resolveTextOptionPath,
   resolveEffectParam,
+  // Before the fallback, like every other resolver here, and for the sharp
+  // version of the reason `resolveEffectParam` gives: a contributed parameter
+  // otherwise falls through to `titleCase(path)` and is labelled with the
+  // track key — `PluginUi.Studio-acme.Lift.Amount` — in the timeline, the graph
+  // editor and every row that names a property.
+  resolvePluginParam,
   resolvePathOpParam,
   resolvePolystarParam,
 ];
+
+// ── Strokes 2+ and stroke units ─────────────────────────────────────
+
+/**
+ * `stroke.<i>.<param>` (and `stroke.<i>.color_r|g|b|a`) — one parameter of a
+ * stroke after the first.
+ *
+ * Described as the primary stroke's entry for the same parameter, renumbered:
+ * "Stroke Width" on the second stroke reads "Stroke 2 Width", "Dash Offset"
+ * reads "Stroke 2 Dash Offset". Deriving rather than duplicating the table is
+ * what keeps a range or unit fix on the primary from missing its siblings.
+ */
+function resolveStrokeStackParam(path: string, nodeId?: string): PropertyMeta | null {
+  if (!path.startsWith('stroke.')) return null;
+  const parsed = parseStrokeTrackPath(path);
+  if (!parsed || parsed.index === 0) return null;
+  const primary = parsed.channel ? `stroke${parsed.channel}` : strokeTrackPath(0, parsed.param);
+  const base = resolvePropertyMeta(primary);
+  const n = parsed.index + 1;
+  const label = base.label.startsWith('Stroke ') ? `Stroke ${n} ${base.label.slice(7)}` : `Stroke ${n} ${base.label}`;
+  const meta: PropertyMeta = { ...base, path, label };
+  return nodeId ? withStrokeUnits(meta, nodeId) : meta;
+}
+
+/** The STORED stroke at `index` of a node's stack, raw — enough to read its units. */
+function storedStrokeAt(
+  nodeId: string,
+  index: number,
+): { taper?: { lengthUnits?: string }; wave?: { units?: string } } | undefined {
+  const fx = defaultSceneGraph.getNode(nodeId)?.components.find((c) => c.type === 'fx')?.props as
+    | { strokes?: unknown; stroke?: unknown }
+    | undefined;
+  const stack = Array.isArray(fx?.strokes) && fx!.strokes.length > 0 ? fx!.strokes : fx?.stroke ? [fx.stroke] : [];
+  return stack[index] as { taper?: { lengthUnits?: string }; wave?: { units?: string } } | undefined;
+}
+
+/**
+ * The two stroke parameters whose UNIT belongs to the layer, not the property:
+ * a taper length is a percentage or px (AE's Length Units), and a wavelength is
+ * px or a cycle count (AE's Wave Units). Without this a pixel taper's row reads
+ * "%" and scales by 100 — a field that means the wrong thing.
+ */
+function withStrokeUnits(meta: PropertyMeta, nodeId: string): PropertyMeta {
+  const parsed = parseStrokeTrackPath(meta.path);
+  if (!parsed) return meta;
+  const { param, index } = parsed;
+  if (param === 'waveWavelength') {
+    return storedStrokeAt(nodeId, index)?.wave?.units === 'cycles'
+      ? { ...meta, label: meta.label.replace(/Wavelength$/, 'Cycles'), unit: '', min: 0, step: 0.1, precision: 1 }
+      : meta;
+  }
+  if (param !== 'taperStartLength' && param !== 'taperEndLength') return meta;
+  if (storedStrokeAt(nodeId, index)?.taper?.lengthUnits !== 'pixels') return meta;
+  const { displayScale: _scale, max: _max, ...rest } = meta;
+  return { ...rest, type: 'number', unit: 'px', min: 0, step: 1, precision: 1 };
+}
 
 // ── Public API ──────────────────────────────────────────────────────
 
@@ -1214,7 +1461,10 @@ const RESOLVERS: ReadonlyArray<(path: string, nodeId?: string) => PropertyMeta |
  */
 export function resolvePropertyMeta(path: string, nodeId?: string): PropertyMeta {
   const exact = STATIC[path];
-  if (exact) return { path, ...exact };
+  if (exact) {
+    // A stroke entry's unit can depend on the layer (see withStrokeUnits).
+    return nodeId && exact.group === 'stroke' ? withStrokeUnits({ path, ...exact }, nodeId) : { path, ...exact };
+  }
   for (const r of RESOLVERS) {
     const hit = r(path, nodeId);
     if (hit) return hit;

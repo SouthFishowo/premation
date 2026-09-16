@@ -85,6 +85,38 @@ describe('rasterPadding — path escape', () => {
     expect(pad).toBeLessThanOrEqual(512);
   });
 
+  describe('the stroke band itself — miter limit and wave', () => {
+    // Every point on the box edge, so there is no path escape: the result is the
+    // stroke overshoot alone, ceil(overshoot + 1).
+    const inBox = [pt(-50, -50), pt(50, -50), pt(0, 50)] as never;
+    const base = { enabled: true, color: '#fff', width: 8, opacity: 1, align: 'center', dash: [], cap: 'butt', join: 'miter' };
+    const padFor = (s: Record<string, unknown>, over: Partial<RenderLayer> = {}): number =>
+      rasterPadding(shape({ pathPoints: inBox, stroke: { ...base, ...s }, ...over } as never));
+
+    it('a MITER join on a path pads (w/2)·miterLimit — the tip Canvas2D draws before bevelling', () => {
+      // Default limit 4 → 2×w = 16. The flat 1×w used to slice star tips.
+      expect(padFor({})).toBe(17);
+      expect(padFor({ miterLimit: 10 })).toBe(41);
+    });
+
+    it('never pads LESS than the band, however low the limit', () => {
+      expect(padFor({ miterLimit: 1 })).toBe(9);
+      expect(padFor({ join: 'round' })).toBe(9);
+    });
+
+    it('adds the WAVE amount, whichever sign it is keyed at', () => {
+      expect(padFor({ join: 'round', wave: { amount: 12, wavelength: 40, phase: 0 } })).toBe(21);
+      expect(padFor({ join: 'round', wave: { amount: -12, wavelength: 40, phase: 0 } })).toBe(21);
+      // An identity wave (wavelength 0) displaces nothing.
+      expect(padFor({ join: 'round', wave: { amount: 12, wavelength: 0, phase: 0 } })).toBe(9);
+    });
+
+    it('doubles for OUTSIDE (drawn at twice the width), and INSIDE never escapes', () => {
+      expect(padFor({ align: 'outside' })).toBe(33); // max(16, 8·4) = 32
+      expect(padFor({ align: 'inside', wave: { amount: 12, wavelength: 40, phase: 0 } })).toBe(0);
+    });
+  });
+
   it('leaves a plain stroked rect exactly as it was', () => {
     // No pathPoints → the stroke-only rule, untouched.
     expect(rasterPadding(shape({
